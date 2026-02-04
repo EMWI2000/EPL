@@ -1,0 +1,124 @@
+/* Premier League FPL Assistant - Custom CSS */
+
+/* Metric cards */
+div[data-testid="metric-container"] {
+    background-color: #f8f9fa;
+    border: 1px solid #e9ecef;
+    border-radius: 10px;
+    padding: 14px 18px;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.06);
+}
+
+div[data-testid="metric-container"] label {
+    color: #6c757d !important;
+    font-size: 0.85rem !important;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+div[data-testid="metric-container"] [data-testid="stMetricValue"] {
+    font-weight: 700 !important;
+    color: #37003c !important;
+}
+
+/* Headers */
+h1 {
+    color: #37003c !important;
+    font-weight: 800 !important;
+    letter-spacing: -0.5px;
+}
+
+h2, h3 {
+    color: #2d0032 !important;
+    font-weight: 700 !important;
+}
+
+/* Sidebar */
+section[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #37003c 0%, #2d0032 100%);
+}
+
+section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] .stMarkdown p,
+section[data-testid="stSidebar"] h1,
+section[data-testid="stSidebar"] h2,
+section[data-testid="stSidebar"] h3 {
+    color: #ffffff !important;
+}
+
+section[data-testid="stSidebar"] .stSelectbox label,
+section[data-testid="stSidebar"] .stSlider label,
+section[data-testid="stSidebar"] .stNumberInput label,
+section[data-testid="stSidebar"] .stTextInput label {
+    color: #e0d4e6 !important;
+}
+
+/* DataFrames */
+.stDataFrame {
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.05);
+}
+
+/* Tabs */
+.stTabs [data-baseweb="tab"] {
+    font-weight: 600;
+    color: #37003c;
+    padding: 10px 20px;
+}
+
+.stTabs [data-baseweb="tab"][aria-selected="true"] {
+    border-bottom: 3px solid #37003c;
+}
+
+/* Alert boxes */
+.stAlert {
+    border-radius: 10px;
+}
+
+/* Success box - grønt tema */
+div[data-testid="stAlert"][data-baseweb*="positive"] {
+    background-color: #e8f5e9;
+    border-left: 4px solid #00ff87;
+}
+
+/* Buttons */
+.stButton > button {
+    border-radius: 8px;
+    font-weight: 600;
+    border: 1px solid #37003c;
+    transition: all 0.2s ease;
+}
+
+.stButton > button:hover {
+    background-color: #37003c;
+    color: white;
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(55, 0, 60, 0.3);
+}
+
+/* Expander */
+.streamlit-expanderHeader {
+    font-weight: 600;
+    color: #37003c;
+    border-radius: 8px;
+}
+
+/* Chat messages */
+.stChatMessage {
+    border-radius: 12px;
+    margin-bottom: 8px;
+}
+
+/* Divider */
+hr {
+    border: none;
+    border-top: 2px solid #f0f2f6;
+    margin: 1.5rem 0;
+}
+
+/* Caption text */
+.stCaption {
+    color: #6c757d !important;
+    font-style: italic;
+}

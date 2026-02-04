@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Streamlit secrets (indeholder API-nøgler)
+.streamlit/secrets.toml
+fpl_app/.streamlit/secrets.toml
+
+# Claude Code
+.claude/
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ML model artifacts (kan regenereres med train_model.py)
+# Uncomment linjen nedenfor hvis modellen er for stor til Git
+# fpl_app/ml/models/*.joblib
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data cache
+*.parquet
+*.csv.gz

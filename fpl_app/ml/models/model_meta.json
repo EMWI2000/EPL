@@ -1,0 +1,38 @@
+{
+  "seasons": [
+    "2022-23",
+    "2023-24",
+    "2024-25"
+  ],
+  "n_features": 26,
+  "n_training_rows": 61823,
+  "avg_mae": 1.307,
+  "feature_importance": {
+    "net_transfers": 990,
+    "selected_pct": 885,
+    "price": 859,
+    "roll_bps_3gw": 727,
+    "cs_rate": 668,
+    "cum_minutes": 654,
+    "xA_per_90": 643,
+    "roll_ict_3gw": 610,
+    "roll_xA_3gw": 604,
+    "roll_ict_5gw": 591,
+    "roll_xG_3gw": 572,
+    "roll_xG_5gw": 571,
+    "roll_bps_5gw": 552,
+    "xG_per_90": 545,
+    "roll_xA_5gw": 542,
+    "goals_per_90": 531,
+    "roll_min_5gw": 514,
+    "assists_per_90": 512,
+    "opponent_team_id": 490,
+    "roll_min_3gw": 463,
+    "roll_pts_5gw": 442,
+    "roll_pts_3gw": 380,
+    "roll_bonus_5gw": 184,
+    "roll_bonus_3gw": 156,
+    "pos_code": 135,
+    "is_home": 91
+  }
+}
