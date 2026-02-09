@@ -35,7 +35,7 @@ h2, h3 {
 
 /* Sidebar */
 section[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #37003c 0%, #2d0032 100%);
+    background: linear-gradient(180deg, #1b263b 0%, #0d1b2a 100%);
 }
 
 section[data-testid="stSidebar"] label,
@@ -46,11 +46,35 @@ section[data-testid="stSidebar"] h3 {
     color: #ffffff !important;
 }
 
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"],
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+section[data-testid="stSidebar"] [data-testid="stCaptionContainer"],
+section[data-testid="stSidebar"] .st-emotion-cache-10trblm,
+section[data-testid="stSidebar"] .st-emotion-cache-16idsys,
+section[data-testid="stSidebar"] .st-emotion-cache-1v0mbdj {
+    color: #ffffff !important;
+}
+
 section[data-testid="stSidebar"] .stSelectbox label,
 section[data-testid="stSidebar"] .stSlider label,
 section[data-testid="stSidebar"] .stNumberInput label,
 section[data-testid="stSidebar"] .stTextInput label {
-    color: #e0d4e6 !important;
+    color: #f3f6fb !important;
+}
+
+section[data-testid="stSidebar"] input,
+section[data-testid="stSidebar"] textarea,
+section[data-testid="stSidebar"] [data-baseweb="input"] input,
+section[data-testid="stSidebar"] [data-baseweb="select"] > div,
+section[data-testid="stSidebar"] .stSlider div,
+section[data-testid="stSidebar"] .stNumberInput div {
+    color: #ffffff !important;
+}
+
+section[data-testid="stSidebar"] [data-baseweb="input"] > div,
+section[data-testid="stSidebar"] [data-baseweb="select"] > div {
+    background-color: rgba(255, 255, 255, 0.08) !important;
+    border-color: rgba(255, 255, 255, 0.35) !important;
 }
 
 /* DataFrames */
