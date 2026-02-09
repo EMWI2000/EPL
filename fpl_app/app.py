@@ -9,14 +9,14 @@ from services.data_layer import (
 )
 from logic.captain import captain_score
 from logic.optimizer import select_starting_xi, best_one_transfer_with_quotas
-from services.chat import suggest_from_ai
+from services.chat import suggest_from_ai, get_provider_name, get_provider
 from utils.helpers import safe_df, safe_event_id, fmt_prompt_table
 from utils.session import init_manager_id
 from utils.ui import inject_css
 
-st.set_page_config(page_title="Min FPL-assistent", layout="wide")
+st.set_page_config(page_title="FPL HoldPlanner DK", layout="wide")
 inject_css()
-st.title("⚽ Min FPL-assistent – Mit Hold")
+st.title("⚽ FPL HoldPlanner DK – Mit Hold")
 st.caption("Personlig analyse på dansk: kaptajn, transfers og forventede point. Vælg horisont (1–5 GW) og valgfri odds-justering.")
 
 # --- Hent basisdata ---
@@ -36,8 +36,9 @@ with st.sidebar:
     target_gw = st.number_input("Gameweek (mål/GW)", min_value=1, max_value=38, value=int(default_gw))
     horizon = st.slider("Horisont (antal runder)", min_value=1, max_value=5, value=5)
     use_odds = st.toggle("Brug odds i beregninger", value=False)
-    openai_key = st.secrets.get("OPENAI_API_KEY", "")
     odds_key = st.secrets.get("THE_ODDS_API_KEY", "")
+
+ai_provider = get_provider()
 
 entry_id = st.session_state.get("entry_id", "") or ""
 if not entry_id:
@@ -209,10 +210,11 @@ OPGAVE (dansk, punktvis):
 4) Formation (3-4-3 eller 3-5-2) for næste GW.
 """
 
-if openai_key:
+if ai_provider:
+    st.caption(f"Aktiv AI-provider: {get_provider_name()}")
     with st.spinner("Henter AI-anbefaling..."):
         try:
-            ai_reply = suggest_from_ai(openai_key, prompt)
+            ai_reply = suggest_from_ai("", prompt)
             st.markdown(ai_reply)
         except Exception as e:
             st.error(f"AI-fejl: {e}")
