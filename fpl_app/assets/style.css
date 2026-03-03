@@ -36,21 +36,66 @@ h2, h3 {
 /* Sidebar */
 section[data-testid="stSidebar"] {
     background: linear-gradient(180deg, #37003c 0%, #2d0032 100%);
+    --text-color: #f7efff;
+    --secondary-text-color: #d9c9e2;
 }
 
+/* Sikrer høj kontrast på alt tekstindhold i sidepanelet */
 section[data-testid="stSidebar"] label,
 section[data-testid="stSidebar"] .stMarkdown p,
+section[data-testid="stSidebar"] .stMarkdown li,
 section[data-testid="stSidebar"] h1,
 section[data-testid="stSidebar"] h2,
-section[data-testid="stSidebar"] h3 {
+section[data-testid="stSidebar"] h3,
+section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {
     color: #ffffff !important;
 }
 
 section[data-testid="stSidebar"] .stSelectbox label,
 section[data-testid="stSidebar"] .stSlider label,
 section[data-testid="stSidebar"] .stNumberInput label,
-section[data-testid="stSidebar"] .stTextInput label {
+section[data-testid="stSidebar"] .stTextInput label,
+section[data-testid="stSidebar"] .stToggle label {
     color: #e0d4e6 !important;
+}
+
+/* Widgets i sidepanelet: tydelig tekst på mørk baggrund */
+section[data-testid="stSidebar"] [data-baseweb="input"] input,
+section[data-testid="stSidebar"] [data-baseweb="select"] > div,
+section[data-testid="stSidebar"] [data-baseweb="select"] input,
+section[data-testid="stSidebar"] [role="slider"] {
+    color: #ffffff !important;
+}
+
+section[data-testid="stSidebar"] [data-baseweb="input"] input::placeholder,
+section[data-testid="stSidebar"] [data-baseweb="select"] input::placeholder {
+    color: #d2c2db !important;
+}
+
+
+/* Side-navigation (multipage links) */
+section[data-testid="stSidebar"] [data-testid="stSidebarNav"] [data-testid="stSidebarNavLink"],
+section[data-testid="stSidebar"] [data-testid="stSidebarNav"] [data-testid="stSidebarNavLink"] span,
+section[data-testid="stSidebar"] [data-testid="stSidebarNav"] a,
+section[data-testid="stSidebar"] [data-testid="stSidebarNav"] a span,
+section[data-testid="stSidebar"] [data-testid="stSidebarNav"] li,
+section[data-testid="stSidebar"] [data-testid="stSidebarNav"] p {
+    color: #ffffff !important;
+    opacity: 1 !important;
+    font-weight: 500;
+}
+
+section[data-testid="stSidebar"] [data-testid="stSidebarNav"] [data-testid="stSidebarNavLink"]:hover,
+section[data-testid="stSidebar"] [data-testid="stSidebarNav"] [data-testid="stSidebarNavLink"]:hover span,
+section[data-testid="stSidebar"] [data-testid="stSidebarNav"] a:hover,
+section[data-testid="stSidebar"] [data-testid="stSidebarNav"] a:hover span {
+    color: #ffffff !important;
+    background-color: rgba(255, 255, 255, 0.12);
+}
+
+section[data-testid="stSidebar"] [data-testid="stSidebarNav"] [data-testid="stSidebarNavLink"][aria-current="page"],
+section[data-testid="stSidebar"] [data-testid="stSidebarNav"] a[aria-current="page"] {
+    background-color: rgba(255, 255, 255, 0.22);
 }
 
 /* DataFrames */
