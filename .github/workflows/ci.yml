@@ -2,14 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 permissions:
   contents: read
 
 jobs:
-  test:
+  python:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -19,11 +18,37 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: |
+            requirements.txt
             fpl_app/requirements.txt
             requirements-dev.txt
       - name: Install dependencies
-        run: python -m pip install --upgrade pip && python -m pip install -r fpl_app/requirements.txt -r requirements-dev.txt
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt -r fpl_app/requirements.txt -r requirements-dev.txt
       - name: Compile application
-        run: python -m compileall -q fpl_app
+        run: python -m compileall -q api fpl_app
       - name: Run tests
         run: python -m pytest
+
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BETTER_AUTH_URL: http://localhost:3000
+      BETTER_AUTH_SECRET: ci-only-secret-ci-only-secret-ci-only-secret
+      GITHUB_CLIENT_ID: ci-client
+      GITHUB_CLIENT_SECRET: ci-secret
+      ALLOWED_GITHUB_ID: "199608244"
+      INTERNAL_API_TOKEN: ci-internal-token-ci-internal-token
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Type-check frontend
+        run: npm run typecheck
+      - name: Test auth policy
+        run: npm run test:web
+      - name: Build production frontend
+        run: npm run build

@@ -17,7 +17,11 @@ from typing import Optional, Sequence
 
 import pandas as pd
 import pulp
-from domain.rules import SQUAD
+
+try:  # Package import used by Vercel and tests.
+    from ..domain.rules import SQUAD
+except ImportError:  # Legacy Streamlit working-directory import.
+    from domain.rules import SQUAD
 
 
 SQUAD_QUOTA = {position.value: count for position, count in SQUAD.position_quotas.items()}

@@ -6,19 +6,23 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 BASE = "https://fantasy.premierleague.com/api"
-DEFAULT_TIMEOUT_SECONDS = 20
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 3.05
+DEFAULT_READ_TIMEOUT_SECONDS = 6
+DEFAULT_RETRY_ATTEMPTS = 1
+DEFAULT_TIMEOUT = (DEFAULT_CONNECT_TIMEOUT_SECONDS, DEFAULT_READ_TIMEOUT_SECONDS)
 
 
 def _build_session() -> requests.Session:
     retry = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        status=3,
-        backoff_factor=0.5,
+        total=DEFAULT_RETRY_ATTEMPTS,
+        connect=DEFAULT_RETRY_ATTEMPTS,
+        read=DEFAULT_RETRY_ATTEMPTS,
+        status=DEFAULT_RETRY_ATTEMPTS,
+        backoff_factor=0.25,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset({"GET"}),
-        respect_retry_after_header=True,
+        # A large upstream Retry-After must not outlive Vercel's function budget.
+        respect_retry_after_header=False,
     )
     adapter = HTTPAdapter(max_retries=retry)
     session = requests.Session()
@@ -35,7 +39,7 @@ def _build_session() -> requests.Session:
 _SESSION = _build_session()
 
 def _get(url: str) -> Any:
-    response = _SESSION.get(url, timeout=DEFAULT_TIMEOUT_SECONDS)
+    response = _SESSION.get(url, timeout=DEFAULT_TIMEOUT)
     if response.status_code == 404:
         raise requests.HTTPError(f"404 Not Found for URL: {url}", response=response)
     response.raise_for_status()

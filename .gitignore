@@ -26,7 +26,15 @@ fpl_app/.streamlit/secrets.toml
 
 # Environment
 .env
-.env.local
+.env.*
+!.env.example
+
+# Next.js / Vercel
+node_modules/
+.next/
+.vercel/
+coverage/
+*.tsbuildinfo
 
 # OS
 .DS_Store

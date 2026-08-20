@@ -71,6 +71,20 @@ def test_expected_points_preserve_blank_gameweek_as_zero():
     assert forecast["is_experimental"] is True
 
 
+def test_expected_points_respect_explicit_open_gameweek():
+    fixtures = _fixtures(
+        [
+            (7, 1, 2, 2, 3, "2026-09-01T18:45:00Z"),
+            (8, 1, 3, 3, 2, "2026-09-08T18:45:00Z"),
+        ]
+    )
+
+    forecast = expected_points_for_player(_player(), fixtures, n=1, start_event=8)
+
+    assert [row["event"] for row in forecast["per_gw"]] == [8]
+    assert forecast["per_gw"][0]["fixtures_count"] == 1
+
+
 def test_double_gameweek_keeps_both_fixtures_inside_window():
     fixtures = _fixtures(
         [

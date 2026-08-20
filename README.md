@@ -1,37 +1,45 @@
 # FPL HoldPlanner DK
 
-Et dansk, statistikbaseret beslutningsværktøj til Fantasy Premier League. Projektet er under en kontrolleret genopbygning til 2026/27-sæsonen: målet er reproducerbare data, ærlige prognoser, backtests og lovlige optimeringsforslag — ikke sorte bokse eller automatiske transfers.
+Et dansk, statistikbaseret beslutningsværktøj til Fantasy Premier League. Den primære app er bygget til Vercel med en responsiv Next.js-brugerflade og en stateless Python-beregningsfunktion. Målet er reproducerbare data, ærlige prognoser, backtests og lovlige optimeringsforslag — ikke sorte bokse eller automatiske transfers.
 
 ## Status
 
 Følgende fundament er implementeret:
 
+- Vercel-native Next.js-app uden Streamlit-sessioner eller WebSockets
+- privat GitHub-login med allowlist på en uforanderlig GitHub-bruger-ID
+- beskyttet backend-for-frontend; den tunge Python-funktion kan ikke kaldes direkte uden en intern nøgle
 - centraliserede FPL-regler for 2026/27 med tests
 - en præcis MILP-optimering af et nyt 15-mandshold uden manager-ID
 - en global, fortløbende gameweek-horisont, som bevarer blanks og doubles korrekt
 - snapshots med metadata og atomisk skrivning til senere backtests
 - adapter til Solio Analytics' offentlige JSON-feed
 - korrekt brug af FPL's `selling_price` for ejede spillere
-- tidsbegrænset Streamlit-cache oven på HTTP-kald med retry/backoff
+- gennemsigtig visning af projektion, kilde, start-XI, kaptajn, bænk og datadækning
 
 Den nuværende interne pointmodel er fortsat en **eksperimentel heuristisk baseline**. Dens output må ikke læses som validerede prognoser, før walk-forward-backtests og kalibrering er på plads. AI- og chipråd er derfor sat på pause som beslutningsmotorer.
 
 ## Kør lokalt
 
-Kræver Python 3.11+.
+Kræver Node.js 20.9+ og Python 3.12.
 
 ```bash
+npm ci
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -r fpl_app/requirements.txt -r requirements-dev.txt
-streamlit run fpl_app/app.py
+python -m pip install -r requirements.txt -r requirements-dev.txt
+cp .env.example .env.local
 ```
 
-Test fundamentet:
+`npm run dev` starter Next.js-delen. Brug `npx vercel@59.1.4 dev`, når både Next.js- og Python-ruterne skal køre lokalt i samme miljø. Et lokalt GitHub OAuth App-callback skal da være `http://localhost:3000/api/auth/callback/github`.
+
+Kvalitetskontrol:
 
 ```bash
+npm run typecheck
+npm run build
 python -m pytest
-python -m compileall -q fpl_app
+python -m compileall -q api fpl_app
 ```
 
 Gem et valideret Solio-snapshot til det git-ignorerede point-in-time-lager:
@@ -40,23 +48,30 @@ Gem et valideret Solio-snapshot til det git-ignorerede point-in-time-lager:
 PYTHONPATH=fpl_app python scripts/fetch_solio_snapshot.py
 ```
 
-Kopiér ved behov `fpl_app/secrets.toml.example` til `fpl_app/.streamlit/secrets.toml`. Hemmeligheder må aldrig committes.
+Den tidligere Streamlit-app ligger fortsat i `fpl_app/` som reference og kan køres med dens separate requirements-fil. Hemmeligheder må aldrig committes.
 
 ## Deploy på Vercel
 
-Repoet indeholder `Dockerfile.vercel`, så Vercel kan bygge den eksisterende
-Streamlit-app som en containerfunktion uden at omskrive brugerfladen. Opret et
-Vercel-projekt fra GitHub-repoet; hver commit bygger et nyt image automatisk.
+Forbind GitHub-repoet direkte til et Vercel-projekt. Vercel registrerer Next.js,
+bygger frontend og pakker `api/compute.py` som en separat Python Function. Push
+til den valgte production branch udløser derefter automatisk deployment.
 
-Til privat brug på Hobby-planen skal **Vercel Authentication / Standard
-Protection** aktiveres, og den beskyttede preview- eller deployment-URL skal
-bruges. Den korte produktionsadresse er ikke omfattet af Standard Protection.
-Undlad derfor at dele eller bruge produktionsadressen, medmindre der tilføjes
-applikationslogin eller betalt beskyttelse af alle deployments.
+Følgende miljøvariabler skal oprettes i Vercel — aldrig i GitHub:
 
-Containeren bruger Vercel Functions og WebSockets. På Hobby-planen kan en aktiv
-Streamlit-session blive afbrudt ved funktionens maksimale varighed; appen kan
-genindlæses uden at foretage handlinger i FPL.
+| Variabel | Formål |
+|---|---|
+| `BETTER_AUTH_URL` | Appens kanoniske `https://...vercel.app`-adresse |
+| `BETTER_AUTH_SECRET` | mindst 32 tilfældige bytes til krypterede sessions |
+| `GITHUB_CLIENT_ID` | Client ID fra GitHub OAuth App |
+| `GITHUB_CLIENT_SECRET` | Client secret fra GitHub OAuth App |
+| `ALLOWED_GITHUB_ID` | numerisk GitHub-ID, aktuelt `199608244` |
+| `INTERNAL_API_TOKEN` | tilfældig intern nøgle mellem Next.js og Python |
+| `SESSION_VERSION` | start med `1`; hæv værdien for at logge alle sessioner ud |
+
+GitHub OAuth App skal have produktionsadressen som Homepage URL og
+`https://<produktionsdomæne>/api/auth/callback/github` som callback. App-login
+beskytter også den stabile produktionsadresse, som Vercels gratis Standard
+Protection ikke dækker.
 
 ## Datakilder
 
@@ -74,16 +89,19 @@ Kildeadaptere skal bevare navn, URL, hentetid, sæson/gameweek, skemaversion og 
 ## Arkitektur
 
 ```text
-FPL/Solio/odds -> adaptere -> validerede snapshots -> features/prognoser
-                                                     -> holdoptimering
-                                                     -> senere backtests
-                                                     -> Streamlit-visning
+Browser -> GitHub-login -> Next.js BFF -> intern token -> Python Function
+                                                   -> FPL/Solio-adaptere
+                                                   -> prognoser + MILP
+                                                   -> JSON -> Next.js UI
 ```
 
+- `app/` og `components/`: Next.js UI, login og beskyttet BFF
+- `api/`: små stateless Vercel Python Functions
+- `lib/`: auth- og sessionsgrænse
 - `fpl_app/domain/`: sæsonregler og kildekontrakter
 - `fpl_app/services/`: API-adaptere, cache og snapshots
 - `fpl_app/logic/`: prognose-baseline og optimering
-- `fpl_app/pages/`: Streamlit-visninger
+- `fpl_app/pages/`: tidligere Streamlit-visninger, bevaret som reference
 - `tests/`: enheds- og kontrakttests
 
 ## Næste milepæle

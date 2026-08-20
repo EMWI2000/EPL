@@ -2,8 +2,13 @@
 from __future__ import annotations
 from typing import Dict, Any, List, Tuple, Optional
 import pandas as pd
-from domain.rules import Position, SCORING
-from services.odds import attack_def_factors
+
+try:  # Package imports used by Vercel and tests.
+    from ..domain.rules import Position, SCORING
+    from ..services.odds import attack_def_factors
+except ImportError:  # Legacy Streamlit working-directory imports.
+    from domain.rules import Position, SCORING
+    from services.odds import attack_def_factors
 
 # FDR fallback-faktorer (bruges hvis ingen odds)
 FDR_FACTOR = {1: 1.30, 2: 1.15, 3: 1.00, 4: 0.88, 5: 0.75}
@@ -343,6 +348,7 @@ def expected_points_for_player(
         odds_ctx_by_fixture: Optional[Dict[Tuple[int, int, int], Dict[str, float]]] = None,
         teams_table: Optional[pd.DataFrame] = None,
         use_ml: bool = False,
+        start_event: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Avanceret EP-beregning for en spiller over de næste n runder.
@@ -357,7 +363,7 @@ def expected_points_for_player(
     Returns:
         Dict med 'per_gw' (liste af {event, ep, fixtures_count}) og 'total_next_n'
     """
-    window = gameweek_window(fixtures, n=n)
+    window = gameweek_window(fixtures, n=n, start_event=start_event)
 
     # ML-artifaktet er kun opt-in, indtil det er tidsopdelt og backtestet. Den
     # almindelige app må ikke lydløst servere en model med ukendt provenance.
@@ -379,7 +385,12 @@ def expected_points_for_player(
     base = calculate_base_ep(player_row, pos)
 
     # Hent kommende kampe
-    upcoming = next_n_fixtures_for_team(fixtures, team_id, n=n)
+    upcoming = next_n_fixtures_for_team(
+        fixtures,
+        team_id,
+        n=n,
+        start_event=start_event,
+    )
 
     # Gruppér kampe per event (for DGW håndtering)
     events_fixtures: Dict[int, List[Dict]] = {}
