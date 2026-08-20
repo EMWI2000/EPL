@@ -183,7 +183,25 @@ def build_my_team_df(
         return pd.DataFrame()
 
     my15 = els[els["id"].isin(my_el_ids)].copy()
-    my15["sell_price"] = my15["now_cost"]
+    pick_by_element = {
+        int(p["element"]): p
+        for p in picks.get("picks", [])
+        if p.get("element") is not None
+    }
+
+    def pick_price(element_id: int, field: str, fallback: float) -> float:
+        value = pick_by_element.get(int(element_id), {}).get(field)
+        return float(value) if value is not None else float(fallback)
+
+    my15["sell_price"] = my15.apply(
+        lambda row: pick_price(row["id"], "selling_price", row["now_cost"]), axis=1
+    )
+    my15["purchase_price"] = my15.apply(
+        lambda row: pick_price(row["id"], "purchase_price", row["now_cost"]), axis=1
+    )
+    my15["sell_price_estimated"] = my15["id"].map(
+        lambda element_id: pick_by_element.get(int(element_id), {}).get("selling_price") is None
+    )
     my15["pos"] = my15["singular_name_short"]
 
     rows = []
@@ -215,7 +233,9 @@ def build_my_team_df(
             "team": str(pl["short_name"]),
             "pos": str(pl["singular_name_short"]),
             "now_cost": float(pl["now_cost"]),
-            "sell_price": float(pl.get("sell_price", pl["now_cost"])),
+            "sell_price": float(pl["sell_price"]),
+            "purchase_price": float(pl["purchase_price"]),
+            "sell_price_estimated": bool(pl["sell_price_estimated"]),
             "status": str(pl["status"]),
             "form": float(pl.get("form", 0) or 0),
             "ep_next_gw": round(float(ep1), 2),

@@ -6,6 +6,7 @@ Importeres i alle pages for konsistent manager ID håndtering.
 from __future__ import annotations
 import streamlit as st
 from typing import Optional
+from utils.config import get_secret
 
 
 def init_manager_id() -> str:
@@ -40,7 +41,7 @@ def init_manager_id() -> str:
         return entry_from_qp
 
     # 3) Fra secrets (DEFAULT_MANAGER_ID)
-    default_id = str(st.secrets.get("DEFAULT_MANAGER_ID", "") or "").strip()
+    default_id = str(get_secret("DEFAULT_MANAGER_ID", "") or "").strip()
     if default_id:
         st.session_state.entry_id = default_id
         return default_id

@@ -2,6 +2,7 @@
 from __future__ import annotations
 from typing import Dict, Any, List, Tuple, Optional
 import pandas as pd
+from domain.rules import Position, SCORING
 from services.odds import attack_def_factors
 
 # FDR fallback-faktorer (bruges hvis ingen odds)
@@ -26,10 +27,19 @@ TEAM_SYNONYMS: Dict[str, str] = {
 
 # Point-værdier for forskellige handlinger per position
 POINTS_CONFIG = {
-    "GKP": {"goal": 6, "assist": 3, "cs": 4, "goals_conceded_penalty": -0.5},
-    "DEF": {"goal": 6, "assist": 3, "cs": 4, "goals_conceded_penalty": -0.5},
-    "MID": {"goal": 5, "assist": 3, "cs": 1, "goals_conceded_penalty": 0},
-    "FWD": {"goal": 4, "assist": 3, "cs": 0, "goals_conceded_penalty": 0},
+    position.value: {
+        "goal": scoring.goal,
+        "assist": scoring.assist,
+        "cs": scoring.clean_sheet,
+        # Den heuristiske baseline bruger en kontinuerlig forventningsværdi;
+        # den officielle regel er -1 point for hver påbegyndt blok af 2 mål.
+        "goals_conceded_penalty": (
+            scoring.goals_conceded_block_points / scoring.goals_conceded_block_size
+            if scoring.goals_conceded_block_size
+            else 0
+        ),
+    }
+    for position, scoring in SCORING.positions.items()
 }
 
 
@@ -92,15 +102,49 @@ def count_fixtures_in_gw(fixtures: pd.DataFrame, team_id: int, event: int) -> in
     return len(fixtures[mask])
 
 
-def get_dgw_events(fixtures: pd.DataFrame, team_id: int, n_events: int = 5) -> List[int]:
-    """Returnerer liste af events hvor holdet har DGW (2+ kampe)."""
-    mask = (fixtures["home_team"] == team_id) | (fixtures["away_team"] == team_id)
-    team_fixt = fixtures.loc[mask].copy()
-    events = sorted([e for e in team_fixt["event"].unique() if e != 0])[:n_events]
+def gameweek_window(
+    fixtures: pd.DataFrame,
+    n: int = 5,
+    start_event: Optional[int] = None,
+) -> List[int]:
+    """Returnér de næste ``n`` fortløbende gameweeks.
+
+    Horisonten er global og ikke holdafhængig. Det er vigtigt, fordi et hold med
+    en blank gameweek ellers fejlagtigt ville få en ekstra, senere kamp med i sin
+    prognose. Fixtures uden tildelt event (``event == 0``) kan ikke placeres i en
+    gameweek og indgår derfor ikke.
+    """
+    if n <= 0 or fixtures.empty or "event" not in fixtures.columns:
+        return []
+
+    scheduled = pd.to_numeric(fixtures["event"], errors="coerce")
+    scheduled = scheduled[scheduled > 0]
+    if scheduled.empty and start_event is None:
+        return []
+
+    first = int(start_event) if start_event is not None else int(scheduled.min())
+    if first <= 0:
+        raise ValueError("start_event skal være en positiv gameweek")
+    return list(range(first, first + int(n)))
+
+
+def get_dgw_events(
+    fixtures: pd.DataFrame,
+    team_id: int,
+    n_events: int = 5,
+    start_event: Optional[int] = None,
+) -> List[int]:
+    """Returnerer DGW-events inden for den globale gameweek-horisont."""
+    events = gameweek_window(fixtures, n_events, start_event=start_event)
     return [e for e in events if count_fixtures_in_gw(fixtures, team_id, e) >= 2]
 
 
-def next_n_fixtures_for_team(fixtures: pd.DataFrame, team_id: int, n: int = 5) -> List[Dict[str, Any]]:
+def next_n_fixtures_for_team(
+    fixtures: pd.DataFrame,
+    team_id: int,
+    n: int = 5,
+    start_event: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     """
     Henter alle kampe i de næste N runder for et givet hold.
     Returnerer liste af dicts med event, fdr, is_home, opponent_team_id.
@@ -108,10 +152,12 @@ def next_n_fixtures_for_team(fixtures: pd.DataFrame, team_id: int, n: int = 5) -
     """
     mask = (fixtures["home_team"] == team_id) | (fixtures["away_team"] == team_id)
     team_fixt = fixtures.loc[mask].copy()
-    team_fixt = team_fixt.sort_values("event")
+    sort_columns = [c for c in ("event", "kickoff_time") if c in team_fixt.columns]
+    team_fixt = team_fixt.sort_values(sort_columns)
 
-    # Få de næste N unikke runder (ekskluder event=0)
-    upcoming_events = [e for e in team_fixt["event"].unique() if e != 0][:n]
+    # Brug den samme kalenderhorisont for alle hold. En blank GW giver ingen
+    # fixture, men skubber ikke horisonten en uge frem.
+    upcoming_events = gameweek_window(fixtures, n, start_event=start_event)
 
     out = []
     for e in upcoming_events:
@@ -296,7 +342,7 @@ def expected_points_for_player(
         n: int = 5,
         odds_ctx_by_fixture: Optional[Dict[Tuple[int, int, int], Dict[str, float]]] = None,
         teams_table: Optional[pd.DataFrame] = None,
-        use_ml: bool = True,
+        use_ml: bool = False,
 ) -> Dict[str, Any]:
     """
     Avanceret EP-beregning for en spiller over de næste n runder.
@@ -311,7 +357,10 @@ def expected_points_for_player(
     Returns:
         Dict med 'per_gw' (liste af {event, ep, fixtures_count}) og 'total_next_n'
     """
-    # Forsøg ML-model først
+    window = gameweek_window(fixtures, n=n)
+
+    # ML-artifaktet er kun opt-in, indtil det er tidsopdelt og backtestet. Den
+    # almindelige app må ikke lydløst servere en model med ukendt provenance.
     if use_ml:
         try:
             from ml.predict import model_available, predict_single_player_multi_gw
@@ -323,9 +372,6 @@ def expected_points_for_player(
     status = str(player_row.get("status", "a"))
     avail = availability_multiplier(status)
 
-    if avail == 0.0:
-        return {"per_gw": [], "total_next_n": 0.0, "has_dgw": False, "dgw_events": []}
-
     pos = str(player_row.get("singular_name_short", "MID"))
     team_id = int(player_row.get("team_id", player_row.get("team", 0)))
 
@@ -334,9 +380,6 @@ def expected_points_for_player(
 
     # Hent kommende kampe
     upcoming = next_n_fixtures_for_team(fixtures, team_id, n=n)
-
-    if not upcoming:
-        return {"per_gw": [], "total_next_n": 0.0, "has_dgw": False, "dgw_events": []}
 
     # Gruppér kampe per event (for DGW håndtering)
     events_fixtures: Dict[int, List[Dict]] = {}
@@ -349,8 +392,8 @@ def expected_points_for_player(
     per_gw = []
     dgw_events = []
 
-    for event in sorted(events_fixtures.keys()):
-        event_fixtures = events_fixtures[event]
+    for event in window:
+        event_fixtures = events_fixtures.get(event, [])
         fixtures_count = len(event_fixtures)
 
         if fixtures_count >= 2:
@@ -403,7 +446,8 @@ def expected_points_for_player(
             "event": int(event),
             "ep": round(event_ep, 2),
             "fixtures_count": fixtures_count,
-            "is_dgw": fixtures_count >= 2
+            "is_dgw": fixtures_count >= 2,
+            "is_blank": fixtures_count == 0,
         })
 
     total = float(sum(x["ep"] for x in per_gw))
@@ -412,7 +456,9 @@ def expected_points_for_player(
         "per_gw": per_gw,
         "total_next_n": total,
         "has_dgw": len(dgw_events) > 0,
-        "dgw_events": dgw_events
+        "dgw_events": dgw_events,
+        "forecast_method": "heuristic_baseline",
+        "is_experimental": True,
     }
 
 

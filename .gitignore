@@ -42,3 +42,4 @@ Thumbs.db
 # Data cache
 *.parquet
 *.csv.gz
+data/snapshots/

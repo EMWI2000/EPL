@@ -10,13 +10,18 @@ from services.data_layer import (
 from logic.captain import captain_score
 from logic.optimizer import best_n_transfers_with_quotas, best_two_transfers, find_best_formation
 from utils.helpers import safe_df
+from utils.config import get_secret
 from utils.session import manager_id_input, get_manager_id
 from utils.ui import inject_css
 
 st.set_page_config(page_title="Opsummering", layout="wide")
 inject_css()
-st.title("📊 Opsummering: Anbefalinger & Forklaringer")
-st.caption("Komplet overblik over dit hold med kaptajn- og transfer-anbefalinger.")
+st.title("📊 Opsummering: eksperimentel screening")
+st.caption("Overblik over dit hold, kaptajnprognose og mulige transfers.")
+st.warning(
+    "Transferforslagene er ikke en valideret flerugersplan og værdisætter endnu ikke gemte "
+    "free transfers, alle start-XI-/bænkeffekter eller chips."
+)
 
 bs, events, els, fixt, teams_df = load_base_data()
 
@@ -28,7 +33,7 @@ with st.sidebar:
     target_gw = st.number_input("Gameweek (mål/GW)", 1, 38, value=default_gw)
     horizon = st.slider("Horisont (antal runder)", 1, 5, 5)
     use_odds = st.toggle("Brug odds i beregninger", value=False)
-    odds_key = st.secrets.get("THE_ODDS_API_KEY", "")
+    odds_key = get_secret("THE_ODDS_API_KEY", "") or ""
 
 entry_id = get_manager_id()
 if not entry_id:

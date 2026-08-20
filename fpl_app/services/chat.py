@@ -4,12 +4,11 @@ AI-integration med support for både OpenAI og Anthropic (Claude).
 Vælger automatisk baseret på tilgængelige API-nøgler.
 """
 from __future__ import annotations
-import os
 import requests
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Optional
 import pandas as pd
-import streamlit as st
+from utils.config import get_secret
 
 
 # ---------------------------------------------------------------------------
@@ -114,8 +113,8 @@ def get_provider() -> Optional[LLMProvider]:
     Returnerer den bedste tilgængelige provider.
     Prioritet: Anthropic > OpenAI.
     """
-    anthropic_key = st.secrets.get("ANTHROPIC_API_KEY", "") or os.getenv("ANTHROPIC_API_KEY", "")
-    openai_key = st.secrets.get("OPENAI_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
+    anthropic_key = get_secret("ANTHROPIC_API_KEY", "") or ""
+    openai_key = get_secret("OPENAI_API_KEY", "") or ""
 
     if anthropic_key:
         return AnthropicProvider(anthropic_key)

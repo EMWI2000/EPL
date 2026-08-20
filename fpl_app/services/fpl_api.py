@@ -1,28 +1,49 @@
 # services/fpl_api.py
 from __future__ import annotations
 import requests
-from functools import lru_cache
 from typing import Dict, Any, List
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 BASE = "https://fantasy.premierleague.com/api"
+DEFAULT_TIMEOUT_SECONDS = 20
+
+
+def _build_session() -> requests.Session:
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        status=3,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session = requests.Session()
+    session.headers.update(
+        {
+            "Accept": "application/json",
+            "User-Agent": "EPL-FPL-Decision-Support/0.2",
+        }
+    )
+    session.mount("https://", adapter)
+    return session
+
+
+_SESSION = _build_session()
 
 def _get(url: str) -> Any:
-    try:
-        r = requests.get(url, timeout=30)
-        if r.status_code == 404:
-            raise requests.HTTPError(f"404 Not Found for URL: {url}")
-        r.raise_for_status()
-        return r.json()
-    except requests.HTTPError:
-        raise
-    except Exception:
-        raise
+    response = _SESSION.get(url, timeout=DEFAULT_TIMEOUT_SECONDS)
+    if response.status_code == 404:
+        raise requests.HTTPError(f"404 Not Found for URL: {url}", response=response)
+    response.raise_for_status()
+    return response.json()
 
-@lru_cache(maxsize=1)
 def bootstrap_static() -> Dict[str, Any]:
     return _get(f"{BASE}/bootstrap-static/")
 
-@lru_cache(maxsize=8)
 def fixtures(future_only: bool = True) -> List[Dict[str, Any]]:
     url = f"{BASE}/fixtures/"
     if future_only:
@@ -35,7 +56,6 @@ def entry_picks(entry_id: int, event_id: int) -> Dict[str, Any]:
 def manager_summary(entry_id: int) -> Dict[str, Any]:
     return _get(f"{BASE}/entry/{entry_id}/")
 
-@lru_cache(maxsize=4096)
 def element_summary(player_id: int) -> Dict[str, Any]:
     return _get(f"{BASE}/element-summary/{player_id}/")
 

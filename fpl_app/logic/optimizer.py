@@ -4,34 +4,22 @@ from typing import List, Dict, Any, Optional, Tuple
 import pandas as pd
 import pulp
 from itertools import combinations
-
-POS_343 = {"GKP": 1, "DEF": 3, "MID": 4, "FWD": 3}
-POS_352 = {"GKP": 1, "DEF": 3, "MID": 5, "FWD": 2}
-POS_442 = {"GKP": 1, "DEF": 4, "MID": 4, "FWD": 2}
-POS_433 = {"GKP": 1, "DEF": 4, "MID": 3, "FWD": 3}
-POS_451 = {"GKP": 1, "DEF": 4, "MID": 5, "FWD": 1}
-POS_532 = {"GKP": 1, "DEF": 5, "MID": 3, "FWD": 2}
-POS_541 = {"GKP": 1, "DEF": 5, "MID": 4, "FWD": 1}
+from domain.rules import FORMATION_BY_CODE, SQUAD, TRANSFERS
 
 FORMATIONS = {
-    "343": POS_343,
-    "352": POS_352,
-    "442": POS_442,
-    "433": POS_433,
-    "451": POS_451,
-    "532": POS_532,
-    "541": POS_541,
+    code: {position.value: count for position, count in formation.positions.items()}
+    for code, formation in FORMATION_BY_CODE.items()
 }
 
-SQUAD_QUOTA = {"GKP": 2, "DEF": 5, "MID": 5, "FWD": 3}
+SQUAD_QUOTA = {position.value: count for position, count in SQUAD.position_quotas.items()}
 
 # Point hit for ekstra transfers
-TRANSFER_HIT = 4.0
+TRANSFER_HIT = float(TRANSFERS.additional_transfer_cost_points)
 
 
 def select_starting_xi(players_df: pd.DataFrame, formation: str = "343") -> List[int]:
     """Vælger optimal starting XI baseret på formation og EP."""
-    need = FORMATIONS.get(formation, POS_343)
+    need = FORMATIONS.get(formation, FORMATIONS["343"])
     df = players_df.copy()
     df["ep_next_gw"] = pd.to_numeric(df.get("ep_next_gw", 0.0), errors="coerce").fillna(0.0)
     df["team_id"] = pd.to_numeric(df["team_id"], errors="coerce").fillna(-1).astype(int)

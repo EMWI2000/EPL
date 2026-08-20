@@ -7,6 +7,7 @@ import warnings
 from services.data_layer import load_base_data, build_odds_context_for_fixtures
 from logic.features import expected_points_for_player, get_player_detailed_stats, price_change_indicator
 from utils.session import init_manager_id
+from utils.config import get_secret
 from utils.ui import inject_css
 
 
@@ -37,10 +38,14 @@ warnings.filterwarnings(
     module="altair.utils.data",
 )
 
-st.set_page_config(page_title="ML-analyse", layout="wide")
+st.set_page_config(page_title="Eksperimentel forecastanalyse", layout="wide")
 inject_css()
-st.title("🧠 ML-inspireret analyse (1–5 GW)")
-st.caption("Avanceret prediktion af forventede point baseret på xG, xA, ICT, fixtures og odds.")
+st.title("🧠 Eksperimentel forecastanalyse (1–5 GW)")
+st.caption("En heuristisk baseline baseret på FPL-statistik, fixtures og eventuelt odds.")
+st.warning(
+    "Dette er ikke en valideret ML-model. Rangeringerne vises til inspektion og skal "
+    "walk-forward-backtestes, før de bruges som endelige købssignaler."
+)
 
 bs, events, els, fixt, teams_df = load_base_data()
 
@@ -52,7 +57,7 @@ with st.sidebar:
 
     horizon = st.slider("Horisont (antal runder)", 1, 5, 5)
     use_odds = st.toggle("Brug odds", value=True)
-    odds_key = st.secrets.get("THE_ODDS_API_KEY", "")
+    odds_key = get_secret("THE_ODDS_API_KEY", "") or ""
 
     st.markdown("---")
     st.subheader("Filtre")
@@ -73,8 +78,14 @@ ep_col = f"EP næste {horizon}"
 with st.spinner("Beregner forventede point for alle spillere..."):
     rows = []
     for _, pl in els.iterrows():
-        ep = expected_points_for_player(pl, fixt, n=horizon, odds_ctx_by_fixture=odds_ctx_by_fixture,
-                                        teams_table=teams_df)
+        ep = expected_points_for_player(
+            pl,
+            fixt,
+            n=horizon,
+            odds_ctx_by_fixture=odds_ctx_by_fixture,
+            teams_table=teams_df,
+            use_ml=False,
+        )
         total = ep["total_next_n"]
         per_gw = ep["per_gw"]
         ep_next_gw = per_gw[0]["ep"] if per_gw else 0.0
