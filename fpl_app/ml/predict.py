@@ -1,43 +1,106 @@
-# ml/predict.py
-"""
-Runtime prediction modul til FPL EP-model.
-Bruger den prætræende LightGBM model til at forudsige spillers forventede point.
-"""
+"""Fail-closed runtime access to the experimental v2 EP model."""
 from __future__ import annotations
+
+import hashlib
 import json
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-import numpy as np
 import pandas as pd
+
+try:
+    from fpl_app.ml.v2_dataset import PointInTimeFeatureBuilder
+except ImportError:
+    from ml.v2_dataset import PointInTimeFeatureBuilder
+
 
 MODEL_DIR = Path(__file__).parent / "models"
 MODEL_PATH = MODEL_DIR / "ep_model.joblib"
 FEATURES_PATH = MODEL_DIR / "feature_columns.joblib"
 META_PATH = MODEL_DIR / "model_meta.json"
-
+ARTIFACT_SCHEMA_VERSION = 2
+FEATURE_CONTRACT = "point_in_time_history_v2"
 _model_cache: Dict[str, Any] = {}
 
 
-def model_available() -> bool:
-    """Tjek om modellen er tilgængelig."""
-    return MODEL_PATH.exists() and FEATURES_PATH.exists()
+class FeatureContractError(RuntimeError):
+    """Raised when runtime inputs cannot reproduce the training features."""
 
 
-def load_model():
-    """Load model og features (cached)."""
+def load_meta() -> Dict[str, Any]:
+    if not META_PATH.exists():
+        return {}
+    try:
+        value = json.loads(META_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def artifact_is_validated() -> bool:
+    """Require an explicit v2 contract and independent validation marker."""
+
+    meta = load_meta()
+    checksums = meta.get("artifact_sha256")
+    if not isinstance(checksums, dict):
+        return False
+
+    def matches(path: Path, expected: Any) -> bool:
+        if not path.is_file() or not isinstance(expected, str):
+            return False
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            return False
+        return digest.hexdigest() == expected
+
+    return (
+        meta.get("schema_version") == ARTIFACT_SCHEMA_VERSION
+        and meta.get("feature_contract") == FEATURE_CONTRACT
+        and meta.get("validation_status") == "validated"
+        and matches(MODEL_PATH, checksums.get("model"))
+        and matches(FEATURES_PATH, checksums.get("features"))
+    )
+
+
+def model_available(runtime_contract: str | None = None) -> bool:
+    """Require artifact, validation and an exactly matching runtime contract."""
+
+    return (
+        runtime_contract == FEATURE_CONTRACT
+        and MODEL_PATH.exists()
+        and FEATURES_PATH.exists()
+        and artifact_is_validated()
+    )
+
+
+def load_model(*, runtime_contract: str):
+    if not model_available(runtime_contract):
+        raise FeatureContractError("The ML artifact is unavailable, unvalidated, or uses another feature contract")
     if "model" not in _model_cache:
         import joblib
+
         _model_cache["model"] = joblib.load(MODEL_PATH)
         _model_cache["features"] = joblib.load(FEATURES_PATH)
     return _model_cache["model"], _model_cache["features"]
 
 
-def load_meta() -> Dict[str, Any]:
-    """Load model metadata."""
-    if META_PATH.exists():
-        return json.loads(META_PATH.read_text())
-    return {}
+def prepare_point_in_time_features(
+    history: pd.DataFrame,
+    candidates: pd.DataFrame,
+    cutoff: Any,
+    feature_columns: List[str],
+) -> pd.DataFrame:
+    """Build serving features through the exact training-time builder."""
+
+    built = PointInTimeFeatureBuilder().build(history, candidates, cutoff)
+    missing = sorted(set(feature_columns).difference(built.columns))
+    if missing:
+        raise FeatureContractError(f"Runtime data cannot reproduce features: {', '.join(missing)}")
+    return built[feature_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
 
 def prepare_features_for_player(
@@ -46,70 +109,22 @@ def prepare_features_for_player(
     fixture_info: Dict[str, Any],
     feature_cols: List[str],
 ) -> pd.DataFrame:
-    """
-    Konverterer en spillers FPL API-data til feature-vektor som modellen forventer.
+    """Reject the legacy aggregate proxy path instead of creating train/serve skew."""
 
-    Args:
-        player_row: Series med spillerdata fra FPL API (elements_df)
-        fixtures_data: Fixtures DataFrame
-        fixture_info: Dict med {event, fdr, is_home, opponent_team_id}
-        feature_cols: Liste af feature-navne modellen forventer
-    """
-    minutes = float(player_row.get("minutes", 0) or 0)
-    games_played = max(minutes / 90.0, 0.5)
-
-    # Base stats
-    features = {
-        "pos_code": _pos_to_code(str(player_row.get("singular_name_short", "MID"))),
-        "is_home": int(fixture_info.get("is_home", False)),
-        "price": float(player_row.get("now_cost", 50)) / 10.0,
-        "selected_pct": float(player_row.get("selected_by_percent", 0) or 0),
-        "net_transfers": float(player_row.get("transfers_in_event", 0) or 0)
-                        - float(player_row.get("transfers_out_event", 0) or 0),
-        "cum_minutes": minutes,
-        "opponent_team_id": int(fixture_info.get("opponent_team_id", 0)),
-    }
-
-    # Per-90 stats
-    goals = float(player_row.get("goals_scored", 0) or 0)
-    assists = float(player_row.get("assists", 0) or 0)
-    cs = float(player_row.get("clean_sheets", 0) or 0)
-    features["goals_per_90"] = goals / games_played
-    features["assists_per_90"] = assists / games_played
-    features["cs_rate"] = cs / games_played
-
-    # xG per 90
-    xG = float(player_row.get("expected_goals", 0) or 0)
-    xA = float(player_row.get("expected_assists", 0) or 0)
-    features["xG_per_90"] = xG / games_played
-    features["xA_per_90"] = xA / games_played
-
-    # Rolling features - vi bruger "form" og andre API-felter som proxy
-    form = float(player_row.get("form", 0) or 0)
-    ppg = float(player_row.get("points_per_game", 0) or 0)
-    ict = float(player_row.get("ict_index", 0) or 0)
-    bps = float(player_row.get("bps", 0) or 0)
-    bonus = float(player_row.get("bonus", 0) or 0)
-
-    # form ≈ gennemsnit af de sidste par GWs point
-    for window in [3, 5]:
-        w = f"_{window}gw"
-        features[f"roll_pts{w}"] = form  # FPL "form" er allerede rolling avg
-        features[f"roll_min{w}"] = min(minutes / max(games_played, 1), 90)
-        features[f"roll_bps{w}"] = bps / games_played
-        features[f"roll_ict{w}"] = ict / games_played
-        features[f"roll_bonus{w}"] = bonus / games_played
-        features[f"roll_xG{w}"] = xG / games_played
-        features[f"roll_xA{w}"] = xA / games_played
-
-    # Lav DataFrame med kun de kolonner modellen forventer
-    row_data = {col: features.get(col, 0.0) for col in feature_cols}
-    return pd.DataFrame([row_data])
+    del player_row, fixtures_data, fixture_info, feature_cols
+    raise FeatureContractError(
+        "Aggregate FPL API rows do not contain the per-gameweek history required by point_in_time_history_v2"
+    )
 
 
-def _pos_to_code(pos: str) -> int:
-    """Konverterer position til numerisk kode."""
-    return {"GKP": 0, "GK": 0, "DEF": 1, "MID": 2, "FWD": 3}.get(pos, 2)
+def predict_point_in_time(
+    history: pd.DataFrame, candidates: pd.DataFrame, cutoff: Any,
+) -> pd.Series:
+    """Predict for callers that can supply the validated v2 runtime contract."""
+
+    model, feature_columns = load_model(runtime_contract=FEATURE_CONTRACT)
+    features = prepare_point_in_time_features(history, candidates, cutoff, feature_columns)
+    return pd.Series(model.predict(features), index=candidates.index, dtype=float).clip(lower=0.0)
 
 
 def predict_single_player_multi_gw(
@@ -118,72 +133,10 @@ def predict_single_player_multi_gw(
     n: int = 5,
     teams_table: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
-    """
-    Forudsiger EP for en spiller over de næste n runder med ML-model.
-    Returnerer samme format som expected_points_for_player() i features.py.
-    """
-    if not model_available():
-        return {"per_gw": [], "total_next_n": 0.0, "has_dgw": False, "dgw_events": []}
+    """Compatibility fallback for the app's legacy aggregate runtime path."""
 
-    model, feature_cols = load_model()
-
-    # Tjek tilgængelighed
-    status = str(player_row.get("status", "a"))
-    if status in ("i", "s"):
-        return {"per_gw": [], "total_next_n": 0.0, "has_dgw": False, "dgw_events": []}
-
-    avail_mult = 1.0
-    if status == "d":
-        avail_mult = 0.5
-    elif status == "u":
-        avail_mult = 0.75
-
-    team_id = int(player_row.get("team_id", player_row.get("team", 0)))
-
-    # Hent kommende fixtures
-    from logic.features import next_n_fixtures_for_team
-    upcoming = next_n_fixtures_for_team(fixtures_df, team_id, n=n)
-
-    if not upcoming:
-        return {"per_gw": [], "total_next_n": 0.0, "has_dgw": False, "dgw_events": []}
-
-    # Gruppér per event
-    events_fixtures: Dict[int, List[Dict]] = {}
-    for fix in upcoming:
-        ev = fix["event"]
-        if ev not in events_fixtures:
-            events_fixtures[ev] = []
-        events_fixtures[ev].append(fix)
-
-    per_gw = []
-    dgw_events = []
-
-    for event in sorted(events_fixtures.keys()):
-        event_fixtures = events_fixtures[event]
-        fixtures_count = len(event_fixtures)
-        if fixtures_count >= 2:
-            dgw_events.append(event)
-
-        event_ep = 0.0
-        for fix in event_fixtures:
-            X = prepare_features_for_player(player_row, fixtures_df, fix, feature_cols)
-            pred = model.predict(X)[0]
-            # Clamp til realistisk range og apply availability
-            pred = max(float(pred), 0.0) * avail_mult
-            event_ep += pred
-
-        per_gw.append({
-            "event": int(event),
-            "ep": round(event_ep, 2),
-            "fixtures_count": fixtures_count,
-            "is_dgw": fixtures_count >= 2,
-        })
-
-    total = float(sum(x["ep"] for x in per_gw))
-
+    del player_row, fixtures_df, n, teams_table
     return {
-        "per_gw": per_gw,
-        "total_next_n": total,
-        "has_dgw": len(dgw_events) > 0,
-        "dgw_events": dgw_events,
+        "per_gw": [], "total_next_n": 0.0, "has_dgw": False, "dgw_events": [],
+        "unavailable_reason": "point_in_time_history_required",
     }

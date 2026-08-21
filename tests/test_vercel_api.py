@@ -25,6 +25,8 @@ def test_health_payload_is_json_serializable():
         ({"horizon": 2.5}, "horizon"),
         ({"include_doubtful": 1}, "include_doubtful"),
         ({"use_solio": "yes"}, "use_solio"),
+        ({"forecast_version": "future"}, "forecast_version"),
+        ({"forecast_version": 2}, "forecast_version"),
         ({"unexpected": True}, "unsupported"),
         ([], "JSON object"),
     ],
@@ -39,7 +41,12 @@ def test_request_validation_applies_defaults_without_mutating_input():
 
     result = compute.validate_request_payload(supplied)
 
-    assert result == {"horizon": 2, "include_doubtful": True, "use_solio": True}
+    assert result == {
+        "horizon": 2,
+        "include_doubtful": True,
+        "use_solio": True,
+        "forecast_version": "v2",
+    }
     assert supplied == {"horizon": 2}
 
 
@@ -237,6 +244,40 @@ def _synthetic_pool(horizon: int = 2) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def test_optimizer_shortlist_is_bounded_diverse_and_deterministic():
+    rows = []
+    position_sizes = {"GKP": 20, "DEF": 45, "MID": 45, "FWD": 30}
+    player_id = 1
+    for position, size in position_sizes.items():
+        for index in range(size):
+            rows.append(
+                {
+                    "id": player_id,
+                    "team_id": (index % 20) + 1,
+                    "pos": position,
+                    "now_cost": 40 + index,
+                    "ep_gw1": float((index * 7) % 19),
+                    "ep_gw2": float((index * 11) % 23),
+                }
+            )
+            player_id += 1
+    pool = pd.DataFrame(rows)
+
+    first = compute._shortlist_optimizer_pool(pool, horizon=2)
+    shuffled = compute._shortlist_optimizer_pool(
+        pool.sample(frac=1.0, random_state=17),
+        horizon=2,
+    )
+
+    assert first.groupby("pos").size().to_dict() == compute.OPTIMIZER_CANDIDATE_LIMITS
+    assert first["id"].tolist() == shuffled["id"].tolist()
+    for position, quota in {"GKP": 2, "DEF": 5, "MID": 5, "FWD": 3}.items():
+        cheapest_ids = set(
+            pool[pool["pos"] == position].nsmallest(quota, ["now_cost", "id"])["id"]
+        )
+        assert cheapest_ids.issubset(set(first["id"]))
+
+
 def test_generate_recommendation_returns_frontend_contract(monkeypatch):
     pool = _synthetic_pool(horizon=2)
     official = pd.DataFrame({"id": pool["id"]})
@@ -278,12 +319,93 @@ def test_generate_recommendation_returns_frontend_contract(monkeypatch):
     )
 
     assert response["meta"]["gameweek_window"] == [7, 8]
+    assert response["meta"]["forecast_version"] == "v2"
+    assert response["meta"]["validation"]["status"] == "unvalidated"
     assert response["meta"]["data_sources"]["solio"]["requested"] is False
+    assert response["meta"]["data_sources"]["fpl"]["optimizer_candidate_count"] == 15
     assert response["summary"]["total_cost_tenths"] == 750
     assert len(response["team"]["squad"]) == 15
     assert len(response["team"]["starters"]) == 11
     assert len(response["team"]["bench"]) == 4
+    assert len(response["team"]["gameweeks"]) == 2
+    assert all(len(plan["starting_ids"]) == 11 for plan in response["team"]["gameweeks"])
     assert sum(player["is_captain"] for player in response["team"]["squad"]) == 1
     assert sum(player["is_vice_captain"] for player in response["team"]["squad"]) == 1
     assert all(len(player["projections"]) == 2 for player in response["team"]["squad"])
+    assert all(
+        "expected_minutes" in projection and "confidence" in projection
+        for player in response["team"]["squad"]
+        for projection in player["projections"]
+    )
+    json.dumps(response, allow_nan=False)
+
+
+def test_solio_projection_does_not_publish_internal_expected_minutes(monkeypatch):
+    pool = _synthetic_pool(horizon=1)
+    official = pd.DataFrame({"id": pool["id"]})
+    fixtures = pd.DataFrame(
+        {
+            "event": [7],
+            "home_team": [1],
+            "away_team": [2],
+            "home_fdr": [3],
+            "away_fdr": [3],
+        }
+    )
+    teams = pd.DataFrame(
+        {
+            "team_id": range(1, 6),
+            "name": [f"Team {index}" for index in range(1, 6)],
+            "short_name": [f"T{index}" for index in range(1, 6)],
+        }
+    )
+    bootstrap = {
+        "events": [
+            {
+                "id": 7,
+                "is_next": True,
+                "deadline_time": "2099-08-01T17:30:00Z",
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        compute,
+        "_load_official_data",
+        lambda: (bootstrap, official, fixtures, teams),
+    )
+    monkeypatch.setattr(compute, "_build_forecast_pool", lambda *args: pool.copy())
+
+    def apply_solio(candidate_pool, *_args, **_kwargs):
+        updated = candidate_pool.copy()
+        updated.loc[updated["id"] == 1, "source_gw1"] = (
+            "solio_points_internal_minutes"
+        )
+        return updated, {
+            "requested": True,
+            "applied": True,
+            "gameweek": 7,
+            "generated_at": None,
+            "matched": 1,
+            "usable": 1,
+            "unmatched": 0,
+            "ambiguous": 0,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(compute, "_apply_solio_overlay", apply_solio)
+
+    response = compute.generate_recommendation(
+        {"horizon": 1, "include_doubtful": False, "use_solio": True}
+    )
+    projections = {
+        player["id"]: player["projections"][0]
+        for player in response["team"]["squad"]
+    }
+
+    assert projections[1]["expected_minutes"] is None
+    assert any(
+        projection["expected_minutes"] is not None
+        for player_id, projection in projections.items()
+        if player_id != 1
+    )
     json.dumps(response, allow_nan=False)

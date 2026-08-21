@@ -18,17 +18,28 @@ import {
 } from "@/components/icons";
 
 type Horizon = 1 | 2 | 3 | 4 | 5;
+type ForecastVersion = "v2" | "legacy";
 
 type Settings = {
   horizon: Horizon;
   includeDoubtful: boolean;
   useSolio: boolean;
+  forecastVersion: ForecastVersion;
 };
 
 type PlayerProjection = {
   gameweek: number;
   ep: number;
   source: string;
+  expected_minutes: number | null;
+  appearance_probability: number;
+  sixty_probability: number;
+  confidence: number;
+  reliability: "low" | "medium" | "high";
+  fixtures_count: number;
+  is_blank: boolean;
+  is_dgw: boolean;
+  components: Record<string, number>;
 };
 
 type Player = {
@@ -60,17 +71,37 @@ type SolioMetadata = {
   warning: string | null;
 };
 
+type GameweekLineup = {
+  gameweek: number;
+  formation: string;
+  starting_ids: number[];
+  bench_ids: number[];
+  captain_id: number;
+  vice_captain_id: number;
+  projected_xi_points: number;
+  projected_captain_bonus: number;
+  projected_bench_contribution: number;
+  objective_points: number;
+};
+
 type RecommendationResponse = {
   meta: {
     generated_at: string;
     gameweek_window: number[];
     horizon: number;
+    forecast_version: ForecastVersion;
     include_doubtful: boolean;
     use_solio_requested: boolean;
+    validation: {
+      status: string;
+      message: string;
+    };
     data_sources: {
       fpl: {
         player_count: number;
         eligible_count: number;
+        optimizer_candidate_count: number;
+        shortlist_method: string;
       };
       solio: SolioMetadata;
     };
@@ -92,6 +123,7 @@ type RecommendationResponse = {
     bench: Player[];
     captain_id: number;
     vice_captain_id: number;
+    gameweeks: GameweekLineup[];
   };
   experimental_notice: string;
 };
@@ -108,6 +140,7 @@ const DEFAULT_SETTINGS: Settings = {
   horizon: 5,
   includeDoubtful: true,
   useSolio: true,
+  forecastVersion: "v2",
 };
 
 const positionNames: Record<Player["position"], string> = {
@@ -158,7 +191,35 @@ function isProjection(value: unknown): value is PlayerProjection {
     isRecord(value) &&
       isFiniteNumber(value.gameweek) &&
       isFiniteNumber(value.ep) &&
-      typeof value.source === "string",
+      typeof value.source === "string" &&
+      (value.expected_minutes === null || isFiniteNumber(value.expected_minutes)) &&
+      isFiniteNumber(value.appearance_probability) &&
+      isFiniteNumber(value.sixty_probability) &&
+      isFiniteNumber(value.confidence) &&
+      ["low", "medium", "high"].includes(String(value.reliability)) &&
+      isFiniteNumber(value.fixtures_count) &&
+      typeof value.is_blank === "boolean" &&
+      typeof value.is_dgw === "boolean" &&
+      isRecord(value.components) &&
+      Object.values(value.components).every(isFiniteNumber),
+  );
+}
+
+function isGameweekLineup(value: unknown): value is GameweekLineup {
+  return Boolean(
+    isRecord(value) &&
+      isFiniteNumber(value.gameweek) &&
+      typeof value.formation === "string" &&
+      Array.isArray(value.starting_ids) &&
+      value.starting_ids.every(isFiniteNumber) &&
+      Array.isArray(value.bench_ids) &&
+      value.bench_ids.every(isFiniteNumber) &&
+      isFiniteNumber(value.captain_id) &&
+      isFiniteNumber(value.vice_captain_id) &&
+      isFiniteNumber(value.projected_xi_points) &&
+      isFiniteNumber(value.projected_captain_bonus) &&
+      isFiniteNumber(value.projected_bench_contribution) &&
+      isFiniteNumber(value.objective_points),
   );
 }
 
@@ -188,17 +249,27 @@ function isRecommendation(value: unknown): value is RecommendationResponse {
     return false;
   }
   const { meta, summary, team } = value;
-  if (!isRecord(meta.data_sources) || !isRecord(meta.data_sources.fpl) || !isRecord(meta.data_sources.solio)) {
+  if (
+    !isRecord(meta.data_sources) ||
+    !isRecord(meta.data_sources.fpl) ||
+    !isRecord(meta.data_sources.solio) ||
+    !isRecord(meta.validation)
+  ) {
     return false;
   }
   const { fpl, solio } = meta.data_sources;
-  return Boolean(
+  const hasValidShape = Boolean(
     typeof meta.generated_at === "string" &&
       Array.isArray(meta.gameweek_window) &&
       meta.gameweek_window.every(isFiniteNumber) &&
       isFiniteNumber(meta.horizon) &&
+      ["v2", "legacy"].includes(String(meta.forecast_version)) &&
+      typeof meta.validation.status === "string" &&
+      typeof meta.validation.message === "string" &&
       isFiniteNumber(fpl.player_count) &&
       isFiniteNumber(fpl.eligible_count) &&
+      isFiniteNumber(fpl.optimizer_candidate_count) &&
+      typeof fpl.shortlist_method === "string" &&
       typeof solio.requested === "boolean" &&
       typeof solio.applied === "boolean" &&
       isFiniteNumber(solio.matched) &&
@@ -215,16 +286,91 @@ function isRecommendation(value: unknown): value is RecommendationResponse {
       team.starters.every(isPlayer) &&
       Array.isArray(team.bench) &&
       team.bench.every(isPlayer) &&
+      Array.isArray(team.gameweeks) &&
+      team.gameweeks.every(isGameweekLineup) &&
       typeof value.experimental_notice === "string",
   );
+  if (!hasValidShape) return false;
+
+  const squad = team.squad as Player[];
+  const starters = team.starters as Player[];
+  const bench = team.bench as Player[];
+  const lineups = team.gameweeks as GameweekLineup[];
+  const squadIds = new Set(squad.map((player) => player.id));
+  if (
+    squad.length !== 15 ||
+    squadIds.size !== 15 ||
+    starters.length !== 11 ||
+    bench.length !== 4 ||
+    lineups.length === 0
+  ) {
+    return false;
+  }
+
+  return lineups.every((lineup) => {
+    const startingIds = new Set(lineup.starting_ids);
+    const benchIds = new Set(lineup.bench_ids);
+    const allLineupIds = new Set([...startingIds, ...benchIds]);
+    return (
+      lineup.starting_ids.length === 11 &&
+      startingIds.size === 11 &&
+      lineup.bench_ids.length === 4 &&
+      benchIds.size === 4 &&
+      allLineupIds.size === 15 &&
+      [...allLineupIds].every((id) => squadIds.has(id)) &&
+      startingIds.has(lineup.captain_id) &&
+      startingIds.has(lineup.vice_captain_id) &&
+      lineup.captain_id !== lineup.vice_captain_id
+    );
+  });
 }
 
 function sourceKind(source: string) {
   return source.toLocaleLowerCase("da-DK").includes("solio") ? "solio" : "internal";
 }
 
-function isStarter(player: Player) {
-  return player.role.toLocaleLowerCase("da-DK").includes("start");
+function projectionFor(player: Player, gameweek: number) {
+  return player.projections.find((projection) => projection.gameweek === gameweek);
+}
+
+function expectedMinutesLabel(projection: PlayerProjection) {
+  return projection.expected_minutes === null
+    ? "xMin ikke oplyst"
+    : `${Math.round(projection.expected_minutes)} xMin`;
+}
+
+function lineupRole(player: Player, lineup: GameweekLineup) {
+  if (player.id === lineup.captain_id) return "Kaptajn";
+  if (player.id === lineup.vice_captain_id) return "Vicekaptajn";
+  if (lineup.starting_ids.includes(player.id)) return "Start-XI";
+  const benchIndex = lineup.bench_ids.indexOf(player.id);
+  return benchIndex >= 0 ? `Bænk ${benchIndex + 1}` : "Ikke udtaget";
+}
+
+function confidenceLabel(confidence: number) {
+  if (confidence >= 0.72) return "Høj";
+  if (confidence >= 0.42) return "Middel";
+  return "Lav";
+}
+
+function lineupPlayers(
+  squad: Player[],
+  lineup: GameweekLineup,
+  role: "starter" | "bench",
+) {
+  const ids = role === "starter" ? lineup.starting_ids : lineup.bench_ids;
+  const byId = new Map(squad.map((player) => [player.id, player]));
+  return ids.flatMap((id, index) => {
+    const player = byId.get(id);
+    if (!player) return [];
+    return [{
+      ...player,
+      role,
+      is_captain: id === lineup.captain_id,
+      is_vice_captain: id === lineup.vice_captain_id,
+      bench_order: role === "bench" ? index + 1 : null,
+    }];
+  });
 }
 
 function SourcePill({ source }: { source: string }) {
@@ -237,8 +383,8 @@ function SourcePill({ source }: { source: string }) {
   );
 }
 
-function PlayerTile({ player }: { player: Player }) {
-  const leadProjection = player.projections[0];
+function PlayerTile({ player, gameweek }: { player: Player; gameweek: number }) {
+  const leadProjection = projectionFor(player, gameweek);
   return (
     <article
       className={classNames("player-tile", player.is_captain && "player-tile--captain")}
@@ -254,16 +400,21 @@ function PlayerTile({ player }: { player: Player }) {
       <strong className="player-tile__name">{player.name}</strong>
       <div className="player-tile__meta">
         <span>{formatPrice(player.price)}</span>
-        <span aria-label={`${formatPoints(player.weighted_ep)} vægtede forventede point`}>
-          {formatPoints(player.weighted_ep)} EP
+        <span aria-label={`${formatPoints(leadProjection?.ep ?? 0)} forventede point i gameweek ${gameweek}`}>
+          {formatPoints(leadProjection?.ep ?? 0)} EP
         </span>
       </div>
+      {leadProjection && (
+        <span className="player-tile__forecast">
+          {expectedMinutesLabel(leadProjection)} · {confidenceLabel(leadProjection.confidence)} sikkerhed
+        </span>
+      )}
       {leadProjection && <span className={classNames("player-tile__source", `player-tile__source--${sourceKind(leadProjection.source)}`)} />}
     </article>
   );
 }
 
-function Pitch({ starters }: { starters: Player[] }) {
+function Pitch({ starters, gameweek }: { starters: Player[]; gameweek: number }) {
   const rows = (["FWD", "MID", "DEF", "GKP"] as const)
     .map((position) => ({
       position,
@@ -287,7 +438,7 @@ function Pitch({ starters }: { starters: Player[] }) {
             <span className="pitch-row__label">{positionNames[row.position]}</span>
             <div className="pitch-row__players">
               {row.players.map((player) => (
-                <PlayerTile key={player.id} player={player} />
+                <PlayerTile key={player.id} player={player} gameweek={gameweek} />
               ))}
             </div>
           </div>
@@ -297,7 +448,7 @@ function Pitch({ starters }: { starters: Player[] }) {
   );
 }
 
-function Bench({ players }: { players: Player[] }) {
+function Bench({ players, gameweek }: { players: Player[]; gameweek: number }) {
   const sorted = [...players].sort((a, b) => (a.bench_order ?? 99) - (b.bench_order ?? 99));
   return (
     <section className="bench-section" aria-labelledby="bench-heading">
@@ -320,8 +471,8 @@ function Bench({ players }: { players: Player[] }) {
               </div>
             </div>
             <div className="bench-card__numbers">
-              <strong>{formatPoints(player.weighted_ep)} EP</strong>
-              <span>{formatPrice(player.price)}</span>
+              <strong>{formatPoints(projectionFor(player, gameweek)?.ep ?? 0)} EP</strong>
+              <span>{projectionFor(player, gameweek) ? expectedMinutesLabel(projectionFor(player, gameweek)!) : "Ingen prognose"} · {formatPrice(player.price)}</span>
             </div>
           </article>
         ))}
@@ -350,10 +501,13 @@ function MetricCard({
   );
 }
 
-function ForecastTable({ data }: { data: RecommendationResponse }) {
+function ForecastTable({ data, gameweek }: { data: RecommendationResponse; gameweek: number }) {
   const gameweeks = data.meta.gameweek_window;
+  const selectedLineup = data.team.gameweeks.find((lineup) => lineup.gameweek === gameweek) ?? data.team.gameweeks[0];
   const players = [...data.team.squad].sort((a, b) => {
-    if (a.role !== b.role) return isStarter(a) ? -1 : 1;
+    const aStarts = selectedLineup.starting_ids.includes(a.id);
+    const bStarts = selectedLineup.starting_ids.includes(b.id);
+    if (aStarts !== bStarts) return aStarts ? -1 : 1;
     return b.weighted_ep - a.weighted_ep;
   });
 
@@ -363,7 +517,7 @@ function ForecastTable({ data }: { data: RecommendationResponse }) {
         <div>
           <p className="eyebrow">Transparens</p>
           <h2 id="forecast-heading">Spillerprognoser</h2>
-          <p>Se pointestimat og datakilde for hver gameweek.</p>
+          <p>Se pointestimat, forventede minutter og usikkerhed for hver gameweek.</p>
         </div>
         <span className="row-count">15 spillere</span>
       </div>
@@ -372,7 +526,7 @@ function ForecastTable({ data }: { data: RecommendationResponse }) {
           <thead>
             <tr>
               <th scope="col">Spiller</th>
-              <th scope="col">Rolle</th>
+              <th scope="col">Rolle i GW{selectedLineup.gameweek}</th>
               <th scope="col">Pris</th>
               {gameweeks.map((gameweek) => (
                 <th scope="col" key={gameweek}>
@@ -385,7 +539,8 @@ function ForecastTable({ data }: { data: RecommendationResponse }) {
           </thead>
           <tbody>
             {players.map((player) => {
-              const primarySource = player.projections[0]?.source ?? "Intern baseline";
+              const primarySource = projectionFor(player, selectedLineup.gameweek)?.source ?? player.projections[0]?.source ?? "Intern baseline";
+              const role = lineupRole(player, selectedLineup);
               return (
                 <tr key={player.id}>
                   <th scope="row">
@@ -398,14 +553,8 @@ function ForecastTable({ data }: { data: RecommendationResponse }) {
                     </span>
                   </th>
                   <td>
-                    <span className={classNames("role-label", isStarter(player) && "role-label--start")}>
-                      {player.is_captain
-                        ? "Kaptajn"
-                        : player.is_vice_captain
-                          ? "Vicekaptajn"
-                          : isStarter(player)
-                            ? "Start-XI"
-                            : `Bænk ${player.bench_order ?? ""}`}
+                    <span className={classNames("role-label", selectedLineup.starting_ids.includes(player.id) && "role-label--start")}>
+                      {role}
                     </span>
                   </td>
                   <td>{formatPrice(player.price)}</td>
@@ -413,17 +562,24 @@ function ForecastTable({ data }: { data: RecommendationResponse }) {
                     const projection = player.projections.find((item) => item.gameweek === gameweek);
                     return (
                       <td key={gameweek}>
-                        <span className="projection-cell">
-                          <strong>{projection ? formatPoints(projection.ep) : "–"}</strong>
+                        <span className="projection-cell projection-cell--stacked">
+                          <span>
+                            <strong>{projection ? formatPoints(projection.ep) : "–"}</strong>
+                            {projection && (
+                              <span
+                                className={classNames(
+                                  "projection-cell__source",
+                                  sourceKind(projection.source) === "solio" && "projection-cell__source--solio",
+                                )}
+                                aria-hidden="true"
+                                title={projection.source}
+                              />
+                            )}
+                          </span>
                           {projection && (
-                            <span
-                              className={classNames(
-                                "projection-cell__source",
-                                sourceKind(projection.source) === "solio" && "projection-cell__source--solio",
-                              )}
-                              aria-hidden="true"
-                              title={projection.source}
-                            />
+                            <small title={`${Math.round(projection.appearance_probability * 100)}% sandsynlighed for minutter`}>
+                              {expectedMinutesLabel(projection)} · {confidenceLabel(projection.confidence)}
+                            </small>
                           )}
                           {projection && (
                             <span className="sr-only">
@@ -446,7 +602,12 @@ function ForecastTable({ data }: { data: RecommendationResponse }) {
       </div>
       <div className="table-legend" aria-label="Forklaring af datakilder">
         <span><i className="legend-dot legend-dot--solio" /> Solio Analytics</span>
-        <span><i className="legend-dot" /> Intern eksperimentel baseline</span>
+        <span><i className="legend-dot" /> Intern {data.meta.forecast_version === "v2" ? "minutjusteret v2" : "legacy-baseline"}</span>
+        <span>xMin = forventede spilleminutter · sikkerhed afspejler datamængde og rollevished</span>
+      </div>
+      <div className={classNames("model-status", data.meta.validation.status !== "validated" && "model-status--warning")}>
+        <InfoIcon />
+        <p><strong>Modelstatus: {data.meta.validation.status}</strong>{data.meta.validation.message}</p>
       </div>
     </section>
   );
@@ -488,7 +649,7 @@ function DataCoverage({ data }: { data: RecommendationResponse }) {
           <h3>Officielle FPL-data</h3>
           <strong>{fpl.eligible_count} <small>valgbare spillere</small></strong>
           <ProgressBar value={fpl.eligible_count} max={fpl.player_count} label="Valgbare FPL-spillere" />
-          <p>{fpl.player_count} spillere i det samlede datasæt.</p>
+          <p>{fpl.player_count} spillere i datasættet · {fpl.optimizer_candidate_count} i det auditerbare MILP-shortlist.</p>
         </article>
 
         <article className="coverage-card">
@@ -578,6 +739,7 @@ export function FplDashboard({ userName }: { userName: string }) {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [appliedSettings, setAppliedSettings] = useState<Settings | null>(null);
   const [recommendation, setRecommendation] = useState<RecommendationResponse | null>(null);
+  const [selectedGameweek, setSelectedGameweek] = useState<number | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -597,6 +759,7 @@ export function FplDashboard({ userName }: { userName: string }) {
           horizon: requestSettings.horizon,
           include_doubtful: requestSettings.includeDoubtful,
           use_solio: requestSettings.useSolio,
+          forecast_version: requestSettings.forecastVersion,
         }),
         cache: "no-store",
         signal: controller.signal,
@@ -612,6 +775,7 @@ export function FplDashboard({ userName }: { userName: string }) {
       }
 
       setRecommendation(body);
+      setSelectedGameweek(body.team.gameweeks[0]?.gameweek ?? body.meta.gameweek_window[0] ?? null);
       setAppliedSettings(requestSettings);
     } catch (requestError) {
       if (requestError instanceof DOMException && requestError.name === "AbortError") return;
@@ -633,7 +797,8 @@ export function FplDashboard({ userName }: { userName: string }) {
     return (
       settings.horizon !== appliedSettings.horizon ||
       settings.includeDoubtful !== appliedSettings.includeDoubtful ||
-      settings.useSolio !== appliedSettings.useSolio
+      settings.useSolio !== appliedSettings.useSolio ||
+      settings.forecastVersion !== appliedSettings.forecastVersion
     );
   }, [settings, appliedSettings]);
 
@@ -658,6 +823,16 @@ export function FplDashboard({ userName }: { userName: string }) {
   const windowLabel = recommendation?.meta.gameweek_window.length
     ? `GW${recommendation.meta.gameweek_window[0]}–GW${recommendation.meta.gameweek_window.at(-1)}`
     : `${settings.horizon} gameweeks`;
+  const activeLineup = recommendation?.team.gameweeks.find(
+    (lineup) => lineup.gameweek === selectedGameweek,
+  ) ?? recommendation?.team.gameweeks[0];
+  const activeStarters = recommendation && activeLineup
+    ? lineupPlayers(recommendation.team.squad, activeLineup, "starter")
+    : recommendation?.team.starters ?? [];
+  const activeBench = recommendation && activeLineup
+    ? lineupPlayers(recommendation.team.squad, activeLineup, "bench")
+    : recommendation?.team.bench ?? [];
+  const recommendationIsStale = Boolean(error && recommendation);
 
   return (
     <>
@@ -729,6 +904,31 @@ export function FplDashboard({ userName }: { userName: string }) {
                 <span className="control-hint">gameweeks</span>
               </fieldset>
 
+              <fieldset className="control-group">
+                <legend>Prognosemodel</legend>
+                <p>V2 dæmper små stikprøver og modellerer spilletid.</p>
+                <div className="model-selector">
+                  <label>
+                    <input
+                      type="radio"
+                      name="forecast-version"
+                      checked={settings.forecastVersion === "v2"}
+                      onChange={() => setSettings((current) => ({ ...current, forecastVersion: "v2" }))}
+                    />
+                    <span><strong>V2</strong><small>Anbefalet</small></span>
+                  </label>
+                  <label>
+                    <input
+                      type="radio"
+                      name="forecast-version"
+                      checked={settings.forecastVersion === "legacy"}
+                      onChange={() => setSettings((current) => ({ ...current, forecastVersion: "legacy" }))}
+                    />
+                    <span><strong>Baseline</strong><small>Til sammenligning</small></span>
+                  </label>
+                </div>
+              </fieldset>
+
               <div className="toggle-list">
                 <label className="toggle-control">
                   <span>
@@ -795,7 +995,9 @@ export function FplDashboard({ userName }: { userName: string }) {
                     <p>Start-XI, kaptajn og bænk inden for de officielle trupbegrænsninger.</p>
                   </div>
                   <div className="result-actions">
-                    <span className="live-status"><span /> Live-data</span>
+                    <span className={classNames("live-status", recommendationIsStale && "live-status--stale")}>
+                      <span /> {recommendationIsStale ? "Forældet resultat" : "Live-data"}
+                    </span>
                     <button className="download-button" type="button" onClick={downloadJson}>
                       <DownloadIcon /> Download JSON
                     </button>
@@ -805,7 +1007,7 @@ export function FplDashboard({ userName }: { userName: string }) {
                 <div className="metrics-grid">
                   <MetricCard label="Vægtet modelscore" value={formatPoints(recommendation.summary.objective_points)} detail="XI + kaptajn + bænk" featured />
                   <MetricCard label="Holdpris" value={formatPrice(recommendation.summary.total_cost)} detail={`${formatPrice(recommendation.summary.bank)} i banken`} />
-                  <MetricCard label="Formation" value={recommendation.summary.formation} detail="Valgt af optimeringen" />
+                  <MetricCard label="Formation" value={activeLineup?.formation ?? recommendation.summary.formation} detail={`Valgt for GW${activeLineup?.gameweek ?? recommendation.meta.gameweek_window[0]}`} />
                   <MetricCard label="Analysevindue" value={windowLabel} detail={`${recommendation.meta.horizon} vægtede gameweeks`} />
                 </div>
 
@@ -813,18 +1015,34 @@ export function FplDashboard({ userName }: { userName: string }) {
                   <div className="section-heading section-heading--pitch">
                     <div>
                       <p className="eyebrow">Startopstilling</p>
-                      <h2 id="lineup-heading">Anbefalet XI</h2>
+                      <h2 id="lineup-heading">Anbefalet XI · GW{activeLineup?.gameweek ?? recommendation.meta.gameweek_window[0]}</h2>
                     </div>
                     <div className="captain-summary">
                       <span>Kaptajnbonus</span>
-                      <strong>+{formatPoints(recommendation.summary.projected_captain_bonus)} EP</strong>
+                      <strong>+{formatPoints(activeLineup?.projected_captain_bonus ?? recommendation.summary.projected_captain_bonus)} EP</strong>
                     </div>
                   </div>
-                  <Pitch starters={recommendation.team.starters} />
-                  <Bench players={recommendation.team.bench} />
+                  <div className="gameweek-tabs" aria-label="Vælg gameweek-opstilling">
+                    {recommendation.team.gameweeks.map((lineup) => (
+                      <button
+                        key={lineup.gameweek}
+                        type="button"
+                        aria-pressed={lineup.gameweek === activeLineup?.gameweek}
+                        className={lineup.gameweek === activeLineup?.gameweek ? "is-active" : undefined}
+                        onClick={() => setSelectedGameweek(lineup.gameweek)}
+                      >
+                        GW{lineup.gameweek}<small>{lineup.formation}</small>
+                      </button>
+                    ))}
+                  </div>
+                  <Pitch starters={activeStarters} gameweek={activeLineup?.gameweek ?? recommendation.meta.gameweek_window[0]} />
+                  <Bench players={activeBench} gameweek={activeLineup?.gameweek ?? recommendation.meta.gameweek_window[0]} />
                 </section>
 
-                <ForecastTable data={recommendation} />
+                <ForecastTable
+                  data={recommendation}
+                  gameweek={activeLineup?.gameweek ?? recommendation.meta.gameweek_window[0]}
+                />
                 <div id="data"><DataCoverage data={recommendation} /></div>
 
                 <section className="method-panel" id="metode" aria-labelledby="method-heading">

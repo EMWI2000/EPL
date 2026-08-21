@@ -1,289 +1,270 @@
 #!/usr/bin/env python3
-"""
-Offline træningsscript for FPL EP-model (LightGBM).
+"""Offline training for the experimental FPL expected-points model.
 
-Bruger vaastav/Fantasy-Premier-League GitHub dataset.
-Kør dette script lokalt for at generere ml/models/ep_model.joblib.
-
-Usage:
-    cd fpl_app
-    python -m ml.train_model
-
-Kræver: lightgbm, scikit-learn, pandas, numpy, joblib, requests
+Version 2 builds every row as it looked at the decision deadline. Player
+histories are isolated by season and player, and validation folds are expanding
+global deadlines, never adjacent CSV rows. Artifacts remain candidates until a
+separate evaluation explicitly promotes them.
 """
 from __future__ import annotations
-import os
+
 import io
+import hashlib
 import json
-import warnings
+import os
 from pathlib import Path
-from typing import List, Tuple
+import tempfile
+from typing import Iterator
 
 import numpy as np
 import pandas as pd
 import requests
 
-warnings.filterwarnings("ignore")
+try:
+    from fpl_app.evaluation.backtest import DeadlineFold, ExpandingDeadlineSplit
+    from fpl_app.ml.v2_dataset import PointInTimeFeatureBuilder, build_point_in_time_dataset
+except ImportError:  # ``cd fpl_app && python -m ml.train_model``
+    from evaluation.backtest import DeadlineFold, ExpandingDeadlineSplit
+    from ml.v2_dataset import PointInTimeFeatureBuilder, build_point_in_time_dataset
+
 
 MODEL_DIR = Path(__file__).parent / "models"
-MODEL_DIR.mkdir(exist_ok=True)
-
-# Sæsoner med xG data (tilgængelige i vaastav dataset)
 SEASONS = ["2022-23", "2023-24", "2024-25"]
 VAASTAV_BASE = "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data"
+ARTIFACT_SCHEMA_VERSION = 2
+FEATURE_CONTRACT = "point_in_time_history_v2"
+CONTEXT_FEATURES = (
+    "pos_code", "is_home", "price", "selected_pct", "net_transfers", "opponent_team_id",
+)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _replace_json(path: Path, value: dict) -> None:
+    """Write metadata atomically on the same filesystem."""
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+        json.dump(value, handle, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
 
 
 def download_season_data(season: str) -> pd.DataFrame:
-    """Download merged_gw.csv for en sæson fra vaastav dataset."""
+    """Download one historical season for an explicitly invoked offline run."""
+
     url = f"{VAASTAV_BASE}/{season}/gws/merged_gw.csv"
     print(f"  Henter {season}...")
     try:
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
-        df = pd.read_csv(io.StringIO(r.text), encoding="utf-8")
-        df["season"] = season
-        return df
-    except Exception as e:
-        print(f"  FEJL ved hentning af {season}: {e}")
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        frame = pd.read_csv(io.StringIO(response.text), encoding="utf-8")
+        frame["season"] = season
+        return frame
+    except Exception as exc:
+        print(f"  FEJL ved hentning af {season}: {exc}")
         return pd.DataFrame()
 
 
 def load_all_seasons() -> pd.DataFrame:
-    """Henter og samler alle sæsoner."""
-    print("Henter data fra vaastav/Fantasy-Premier-League...")
-    frames = []
-    for season in SEASONS:
-        df = download_season_data(season)
-        if not df.empty:
-            frames.append(df)
+    """Download and combine the configured seasons."""
+
+    frames = [download_season_data(season) for season in SEASONS]
+    frames = [frame for frame in frames if not frame.empty]
     if not frames:
-        raise RuntimeError("Ingen data hentet – tjek internetforbindelse")
+        raise RuntimeError("Ingen data hentet - tjek internetforbindelse")
     return pd.concat(frames, ignore_index=True)
 
 
-def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Feature engineering: rolling stats, per-90 stats, position encoding."""
-    # Sortér efter spiller + sæson + runde
-    df = df.sort_values(["element", "season", "GW"]).reset_index(drop=True)
-
-    # Konverter numeriske kolonner
-    num_cols = [
-        "total_points", "minutes", "goals_scored", "assists", "clean_sheets",
-        "goals_conceded", "bonus", "bps", "influence", "creativity", "threat",
-        "ict_index", "value", "selected", "transfers_in", "transfers_out",
-    ]
-    # xG kolonner (kan mangle i ældre data)
-    xg_cols = [
-        "expected_goals", "expected_assists", "expected_goal_involvements",
-        "expected_goals_conceded",
-    ]
-
-    for c in num_cols + xg_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-
-    # Position encoding
-    if "position" in df.columns:
-        pos_map = {"GK": 0, "GKP": 0, "DEF": 1, "MID": 2, "FWD": 3}
-        df["pos_code"] = df["position"].map(pos_map).fillna(2).astype(int)
-    elif "element_type" in df.columns:
-        df["pos_code"] = df["element_type"].astype(int) - 1
-    else:
-        df["pos_code"] = 2
-
-    # is_home
-    if "was_home" in df.columns:
-        df["is_home"] = df["was_home"].astype(int)
-    else:
-        df["is_home"] = 0
-
-    # opponent_fdr (hvis tilgængelig)
-    if "opponent_team" in df.columns:
-        df["opponent_team_id"] = pd.to_numeric(df["opponent_team"], errors="coerce").fillna(0).astype(int)
-    else:
-        df["opponent_team_id"] = 0
-
-    # Rolling features per spiller
-    group = df.groupby("element")
-
-    for window in [3, 5]:
-        w = f"_{window}gw"
-        df[f"roll_pts{w}"] = group["total_points"].transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
-        df[f"roll_min{w}"] = group["minutes"].transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
-        df[f"roll_bps{w}"] = group["bps"].transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
-        df[f"roll_ict{w}"] = group["ict_index"].transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
-        df[f"roll_bonus{w}"] = group["bonus"].transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
-
-        if "expected_goals" in df.columns:
-            df[f"roll_xG{w}"] = group["expected_goals"].transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
-            df[f"roll_xA{w}"] = group["expected_assists"].transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
-
-    # Kumulativ per-90 stats (op til forrige runde)
-    df["cum_minutes"] = group["minutes"].transform(lambda x: x.shift(1).cumsum())
-    df["cum_goals"] = group["goals_scored"].transform(lambda x: x.shift(1).cumsum())
-    df["cum_assists"] = group["assists"].transform(lambda x: x.shift(1).cumsum())
-    df["cum_cs"] = group["clean_sheets"].transform(lambda x: x.shift(1).cumsum())
-
-    safe_90s = (df["cum_minutes"] / 90.0).clip(lower=0.5)
-    df["goals_per_90"] = df["cum_goals"] / safe_90s
-    df["assists_per_90"] = df["cum_assists"] / safe_90s
-    df["cs_rate"] = df["cum_cs"] / safe_90s
-
-    if "expected_goals" in df.columns:
-        df["cum_xG"] = group["expected_goals"].transform(lambda x: x.shift(1).cumsum())
-        df["cum_xA"] = group["expected_assists"].transform(lambda x: x.shift(1).cumsum())
-        df["xG_per_90"] = df["cum_xG"] / safe_90s
-        df["xA_per_90"] = df["cum_xA"] / safe_90s
-
-    # Net transfers
-    df["net_transfers"] = df["transfers_in"] - df["transfers_out"]
-
-    # Value (pris)
-    if "value" in df.columns:
-        df["price"] = df["value"].astype(float) / 10.0
-    else:
-        df["price"] = 5.0
-
-    # Selected by
-    if "selected" in df.columns:
-        df["selected_pct"] = pd.to_numeric(df["selected"], errors="coerce").fillna(0)
-    else:
-        df["selected_pct"] = 0
-
-    # Target: næste GWs point (shift -1 inden for samme spiller+sæson)
-    df["target"] = group["total_points"].shift(-1)
-
-    return df
+def _require(frame: pd.DataFrame, columns: tuple[str, ...]) -> None:
+    missing = sorted(set(columns).difference(frame.columns))
+    if missing:
+        raise ValueError(f"Missing required columns: {', '.join(missing)}")
 
 
-def get_feature_columns(df: pd.DataFrame) -> List[str]:
-    """Returnerer liste af feature-kolonner."""
-    features = [
-        "pos_code", "is_home", "price", "selected_pct", "net_transfers",
-        "cum_minutes", "goals_per_90", "assists_per_90", "cs_rate",
-    ]
-
-    # Rolling features
-    for window in [3, 5]:
-        w = f"_{window}gw"
-        features += [f"roll_pts{w}", f"roll_min{w}", f"roll_bps{w}", f"roll_ict{w}", f"roll_bonus{w}"]
-        if f"roll_xG{w}" in df.columns:
-            features += [f"roll_xG{w}", f"roll_xA{w}"]
-
-    # Per-90 xG features
-    if "xG_per_90" in df.columns:
-        features += ["xG_per_90", "xA_per_90"]
-
-    if "opponent_team_id" in df.columns:
-        features.append("opponent_team_id")
-
-    # Returnér kun kolonner der faktisk findes
-    return [f for f in features if f in df.columns]
+def _position_code(frame: pd.DataFrame) -> pd.Series:
+    if "position" in frame:
+        return frame["position"].map({"GK": 0, "GKP": 0, "DEF": 1, "MID": 2, "FWD": 3}).fillna(2).astype(int)
+    if "element_type" in frame:
+        return pd.to_numeric(frame["element_type"], errors="coerce").fillna(3).astype(int) - 1
+    return pd.Series(2, index=frame.index, dtype=int)
 
 
-def train_and_save():
-    """Hovedfunktion: hent data, træn model, gem."""
-    import lightgbm as lgb
-    from sklearn.model_selection import TimeSeriesSplit
-    from sklearn.metrics import mean_absolute_error
-    import joblib
+def _decision_deadlines(frame: pd.DataFrame) -> pd.Series:
+    """Return one globally sortable decision time per season/gameweek."""
 
-    # 1. Hent data
-    raw = load_all_seasons()
-    print(f"Rå data: {len(raw)} rækker, {len(raw.columns)} kolonner")
+    for column in ("deadline_time", "deadline"):
+        if column in frame:
+            parsed = pd.to_datetime(frame[column], utc=True, errors="coerce")
+            if parsed.notna().all():
+                return parsed
+    if "kickoff_time" not in frame:
+        raise ValueError("Training data needs deadline_time, deadline or kickoff_time")
+    kickoff = pd.to_datetime(frame["kickoff_time"], utc=True, errors="coerce")
+    if kickoff.isna().any():
+        raise ValueError("kickoff_time contains invalid timestamps")
+    return frame.assign(_kickoff=kickoff).groupby(["season", "event"], sort=False)["_kickoff"].transform("min")
 
-    # 2. Feature engineering
-    df = engineer_features(raw)
 
-    # 3. Fjern rækker uden target eller med for lidt data
-    df = df.dropna(subset=["target"])
-    df = df[df["cum_minutes"] > 90]  # Mindst 1 kamp spillet
-    print(f"Efter filtrering: {len(df)} rækker")
+def _number(frame: pd.DataFrame, column: str, default: float) -> pd.Series:
+    if column not in frame:
+        return pd.Series(default, index=frame.index, dtype=float)
+    return pd.to_numeric(frame[column], errors="coerce").fillna(default)
 
-    # 4. Features
-    feature_cols = get_feature_columns(df)
-    print(f"Features ({len(feature_cols)}): {feature_cols}")
 
-    X = df[feature_cols].fillna(0)
-    y = df["target"]
+def prepare_training_frames(raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """Normalize raw fixture rows into history and decision contracts."""
 
-    # 5. Train/val split (TimeSeriesSplit)
-    tscv = TimeSeriesSplit(n_splits=5)
-    maes = []
+    frame = raw.copy().rename(columns={
+        **({"element": "player_id"} if "element" in raw and "player_id" not in raw else {}),
+        **({"GW": "event"} if "GW" in raw and "event" not in raw else {}),
+    })
+    required_stats = tuple(PointInTimeFeatureBuilder().stats)
+    _require(frame, ("season", "player_id", "event", "total_points", *required_stats))
+    for column in required_stats:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
+    frame["player_id"] = pd.to_numeric(frame["player_id"], errors="raise").astype(int)
+    frame["event"] = pd.to_numeric(frame["event"], errors="raise").astype(int)
 
-    for fold, (train_idx, val_idx) in enumerate(tscv.split(X), 1):
-        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+    deadline_source = "deadline_time" if "deadline_time" in frame else "deadline"
+    if "deadline_time" not in frame and "deadline" not in frame:
+        deadline_source = "earliest_kickoff_proxy"
+    frame["deadline"] = _decision_deadlines(frame)
+    frame["target"] = pd.to_numeric(frame["total_points"], errors="coerce")
+    frame["pos_code"] = _position_code(frame)
+    frame["is_home"] = _number(frame, "was_home", 0).astype(int)
+    frame["price"] = _number(frame, "value", 50) / 10.0
+    frame["selected_pct"] = _number(frame, "selected", 0)
+    frame["net_transfers"] = _number(frame, "transfers_in", 0) - _number(frame, "transfers_out", 0)
+    frame["opponent_team_id"] = _number(frame, "opponent_team", 0).astype(int)
 
-        model = lgb.LGBMRegressor(
-            n_estimators=500,
-            learning_rate=0.05,
-            max_depth=6,
-            num_leaves=31,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.1,
-            reg_lambda=0.1,
-            min_child_samples=20,
-            verbose=-1,
-        )
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_val, y_val)],
-            callbacks=[lgb.early_stopping(50, verbose=False)],
-        )
-        preds = model.predict(X_val)
-        mae = mean_absolute_error(y_val, preds)
-        maes.append(mae)
-        print(f"  Fold {fold}: MAE = {mae:.3f}")
+    history = frame[["season", "player_id", "event", *required_stats]].copy()
+    decisions = frame[[
+        "season", "player_id", "event", "deadline", "target", *CONTEXT_FEATURES,
+    ]].copy()
+    return history, decisions, deadline_source
 
-    avg_mae = np.mean(maes)
-    print(f"\nGennemsnitlig MAE: {avg_mae:.3f}")
 
-    # 6. Træn final model på al data
-    print("Træner final model...")
-    final_model = lgb.LGBMRegressor(
-        n_estimators=500,
-        learning_rate=0.05,
-        max_depth=6,
-        num_leaves=31,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=0.1,
-        min_child_samples=20,
-        verbose=-1,
+def engineer_features(raw: pd.DataFrame) -> pd.DataFrame:
+    """Build the point-in-time dataset shared by train and future serving."""
+
+    history, decisions, _ = prepare_training_frames(raw)
+    return build_point_in_time_dataset(history, decisions, target_col="target")
+
+
+def get_feature_columns(frame: pd.DataFrame) -> list[str]:
+    """Return the deterministic v2 feature contract in dataframe order."""
+
+    columns = list(CONTEXT_FEATURES)
+    columns.extend(
+        column for column in frame.columns
+        if column.startswith(("cum_", "roll_"))
+        or column in {"history_minutes", "history_events", "sample_weight"}
+        or column.endswith("_per90")
     )
+    return list(dict.fromkeys(columns))
+
+
+def deadline_folds(
+    dataset: pd.DataFrame, *, min_train_deadlines: int = 5,
+) -> Iterator[tuple[DeadlineFold, pd.Series, pd.Series]]:
+    """Yield global expanding deadline masks, independent of input row order."""
+
+    splitter = ExpandingDeadlineSplit(min_train_deadlines=min_train_deadlines)
+    for fold in splitter.split(dataset, deadline_col="deadline"):
+        train_mask, test_mask = splitter.masks(dataset, fold, deadline_col="deadline")
+        yield fold, train_mask, test_mask
+
+
+def train_and_save() -> None:
+    """Train a v2 candidate artifact. This is never called on import."""
+
+    import joblib
+    import lightgbm as lgb
+    from sklearn.metrics import mean_absolute_error
+
+    raw = load_all_seasons()
+    _, _, deadline_source = prepare_training_frames(raw)
+    dataset = engineer_features(raw).dropna(subset=["target"])
+    feature_columns = get_feature_columns(dataset)
+    X = dataset[feature_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    y = pd.to_numeric(dataset["target"], errors="coerce")
+    if len(pd.unique(pd.to_datetime(dataset["deadline"], utc=True))) < 6:
+        raise ValueError("At least six decision deadlines are required for walk-forward validation")
+
+    params = dict(
+        n_estimators=500, learning_rate=0.05, max_depth=6, num_leaves=31,
+        subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=0.1,
+        min_child_samples=20, verbose=-1,
+    )
+    fold_metrics = []
+    for fold, train_mask, test_mask in deadline_folds(dataset):
+        model = lgb.LGBMRegressor(**params)
+        model.fit(X.loc[train_mask], y.loc[train_mask])
+        prediction = model.predict(X.loc[test_mask])
+        fold_metrics.append({
+            "fold": fold.fold,
+            "test_deadline": fold.test_deadline.isoformat(),
+            "n_train": int(train_mask.sum()),
+            "n_test": int(test_mask.sum()),
+            "mae": float(mean_absolute_error(y.loc[test_mask], prediction)),
+        })
+
+    MODEL_DIR.mkdir(exist_ok=True)
+    metadata_path = MODEL_DIR / "model_meta.json"
+    # Invalidate any previously promoted bundle before replacing a byte.  A
+    # crash during training or publication therefore fails closed at runtime.
+    _replace_json(
+        metadata_path,
+        {
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "feature_contract": FEATURE_CONTRACT,
+            "validation_status": "training",
+        },
+    )
+    final_model = lgb.LGBMRegressor(**params)
     final_model.fit(X, y)
-
-    # 7. Feature importance
-    importances = dict(zip(feature_cols, final_model.feature_importances_))
-    sorted_imp = sorted(importances.items(), key=lambda x: x[1], reverse=True)
-    print("\nFeature importance:")
-    for name, imp in sorted_imp[:10]:
-        print(f"  {name}: {imp}")
-
-    # 8. Gem
-    model_path = MODEL_DIR / "ep_model.joblib"
-    features_path = MODEL_DIR / "feature_columns.joblib"
-    meta_path = MODEL_DIR / "model_meta.json"
-
-    joblib.dump(final_model, model_path)
-    joblib.dump(feature_cols, features_path)
-
-    meta = {
+    metadata = {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
+        "feature_contract": FEATURE_CONTRACT,
+        "validation_status": "candidate",
+        "deadline_source": deadline_source,
         "seasons": SEASONS,
-        "n_features": len(feature_cols),
-        "n_training_rows": len(X),
-        "avg_mae": round(avg_mae, 3),
-        "feature_importance": {k: int(v) for k, v in sorted_imp},
+        "n_features": len(feature_columns),
+        "n_training_rows": len(dataset),
+        "folds": fold_metrics,
+        "avg_mae": float(np.mean([item["mae"] for item in fold_metrics])),
+        "activation_note": "Requires independent backtest approval and point-in-time runtime history.",
     }
-    meta_path.write_text(json.dumps(meta, indent=2))
-
-    print(f"\nModel gemt: {model_path}")
-    print(f"Features gemt: {features_path}")
-    print(f"Metadata gemt: {meta_path}")
-    print(f"Model størrelse: {model_path.stat().st_size / 1024:.0f} KB")
+    with tempfile.TemporaryDirectory(dir=MODEL_DIR, prefix=".candidate-") as directory:
+        staging = Path(directory)
+        model_path = staging / "ep_model.joblib"
+        features_path = staging / "feature_columns.joblib"
+        joblib.dump(final_model, model_path)
+        joblib.dump(feature_columns, features_path)
+        metadata["artifact_sha256"] = {
+            "model": _sha256(model_path),
+            "features": _sha256(features_path),
+        }
+        os.replace(model_path, MODEL_DIR / "ep_model.joblib")
+        os.replace(features_path, MODEL_DIR / "feature_columns.joblib")
+        # Metadata is last: readers cannot see candidate/validated status until
+        # both artifacts and their checksums are in place.
+        _replace_json(metadata_path, metadata)
 
 
 if __name__ == "__main__":

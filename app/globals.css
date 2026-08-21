@@ -517,6 +517,55 @@ main {
   outline: 3px solid rgba(117, 89, 232, 0.35);
 }
 
+.model-selector {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.model-selector label {
+  cursor: pointer;
+}
+
+.model-selector input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  opacity: 0;
+}
+
+.model-selector span {
+  display: grid;
+  min-height: 52px;
+  align-content: center;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: white;
+  color: #56645f;
+}
+
+.model-selector strong {
+  color: var(--forest);
+  font-size: 11px;
+}
+
+.model-selector small {
+  font-size: 8px;
+}
+
+.model-selector input:checked + span {
+  border-color: var(--forest);
+  background: var(--mint);
+  box-shadow: inset 0 0 0 1px var(--forest);
+}
+
+.model-selector input:focus-visible + span {
+  outline: 3px solid rgba(117, 89, 232, 0.35);
+}
+
 .control-hint {
   display: block;
   margin-top: 7px;
@@ -783,6 +832,15 @@ main {
   border-radius: 50%;
   background: #44a06d;
   box-shadow: 0 0 0 4px rgba(68, 160, 109, 0.12);
+}
+
+.live-status--stale {
+  color: #8a5a20;
+}
+
+.live-status--stale > span {
+  background: #d08a32;
+  box-shadow: 0 0 0 4px rgba(208, 138, 50, 0.14);
 }
 
 .download-button,
@@ -1107,6 +1165,16 @@ main {
   font-weight: 900;
 }
 
+.player-tile__forecast {
+  overflow: hidden;
+  margin-top: 3px;
+  color: #74817d;
+  font-size: 7px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .player-tile__source {
   position: absolute;
   right: 0;
@@ -1122,6 +1190,44 @@ main {
 
 .bench-section {
   padding: 24px 27px 28px;
+}
+
+.gameweek-tabs {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 0 27px 15px;
+  scrollbar-width: thin;
+}
+
+.gameweek-tabs button {
+  display: grid;
+  min-width: 64px;
+  gap: 1px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: white;
+  color: #66746f;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 850;
+  cursor: pointer;
+}
+
+.gameweek-tabs button small {
+  font-size: 7px;
+  font-weight: 700;
+}
+
+.gameweek-tabs button.is-active {
+  border-color: var(--forest);
+  background: var(--forest);
+  color: white;
+}
+
+.gameweek-tabs button:focus-visible {
+  outline: 3px solid rgba(117, 89, 232, 0.35);
 }
 
 .section-heading--compact {
@@ -1349,6 +1455,23 @@ tbody tr:hover {
   gap: 5px;
 }
 
+.projection-cell--stacked {
+  display: inline-grid;
+  gap: 2px;
+}
+
+.projection-cell--stacked > span {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.projection-cell--stacked small {
+  color: #7b8884;
+  font-size: 7px;
+  font-weight: 650;
+}
+
 .projection-cell strong {
   font-size: 11px;
 }
@@ -1413,6 +1536,34 @@ tbody tr:hover {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+
+.model-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin: 0 27px 20px;
+  padding: 11px 13px;
+  border-radius: 10px;
+  background: var(--mint);
+  color: var(--forest);
+  font-size: 9px;
+}
+
+.model-status--warning {
+  background: #fff5d8;
+  color: #71591a;
+}
+
+.model-status svg {
+  width: 15px;
+  flex: 0 0 auto;
+}
+
+.model-status p {
+  display: grid;
+  gap: 2px;
+  margin: 0;
 }
 
 .coverage-grid {

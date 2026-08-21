@@ -1,23 +1,30 @@
 # FPL HoldPlanner DK
 
-Et dansk, statistikbaseret beslutningsværktøj til Fantasy Premier League. Den primære app er bygget til Vercel med en responsiv Next.js-brugerflade og en stateless Python-beregningsfunktion. Målet er reproducerbare data, ærlige prognoser, backtests og lovlige optimeringsforslag — ikke sorte bokse eller automatiske transfers.
+Et dansk, statistikbaseret beslutningsværktøj til Fantasy Premier League. Den primære app er bygget til Vercel med en responsiv Next.js-brugerflade og en stateless Python-beregningsfunktion. Målet er reproducerbare data, usikkerhedsmarkerede prognoser, backtests og regelgyldige holdforslag. Appen foretager ikke transfers.
 
 ## Status
 
-Følgende fundament er implementeret:
+Følgende er implementeret:
 
 - Vercel-native Next.js-app uden Streamlit-sessioner eller WebSockets
-- privat GitHub-login med allowlist på en uforanderlig GitHub-bruger-ID
+- privat GitHub-login med en tilladelsesliste med et uforanderligt GitHub-bruger-id
 - beskyttet backend-for-frontend; den tunge Python-funktion kan ikke kaldes direkte uden en intern nøgle
 - centraliserede FPL-regler for 2026/27 med tests
-- en præcis MILP-optimering af et nyt 15-mandshold uden manager-ID
+- en minutmodel, der kombinerer FPL-status, antal starter og historiske minutter
+- empirical-Bayes-shrinkage mod dynamiske positions- og prispriorer med 900 minutters priorstyrke
+- pointdekomponering, forventede minutter og usikkerhed for hver spiller og gameweek
+- en lovlig 15-mandstrup med separat XI, kaptajn, vicekaptajn og bænk i hver gameweek
+- en fast shortlist på 45 spillere til serverless-kørslen, som dækker billige budgetspillere, værdi og GW-specialister
+- MILP-optimering af truppen, XI og kaptajn inden for shortlisten; bænken sorteres efter tilgængelighedsjusteret EP
 - en global, fortløbende gameweek-horisont, som bevarer blanks og doubles korrekt
 - snapshots med metadata og atomisk skrivning til senere backtests
 - adapter til Solio Analytics' offentlige JSON-feed
 - korrekt brug af FPL's `selling_price` for ejede spillere
-- gennemsigtig visning af projektion, kilde, start-XI, kaptajn, bænk og datadækning
+- lækagesikre deadline-folds, evalueringsmetrics og GW-parret bootstrap
+- en ML-pipeline med fælles featurekontrakt til træning og drift; modelartefakter er deaktiveret, indtil de er valideret
+- gennemsigtig visning af projektion, kilde, xMin, usikkerhed, start-XI, kaptajn, bænk og datadækning
 
-Den nuværende interne pointmodel er fortsat en **eksperimentel heuristisk baseline**. Dens output må ikke læses som validerede prognoser, før walk-forward-backtests og kalibrering er på plads. AI- og chipråd er derfor sat på pause som beslutningsmotorer.
+V2 er standard i webappen. Legacy-baselinen kan vælges til sammenligning. Begge er **eksperimentelle**. De tekniske tests dokumenterer beregningerne, men dokumenterer endnu ikke prognosekvaliteten. V2 skal derfor walk-forward-testes og kalibreres på deadline-snapshots, før den kan kaldes valideret. Funktionerne til AI- og chipråd er fortsat deaktiveret.
 
 ## Kør lokalt
 
@@ -48,15 +55,15 @@ Gem et valideret Solio-snapshot til det git-ignorerede point-in-time-lager:
 PYTHONPATH=fpl_app python scripts/fetch_solio_snapshot.py
 ```
 
-Den tidligere Streamlit-app ligger fortsat i `fpl_app/` som reference og kan køres med dens separate requirements-fil. Hemmeligheder må aldrig committes.
+Den tidligere Streamlit-app ligger fortsat i `fpl_app/` som reference og kan køres med dens separate requirements-fil. Hemmeligheder må aldrig checkes ind.
 
 ## Deploy på Vercel
 
 Forbind GitHub-repoet direkte til et Vercel-projekt. Vercel registrerer Next.js,
 bygger frontend og pakker `api/compute.py` som en separat Python Function. Push
-til den valgte production branch udløser derefter automatisk deployment.
+til den valgte produktionsbranch udløser derefter automatisk deployment.
 
-Følgende miljøvariabler skal oprettes i Vercel — aldrig i GitHub:
+Følgende miljøvariabler skal oprettes i Vercel og må aldrig gemmes i GitHub:
 
 | Variabel | Formål |
 |---|---|
@@ -79,8 +86,8 @@ Se også den konkrete [datakilde- og købsguide](docs/DATA_SOURCES.md).
 
 | Kilde | Brug | Adgang/licensprincip |
 |---|---|---|
-| [Officiel FPL API](https://fantasy.premierleague.com/api/bootstrap-static/) | spillere, priser, status, fixtures og managerdata | offentlig endpoint; snapshot rå respons med hentetid |
-| [Solio Analytics](https://fpl.solioanalytics.com/) | ekstern projektion og hold-/kampestimater | offentligt JSON-feed; vis attribution “Solio Analytics” |
+| [Officiel FPL API](https://fantasy.premierleague.com/api/bootstrap-static/) | spillere, priser, status, fixtures og managerdata | offentligt endpoint; snapshot rå respons med hentetid |
+| [Solio Analytics](https://fpl.solioanalytics.com/) | ekstern projektion og hold-/kampestimater | offentligt JSON-feed; vis attribution „Solio Analytics“ |
 | Oddsleverandør | markedssandsynligheder | valgfri API-nøgle; rådata må ikke publiceres uden licens |
 | Betalte projektioner | senere model-ensemble/benchmark | kun brugerens egen eksport; ingen redistribuering i repoet |
 
@@ -96,22 +103,24 @@ Browser -> GitHub-login -> Next.js BFF -> intern token -> Python Function
 ```
 
 - `app/` og `components/`: Next.js UI, login og beskyttet BFF
-- `api/`: små stateless Vercel Python Functions
+- `api/`: stateless Vercel Python Functions
 - `lib/`: auth- og sessionsgrænse
 - `fpl_app/domain/`: sæsonregler og kildekontrakter
 - `fpl_app/services/`: API-adaptere, cache og snapshots
-- `fpl_app/logic/`: prognose-baseline og optimering
+- `fpl_app/logic/`: forecast v2, legacy-baseline og flerugersoptimering
+- `fpl_app/evaluation/`: deadline-folds, metrics og bootstrap
+- `fpl_app/ml/v2_dataset.py`: fælles point-in-time-featurebygning til træning og serving
 - `fpl_app/pages/`: tidligere Streamlit-visninger, bevaret som reference
 - `tests/`: enheds- og kontrakttests
 
 ## Næste milepæle
 
-1. Gem deadline-snapshots hver gameweek og byg et point-in-time træningssæt uden datalækage.
-2. Walk-forward-backtest mod simple baselines og eksterne projektioner; rapportér MAE, calibration, captain regret og transfer regret.
-3. Erstat heuristikken med et kalibreret ensemble for point og spilletid.
-4. Udvid optimeringen fra starttrup til flerugers transfers, frie transfers, hits, chips, bench og captaincy.
-5. Aktivér automatiske ugentlige rapporter efter deadline-/tilgængelighedstests — men lad alle FPL-handlinger være manuelle.
+1. Gem deadline-snapshots hver gameweek, så forecast v2 kan evalueres uden datalækage.
+2. Kør walk-forward-backtest mod legacy og Solio. Rapportér MAE, RMSE, kalibrering, Brier-score og captain regret.
+3. Kalibrér minut- og tilgængelighedsmodellen. Justér priorstyrke og shortlist ud fra beslutningsregret.
+4. Sæt kun et ML-modelartefakt i drift, hvis det slår de simple baselines på uafhængige gameweeks.
+5. Udvid senere til transfers, frie transfers, hits og chips. Alle FPL-handlinger forbliver manuelle.
 
 ## Sikkerhed og ansvar
 
-Appen skal ikke modtage dit FPL-password eller foretage transfers. Et manager-ID er offentligt og bruges kun til at læse holddata. Prognoser er usikre estimater, og brugeren skal altid godkende den endelige beslutning i FPL.
+Appen skal ikke modtage din FPL-adgangskode eller foretage transfers. Et manager-ID er offentligt og bruges kun til at læse holddata. Prognoser er usikre estimater, og brugeren skal altid godkende den endelige beslutning i FPL.
