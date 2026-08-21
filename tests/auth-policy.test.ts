@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { isAllowedGitHubIdentity } from "../lib/auth-policy.ts";
+import {
+  AUTH_DISABLED_PATHS,
+  isAllowedGitHubIdentity,
+  isAllowedGitHubSessionUser,
+} from "../lib/auth-policy.ts";
+
+test("prevents clients from rewriting the provider-owned access claim", () => {
+  assert.deepEqual(AUTH_DISABLED_PATHS, ["/update-user"]);
+});
 
 test("allows the configured immutable GitHub identity", () => {
   assert.equal(isAllowedGitHubIdentity("199608244", "github", { id: 199608244 }), true);
@@ -16,8 +24,9 @@ test("fails closed for another provider, identity, or missing configuration", ()
 });
 
 test("can revalidate the identity stored in an existing stateless session", () => {
-  const sessionUser = { id: "199608244" };
+  const sessionUser = { id: "internal-user-id", githubId: "199608244" };
 
-  assert.equal(isAllowedGitHubIdentity("199608244", "github", sessionUser), true);
-  assert.equal(isAllowedGitHubIdentity("42", "github", sessionUser), false);
+  assert.equal(isAllowedGitHubSessionUser("199608244", sessionUser), true);
+  assert.equal(isAllowedGitHubSessionUser("42", sessionUser), false);
+  assert.equal(isAllowedGitHubSessionUser("199608244", { id: "199608244" }), false);
 });

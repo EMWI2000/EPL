@@ -2,7 +2,10 @@ import "server-only";
 
 import { betterAuth } from "better-auth";
 
-import { isAllowedGitHubIdentity } from "@/lib/auth-policy";
+import {
+  AUTH_DISABLED_PATHS,
+  isAllowedGitHubIdentity,
+} from "@/lib/auth-policy";
 
 function authEnvironment(name: string, localFallback?: string) {
   const value = process.env[name];
@@ -19,14 +22,25 @@ export const auth = betterAuth({
   appName: "FPL HoldPlanner",
   baseURL: authEnvironment("BETTER_AUTH_URL", "http://localhost:3000"),
   secret: authEnvironment("BETTER_AUTH_SECRET", "local-development-secret-change-me"),
+  disabledPaths: [...AUTH_DISABLED_PATHS],
   socialProviders: {
     github: {
       clientId: authEnvironment("GITHUB_CLIENT_ID", "local-unconfigured-client")!,
       clientSecret: authEnvironment("GITHUB_CLIENT_SECRET", "local-unconfigured-secret")!,
       scope: ["read:user", "user:email"],
+      mapProfileToUser: (profile) => ({
+        githubId: String(profile.id),
+      }),
     },
   },
   user: {
+    additionalFields: {
+      githubId: {
+        type: "string",
+        required: true,
+        input: true,
+      },
+    },
     validateUserInfo: ({ source }) => {
       if (
         isAllowedGitHubIdentity(

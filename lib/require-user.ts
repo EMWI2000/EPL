@@ -4,7 +4,7 @@ import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 
 import { auth } from "@/lib/auth";
-import { isAllowedGitHubIdentity } from "@/lib/auth-policy";
+import { isAllowedGitHubSessionUser } from "@/lib/auth-policy";
 
 export async function getCurrentSession() {
   const session = await auth.api.getSession({
@@ -12,9 +12,7 @@ export async function getCurrentSession() {
   });
   if (
     !session ||
-    !isAllowedGitHubIdentity(process.env.ALLOWED_GITHUB_ID, "github", {
-      id: session.user.id,
-    })
+    !isAllowedGitHubSessionUser(process.env.ALLOWED_GITHUB_ID, session.user)
   ) {
     return null;
   }
