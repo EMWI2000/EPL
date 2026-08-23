@@ -312,8 +312,52 @@ test("normalizes cosmetic model text without weakening structural validation", (
     ],
   }, 1);
 
-  assert.equal(result.review.rationale[1].length, 280);
+  assert.equal(result.review.rationale[1].length <= 280, true);
   assert.equal(result.review.rationale[1].includes("\n"), false);
+  assert.equal(result.review.rationale[1].endsWith("…"), true);
+});
+
+test("normalization still fails closed on structural and decision invariants", () => {
+  const responseFor = (review: Record<string, unknown>) => ({
+    status: "completed",
+    output: [
+      {
+        type: "web_search_call",
+        action: { sources: [{ url: "https://www.premierleague.com/news/123" }] },
+      },
+      { type: "message", content: [{ type: "output_text", text: JSON.stringify(review) }] },
+    ],
+  });
+
+  const unknownField = { ...reviewFixture(), unexpected: "blocked" };
+  assert.throws(
+    () => parseOpenAiReviewResponseBody(responseFor(unknownField), 1),
+    /unsupported review shape at review/,
+  );
+
+  const missingNested = reviewFixture() as unknown as Record<string, unknown>;
+  const strategic = { ...(missingNested.strategic_outlook as Record<string, unknown>) };
+  delete strategic.scope;
+  missingNested.strategic_outlook = strategic;
+  assert.throws(
+    () => parseOpenAiReviewResponseBody(responseFor(missingNested), 1),
+    /unsupported review shape at review\.strategic_outlook/,
+  );
+
+  const invalidArrayItem = reviewFixture() as unknown as Record<string, unknown>;
+  invalidArrayItem.risks = [42];
+  assert.throws(
+    () => parseOpenAiReviewResponseBody(responseFor(invalidArrayItem), 1),
+    /unsupported review shape at review\.risks\[0\]/,
+  );
+
+  const invalidAlternative = reviewFixture() as unknown as Record<string, unknown>;
+  invalidAlternative.verdict = "prefer_alternative";
+  invalidAlternative.alternative_index = 4;
+  assert.throws(
+    () => parseOpenAiReviewResponseBody(responseFor(invalidAlternative), 1),
+    /unsupported review shape at review\.alternative_index/,
+  );
 });
 
 test("reports only the fixed contract path when semantic output validation fails", () => {

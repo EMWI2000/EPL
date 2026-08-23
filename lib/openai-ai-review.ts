@@ -105,13 +105,34 @@ function safeDataText(value: string, maximum: number): string {
     .slice(0, maximum);
 }
 
-function normalizeOptionalText(value: unknown, maximum: number): unknown {
-  return typeof value === "string" ? safeDataText(value, maximum) : value;
+function normalizeOptionalText(value: unknown): unknown {
+  return typeof value === "string"
+    ? value.replace(CONTROL_CHARACTERS, " ").replace(/\s+/g, " ").trim()
+    : value;
 }
 
-function normalizeOptionalTextArray(value: unknown, maximum: number): unknown {
+function truncateAtWordBoundary(value: string, maximum: number): string {
+  if (value.length <= maximum) return value;
+  const candidate = value.slice(0, maximum - 1);
+  const wordBoundary = candidate.lastIndexOf(" ");
+  const cutAt = wordBoundary >= Math.floor(maximum * 0.6)
+    ? wordBoundary
+    : maximum - 1;
+  return `${candidate.slice(0, cutAt).trimEnd()}…`;
+}
+
+function normalizeOptionalDisplayText(value: unknown, maximum: number): unknown {
+  const normalized = normalizeOptionalText(value);
+  return typeof normalized === "string"
+    ? truncateAtWordBoundary(normalized, maximum)
+    : normalized;
+}
+
+function normalizeOptionalTextArray(value: unknown, maximum?: number): unknown {
   return Array.isArray(value)
-    ? value.map((item) => normalizeOptionalText(item, maximum))
+    ? value.map((item) => maximum === undefined
+        ? normalizeOptionalText(item)
+        : normalizeOptionalDisplayText(item, maximum))
     : value;
 }
 
@@ -123,17 +144,17 @@ function normalizeReviewTextFields(value: unknown): unknown {
   const normalizedStrategic = strategic
     ? {
         ...strategic,
-        summary: normalizeOptionalText(strategic.summary, 900),
-        priorities: normalizeOptionalTextArray(strategic.priorities, 280),
+        summary: normalizeOptionalText(strategic.summary),
+        priorities: normalizeOptionalTextArray(strategic.priorities),
         watchpoints: Array.isArray(strategic.watchpoints)
           ? strategic.watchpoints.map((watchpoint) => {
               const item = unknownRecord(watchpoint);
               return item
                 ? {
                     ...item,
-                    subject: normalizeOptionalText(item.subject, 100),
-                    reason: normalizeOptionalText(item.reason, 280),
-                    trigger: normalizeOptionalText(item.trigger, 280),
+                    subject: normalizeOptionalText(item.subject),
+                    reason: normalizeOptionalText(item.reason),
+                    trigger: normalizeOptionalText(item.trigger),
                   }
                 : watchpoint;
             })
@@ -147,8 +168,8 @@ function normalizeReviewTextFields(value: unknown): unknown {
         return item
           ? {
               ...item,
-              subject: normalizeOptionalText(item.subject, 100),
-              finding: normalizeOptionalText(item.finding, 360),
+              subject: normalizeOptionalText(item.subject),
+              finding: normalizeOptionalText(item.finding),
             }
           : evidence;
       })
@@ -156,14 +177,14 @@ function normalizeReviewTextFields(value: unknown): unknown {
 
   return {
     ...root,
-    headline: normalizeOptionalText(root.headline, 140),
-    summary: normalizeOptionalText(root.summary, 700),
+    headline: normalizeOptionalDisplayText(root.headline, 140),
+    summary: normalizeOptionalText(root.summary),
     rationale: normalizeOptionalTextArray(root.rationale, 280),
-    risks: normalizeOptionalTextArray(root.risks, 280),
-    change_triggers: normalizeOptionalTextArray(root.change_triggers, 280),
-    deadline_checklist: normalizeOptionalTextArray(root.deadline_checklist, 240),
-    evidence_summary: normalizeOptionalText(root.evidence_summary, 900),
-    data_gaps: normalizeOptionalTextArray(root.data_gaps, 280),
+    risks: normalizeOptionalTextArray(root.risks),
+    change_triggers: normalizeOptionalTextArray(root.change_triggers),
+    deadline_checklist: normalizeOptionalTextArray(root.deadline_checklist),
+    evidence_summary: normalizeOptionalText(root.evidence_summary),
+    data_gaps: normalizeOptionalTextArray(root.data_gaps),
     strategic_outlook: normalizedStrategic,
     qualitative_evidence: normalizedEvidence,
   };
