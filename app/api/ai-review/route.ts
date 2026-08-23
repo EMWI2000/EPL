@@ -7,6 +7,7 @@ import { configuredFplManagerId } from "@/lib/fpl-manager-config";
 import {
   DEFAULT_OPENAI_REVIEW_MODEL,
   OpenAiReviewError,
+  configuredOpenAiApiKey,
   requestOpenAiReview,
 } from "@/lib/openai-ai-review";
 import { parsePlannerPayload } from "@/lib/planner-contract";
@@ -115,7 +116,7 @@ export async function POST(request: Request) {
     return errorResponse(403, "manager_mismatch", "Forespørgslen matcher ikke det konfigurerede FPL-hold.");
   }
 
-  const apiKey = process.env.OPENAI_API_KEY?.trim();
+  const apiKey = configuredOpenAiApiKey(process.env);
   if (!apiKey) {
     return errorResponse(
       503,

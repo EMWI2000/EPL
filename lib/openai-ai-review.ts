@@ -48,6 +48,12 @@ export class OpenAiReviewError extends Error {
   }
 }
 
+export function configuredOpenAiApiKey(
+  environment: Readonly<Record<string, string | undefined>>,
+): string | null {
+  return environment.OPENAI_API_KEY?.trim() || environment.FANTASY?.trim() || null;
+}
+
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
 type OpenAiResponseResult = {

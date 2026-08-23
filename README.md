@@ -84,7 +84,7 @@ Følgende miljøvariabler skal oprettes i Vercel og må aldrig gemmes i GitHub:
 | `ALLOWED_GITHUB_ID` | numerisk GitHub-ID, aktuelt `199608244` |
 | `FPL_MANAGER_ID` | offentligt FPL entry-ID, som automatisk synkroniseres efter login |
 | `INTERNAL_API_TOKEN` | mindst 32 tilfældige bytes mellem Next.js og Python |
-| `OPENAI_API_KEY` | server-side projektnøgle til det valgfrie AI-deadlinebrief |
+| `OPENAI_API_KEY` | server-side projektnøgle til det valgfrie AI-deadlinebrief; deploymenten accepterer også aliaset `FANTASY` |
 | `OPENAI_MODEL` | Responses-model; standard er `gpt-5.6-terra` |
 | `SESSION_VERSION` | start med `1`; hæv værdien for at logge alle sessioner ud |
 

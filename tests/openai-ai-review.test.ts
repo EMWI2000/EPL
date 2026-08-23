@@ -8,6 +8,7 @@ import {
   OpenAiReviewError,
   buildOpenAiReviewContext,
   buildOpenAiReviewRequestBody,
+  configuredOpenAiApiKey,
   parseOpenAiReviewResponseBody,
   requestOpenAiReview,
 } from "../lib/openai-ai-review.ts";
@@ -172,6 +173,12 @@ test("builds a bounded stateless Responses request without account identifiers",
   assert.equal(serialized.includes("manager_id"), false);
   assert.equal(serialized.includes("state_fingerprint"), false);
   assert.equal(serialized.includes("8425806"), false);
+});
+
+test("uses the standard API key variable first and accepts the server-side FANTASY alias", () => {
+  assert.equal(configuredOpenAiApiKey({ OPENAI_API_KEY: " standard ", FANTASY: "alias" }), "standard");
+  assert.equal(configuredOpenAiApiKey({ OPENAI_API_KEY: "", FANTASY: " alias " }), "alias");
+  assert.equal(configuredOpenAiApiKey({ OPENAI_API_KEY: " ", FANTASY: "" }), null);
 });
 
 test("compacts the solver into data and never turns player text into instructions", () => {
