@@ -191,7 +191,8 @@ export async function POST(request: Request) {
     );
   } catch (error) {
     const kind = error instanceof OpenAiReviewError ? error.kind : "upstream";
-    console.error("AI review failed", kind);
+    const safeDetail = error instanceof OpenAiReviewError ? error.message : "Unexpected upstream failure.";
+    console.error("AI review failed", kind, safeDetail);
     if (kind === "configuration") {
       return errorResponse(503, "ai_unconfigured", "AI-kvalificeringen er ikke konfigureret korrekt.");
     }
