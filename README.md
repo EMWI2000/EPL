@@ -20,6 +20,7 @@ Følgende er implementeret:
 - snapshots med metadata og atomisk skrivning til senere backtests
 - en ugeplanlægger, der indlæser det senest offentliggjorte managerhold og kræver bekræftelse af bank, frie transfers, priser og chipstatus
 - rullende transferanalyse med hold, én eller flere transfers, hits, halv prisgevinst ved salg og højst fem frie transfers efter FPL-reglerne
+- et eksplicit AI-deadlinebrief, der kan bekræfte solverens plan, anbefale at vente eller pege på et allerede beregnet alternativ
 - korrekt brug af FPL's `selling_price` for ejede spillere
 - lækagesikre deadline-folds, evalueringsmetrics og GW-parret bootstrap
 - en ML-pipeline med fælles featurekontrakt til træning og drift; modelartefakter er deaktiveret, indtil de er valideret
@@ -34,6 +35,12 @@ Ugeplanlæggeren tager udgangspunkt i managerens senest offentliggjorte hold. FP
 Når `FPL_MANAGER_ID` er konfigureret, hentes dette hold automatisk efter login, og anbefalingsruten afviser andre eller manglende manager-ID'er. Den generelle funktion til at bygge en ny trup skjules i den bundne produktionsapp, så alle viste anbefalinger tager udgangspunkt i det konfigurerede managerhold.
 
 Planlæggeren sammenligner at rulle transferen med forskellige transfers til næste deadline. Hver plan vurderes over den valgte prognosehorisont. Den medregner transferhits, bænkens forventede bidrag ved udeblivelser og de særlige salgsprisregler. For transferantal 1-2 kan den vise flere alternativer; for 3-5 beregner den én bedst plan pr. antal. Snapshot-checksummen identificerer den synkroniserede tilstand, men serveren kontrollerer ikke, om managerens hold siden er ændret.
+
+### AI-kvalificering til næste deadline
+
+Efter en ugeplan er beregnet, kan brugeren aktivt bestille en second opinion. Next.js sender en stramt afgrænset fodboldkontekst til OpenAI Responses API: bred ranggruppe, bekræftet bank og frie transfers, solverens bedste plan og alternativer, start-XI, kaptajn, projektioner, minutter, usikkerhed og prissignaler. GitHub-identitet, manager-ID, snapshot-checksum, cookies og tokens fjernes, før API-kaldet foretages.
+
+Revieweren skal lave frisk webresearch på tilladte Premier League- og BBC-domæner. Den kan kun bekræfte bedste plan, anbefale at vente på konkret information eller vælge et nummereret solver-alternativ. Kilder vises som klikbare links. Kaldet er manuelt for at styre omkostninger, og en fejl skjuler aldrig den deterministiske anbefaling. `store: false` er aktiveret; OpenAI kan fortsat behandle API-indhold efter kontoens gældende data- og retentionvilkår.
 
 ## Kør lokalt
 
@@ -77,6 +84,8 @@ Følgende miljøvariabler skal oprettes i Vercel og må aldrig gemmes i GitHub:
 | `ALLOWED_GITHUB_ID` | numerisk GitHub-ID, aktuelt `199608244` |
 | `FPL_MANAGER_ID` | offentligt FPL entry-ID, som automatisk synkroniseres efter login |
 | `INTERNAL_API_TOKEN` | mindst 32 tilfældige bytes mellem Next.js og Python |
+| `OPENAI_API_KEY` | server-side projektnøgle til det valgfrie AI-deadlinebrief |
+| `OPENAI_MODEL` | Responses-model; standard er `gpt-5.6-terra` |
 | `SESSION_VERSION` | start med `1`; hæv værdien for at logge alle sessioner ud |
 
 GitHub OAuth App skal have produktionsadressen som Homepage URL og
@@ -100,10 +109,11 @@ Kildeadaptere skal bevare navn, URL, hentetid, sæson/gameweek, skemaversion og 
 ## Arkitektur
 
 ```text
-Browser -> GitHub-login -> Next.js BFF -> intern token -> Python Functions
-                                                   -> officiel FPL API
-                                                   -> prognoser + MILP
-                                                   -> JSON -> Next.js UI
+Browser -> GitHub-login -> Next.js BFF
+                             |-> intern token -> Python Functions -> officiel FPL API
+                             |                                  -> prognoser + MILP
+                             |                                  -> JSON -> Next.js UI
+                             `-> OpenAI Responses API + afgrænset webresearch
 ```
 
 - `app/` og `components/`: Next.js UI, login og beskyttet BFF

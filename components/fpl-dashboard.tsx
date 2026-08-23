@@ -3,6 +3,12 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { AccountControl } from "@/components/account-control";
+import {
+  actionForAiReview,
+  buildAiReviewRequest,
+  parseAiReviewResponse,
+  type AiReviewResponse,
+} from "@/lib/ai-review-contract";
 import { resolveInitialFplManagerId } from "@/lib/fpl-manager-config";
 import {
   type ManagerSyncResponse,
@@ -554,6 +560,14 @@ function signedPoints(value: number) {
   return `${prefix}${formatPoints(value)}`;
 }
 
+function plannerActionLabel(action: PlannerAction) {
+  if (action.kind === "roll") return "Rul transferen";
+  const moves = action.transfers
+    .map((transfer) => `${transfer.out.name} → ${transfer.in.name}`)
+    .join(" + ");
+  return action.hit_points > 0 ? `${moves} (−${action.hit_points})` : moves;
+}
+
 function TransferDecision({ action, horizon }: { action: PlannerAction; horizon: number }) {
   const title = action.kind === "roll"
     ? "Rul transferen"
@@ -591,6 +605,166 @@ function TransferDecision({ action, horizon }: { action: PlannerAction; horizon:
           <span>{formatPrice(action.bank_after_tenths / 10)} tilbage</span>
           <span>{action.free_transfers_next_gameweek} FT næste runde</span>
         </div>
+      </div>
+    </section>
+  );
+}
+
+function AiReviewList({ title, items }: { title: string; items: string[] }) {
+  return (
+    <div className="ai-review__list">
+      <h4>{title}</h4>
+      {items.length > 0
+        ? <ul>{items.map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}</ul>
+        : <p>Ingen konkrete punkter i den aktuelle review.</p>}
+    </div>
+  );
+}
+
+function AiReviewPanel({
+  response,
+  planner,
+  deadline,
+  isLoading,
+  canReview,
+  error,
+  onReview,
+}: {
+  response: AiReviewResponse | null;
+  planner: PlannerPayload;
+  deadline: string | null;
+  isLoading: boolean;
+  canReview: boolean;
+  error: string | null;
+  onReview: () => void;
+}) {
+  const review = response?.review;
+  const selectedAction = review ? actionForAiReview(planner, review) : null;
+  const verdictLabel = review?.verdict === "confirm_best_action"
+    ? "Bekræft planen"
+    : review?.verdict === "wait_for_information"
+      ? "Vent på nyt"
+      : "Vælg plan B";
+  const actionLabel = review?.verdict === "wait_for_information"
+    ? "Vent og genberegn, når den manglende information er kendt"
+    : selectedAction
+      ? plannerActionLabel(selectedAction)
+      : "Behold solverens plan";
+
+  return (
+    <section
+      className={classNames(
+        "ai-review",
+        response && `ai-review--${response.review.verdict}`,
+      )}
+      aria-labelledby="ai-review-heading"
+    >
+      <div className="ai-review__rail" aria-hidden="true">
+        <span>AI</span>
+        <small>2. vurdering</small>
+      </div>
+      <div className="ai-review__body">
+        <div className="ai-review__header">
+          <div>
+            <p className="eyebrow">Deadlinebrief · GW{planner.target_event}</p>
+            <h2 id="ai-review-heading">Kvalificér næste træk med aktuel kontekst</h2>
+            <p>En uafhængig reviewer udfordrer den beregnede plan med holdnyt, minutrisiko, prisvindue og de allerede løste alternativer.</p>
+          </div>
+          <button className="ai-review__button" type="button" onClick={onReview} disabled={isLoading || !canReview}>
+            {isLoading
+              ? <><span className="spinner spinner--button" /> Researcher …</>
+              : <><SparkIcon /> {!canReview ? "Opdatér planen først" : response ? "Opdatér brief" : "Kvalificér planen"}</>}
+          </button>
+        </div>
+
+        {error && (
+          <div className="ai-review__error" role="alert">
+            <InfoIcon />
+            <p><strong>AI-reviewet stoppede</strong>{error} Den deterministiske plan ovenfor er stadig tilgængelig.</p>
+          </div>
+        )}
+
+        {!response && !isLoading && (
+          <div className="ai-review__empty">
+            <div className="ai-review__empty-mark"><SparkIcon /></div>
+            <div>
+              <strong>Få en second opinion før deadline</strong>
+              <p>Reviewet sender kun en begrænset fodboldkontekst til OpenAI. OpenAI modtager ikke GitHub-identitet, manager-ID, sessioner eller nøgler.</p>
+            </div>
+            <span>{deadline ? `Deadline ${formatDateTime(deadline)}` : "Næste deadline"}</span>
+          </div>
+        )}
+
+        {isLoading && !response && (
+          <div className="ai-review__loading" role="status">
+            <span className="spinner spinner--dark" />
+            <p><strong>Kontrollerer planen</strong>Sammenholder solverens resultat med aktuelle, kildebegrænsede nyheder.</p>
+          </div>
+        )}
+
+        {response && review && (
+          <div className={classNames("ai-review__result", isLoading && "ai-review__result--updating")}>
+            <div className="ai-review__verdict">
+              <span>{verdictLabel}</span>
+              <div>
+                <p>AI-kvalificeret handling</p>
+                <strong>{actionLabel}</strong>
+              </div>
+              <small>{review.confidence === "high" ? "Høj" : review.confidence === "medium" ? "Middel" : "Lav"} sikkerhed</small>
+            </div>
+
+            <div className="ai-review__lead">
+              <h3>{review.headline}</h3>
+              <p>{review.summary}</p>
+            </div>
+
+            <div className="ai-review__grid">
+              <AiReviewList title="Hvorfor nu" items={review.rationale} />
+              <AiReviewList title="Risici" items={review.risks} />
+              <AiReviewList title="Det ændrer rådet" items={review.change_triggers} />
+            </div>
+
+            <div className="ai-review__deadline">
+              <div>
+                <p className="eyebrow">Inden du trykker gem i FPL</p>
+                <h3>Deadline-check</h3>
+                <span>{deadline ? formatDateTime(deadline) : `GW${planner.target_event}`}</span>
+              </div>
+              <ol>
+                {review.deadline_checklist.map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}
+              </ol>
+            </div>
+
+            <div className="ai-review__evidence">
+              <div>
+                <p className="eyebrow">Aktuel research</p>
+                <p>{review.evidence_summary}</p>
+              </div>
+              {response.research.sources.length > 0 ? (
+                <div className="ai-review__sources" aria-label="Kilder til AI-reviewet">
+                  {response.research.sources.map((source, index) => (
+                    <a href={source.url} key={source.url} target="_blank" rel="noopener noreferrer">
+                      <span>{index + 1}</span>{source.title}<ExternalLinkIcon />
+                    </a>
+                  ))}
+                </div>
+              ) : (
+                <p className="ai-review__no-sources">Webresearchen returnerede ingen tilladte kildehenvisninger. Brug reviewet med ekstra forsigtighed.</p>
+              )}
+            </div>
+
+            {review.data_gaps.length > 0 && (
+              <div className="ai-review__gaps">
+                <InfoIcon />
+                <p><strong>Stadig ukendt</strong>{review.data_gaps.join(" · ")}</p>
+              </div>
+            )}
+            <div className="ai-review__meta">
+              <span>Research {formatDateTime(response.generated_at)}</span>
+              <span>{response.model} · server-side · ingen automatisk transfer</span>
+            </div>
+          </div>
+        )}
       </div>
     </section>
   );
@@ -893,13 +1067,28 @@ export function FplDashboard({
   const [squadConfirmed, setSquadConfirmed] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [aiReview, setAiReview] = useState<AiReviewResponse | null>(null);
+  const [isAiReviewing, setIsAiReviewing] = useState(false);
+  const [aiReviewError, setAiReviewError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const syncAbortRef = useRef<AbortController | null>(null);
+  const aiAbortRef = useRef<AbortController | null>(null);
+  const aiRequestKeyRef = useRef<string | null>(null);
+
+  const clearAiReview = useCallback(() => {
+    aiAbortRef.current?.abort();
+    aiAbortRef.current = null;
+    aiRequestKeyRef.current = null;
+    setAiReview(null);
+    setAiReviewError(null);
+    setIsAiReviewing(false);
+  }, []);
 
   const requestRecommendation = useCallback(async (
     requestSettings: Settings,
     plannerInput?: { sync: ManagerSyncResponse; state: ManualManagerState },
   ) => {
+    clearAiReview();
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
@@ -952,9 +1141,10 @@ export function FplDashboard({
         setIsLoading(false);
       }
     }
-  }, []);
+  }, [clearAiReview]);
 
   const syncManagerById = useCallback(async (managerId: number) => {
+    clearAiReview();
     syncAbortRef.current?.abort();
     const controller = new AbortController();
     syncAbortRef.current = controller;
@@ -987,7 +1177,7 @@ export function FplDashboard({
     } finally {
       if (syncAbortRef.current === controller) setIsSyncing(false);
     }
-  }, []);
+  }, [clearAiReview]);
 
   useEffect(() => {
     const managerId = managerIdFromBrowser(initialManagerId);
@@ -999,8 +1189,22 @@ export function FplDashboard({
     return () => {
       abortRef.current?.abort();
       syncAbortRef.current?.abort();
+      aiAbortRef.current?.abort();
     };
   }, [initialManagerId, syncManagerById]);
+
+  useEffect(() => {
+    clearAiReview();
+  }, [
+    bankInput,
+    clearAiReview,
+    freeTransfers,
+    managerIdInput,
+    settings.forecastVersion,
+    settings.horizon,
+    settings.includeDoubtful,
+    squadConfirmed,
+  ]);
 
   async function syncManagerState() {
     let managerId: number;
@@ -1038,6 +1242,7 @@ export function FplDashboard({
       settings.horizon !== appliedSettings.horizon ||
       settings.includeDoubtful !== appliedSettings.includeDoubtful ||
       settings.forecastVersion !== appliedSettings.forecastVersion ||
+      Boolean(recommendation?.planner && !squadConfirmed) ||
       (recommendation?.planner?.confirmed_state.bank_tenths !== undefined &&
         (() => {
           try {
@@ -1048,7 +1253,7 @@ export function FplDashboard({
           }
         })())
     );
-  }, [analysisMode, appliedMode, settings, appliedSettings, recommendation, bankInput, freeTransfers]);
+  }, [analysisMode, appliedMode, settings, appliedSettings, recommendation, bankInput, freeTransfers, squadConfirmed]);
 
   function runCurrentAnalysis() {
     if (analysisMode === "weekly") {
@@ -1058,6 +1263,68 @@ export function FplDashboard({
       return;
     }
     void requestRecommendation(settings);
+  }
+
+  async function requestAiQualification() {
+    if (!managerSync || !recommendation?.planner) return;
+    if (!squadConfirmed) {
+      setAiReviewError("Bekræft først, at truppen, banken, de frie transfers og chipstatus stadig er korrekte.");
+      return;
+    }
+    if (hasUnappliedChanges) {
+      setAiReviewError("Opdatér først den beregnede plan med dine nye indstillinger.");
+      return;
+    }
+
+    aiAbortRef.current?.abort();
+    const controller = new AbortController();
+    aiAbortRef.current = controller;
+    const requestKey = [
+      recommendation.meta.generated_at,
+      recommendation.planner.state_fingerprint,
+      recommendation.planner.target_event,
+    ].join(":");
+    aiRequestKeyRef.current = requestKey;
+    setIsAiReviewing(true);
+    setAiReview(null);
+    setAiReviewError(null);
+
+    try {
+      const requestBody = buildAiReviewRequest(managerSync, {
+        ...recommendation,
+        planner: recommendation.planner,
+      });
+      const response = await fetch("/api/ai-review", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify(requestBody),
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      const body: unknown = await response.json().catch(() => null);
+      if (!response.ok) {
+        const apiError = body as ApiError | null;
+        throw new Error(apiError?.error?.message || `Serveren svarede med status ${response.status}.`);
+      }
+      const parsed = parseAiReviewResponse(body, recommendation.planner.alternatives.length);
+      if (
+        new Date(parsed.recommendation_generated_at).getTime() !== new Date(recommendation.meta.generated_at).getTime() ||
+        parsed.target_event !== recommendation.planner.target_event
+      ) {
+        throw new Error("AI-reviewet matcher ikke længere den viste anbefaling.");
+      }
+      if (aiRequestKeyRef.current === requestKey) setAiReview(parsed);
+    } catch (requestError) {
+      if (requestError instanceof DOMException && requestError.name === "AbortError") return;
+      if (aiRequestKeyRef.current === requestKey) {
+        setAiReviewError(requestError instanceof Error ? requestError.message : "AI-reviewet kunne ikke hentes.");
+      }
+    } finally {
+      if (aiAbortRef.current === controller) {
+        setIsAiReviewing(false);
+        aiAbortRef.current = null;
+      }
+    }
   }
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -1079,6 +1346,7 @@ export function FplDashboard({
   }
 
   function selectAnalysisMode(mode: "weekly" | "initial") {
+    clearAiReview();
     setAnalysisMode(mode);
     setRecommendation(null);
     setError(null);
@@ -1411,7 +1679,18 @@ export function FplDashboard({
                 </section>
 
                 {recommendation.planner && (
-                  <TransferDecision action={recommendation.planner.best_action} horizon={recommendation.meta.horizon} />
+                  <>
+                    <TransferDecision action={recommendation.planner.best_action} horizon={recommendation.meta.horizon} />
+                    <AiReviewPanel
+                      response={aiReview}
+                      planner={recommendation.planner}
+                      deadline={managerSync?.target.deadline_time ?? null}
+                      isLoading={isAiReviewing}
+                      canReview={squadConfirmed && !hasUnappliedChanges && !isLoading}
+                      error={aiReviewError}
+                      onReview={() => void requestAiQualification()}
+                    />
+                  </>
                 )}
 
                 <div className="metrics-grid">
