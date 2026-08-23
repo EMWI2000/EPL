@@ -148,7 +148,7 @@ export interface AiReviewStrategicOutlook {
   summary: string;
   priorities: string[];
   watchpoints: AiReviewStrategicWatchpoint[];
-  scope: "advisory_only_no_unmodelled_transfers_or_chips";
+  scope: "solver_bounded_strategy_context_no_new_actions";
 }
 
 export interface AiReviewQualitativeEvidence {
@@ -305,7 +305,7 @@ export const AI_REVIEW_OUTPUT_SCHEMA = {
     strategic_outlook: {
       type: "object",
       properties: {
-        horizon_gameweeks: { type: "integer", minimum: 1, maximum: 5 },
+        horizon_gameweeks: { type: "integer", minimum: 1, maximum: 10 },
         posture: {
           type: "string",
           enum: [
@@ -341,7 +341,7 @@ export const AI_REVIEW_OUTPUT_SCHEMA = {
         },
         scope: {
           type: "string",
-          enum: ["advisory_only_no_unmodelled_transfers_or_chips"],
+          enum: ["solver_bounded_strategy_context_no_new_actions"],
         },
       },
       required: ["horizon_gameweeks", "posture", "summary", "priorities", "watchpoints", "scope"],
@@ -923,7 +923,7 @@ function validateStrategicOutlook(
     "watchpoints",
     "scope",
   ]);
-  const horizon = integer(root.horizon_gameweeks, `${path}.horizon_gameweeks`, 1, 5);
+  const horizon = integer(root.horizon_gameweeks, `${path}.horizon_gameweeks`, 1, 10);
   if (expectedHorizon !== undefined && horizon !== expectedHorizon) {
     fail(`${path}.horizon_gameweeks`, "must match the solver horizon");
   }
@@ -960,7 +960,7 @@ function validateStrategicOutlook(
   literal(
     root.scope,
     `${path}.scope`,
-    "advisory_only_no_unmodelled_transfers_or_chips",
+    "solver_bounded_strategy_context_no_new_actions",
   );
   return root as unknown as AiReviewStrategicOutlook;
 }

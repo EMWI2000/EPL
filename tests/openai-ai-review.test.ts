@@ -7,6 +7,7 @@ import {
   DEFAULT_OPENAI_REASONING_EFFORT,
   DEFAULT_OPENAI_REVIEW_TIMEOUT_MS,
   DEFAULT_OPENAI_REVIEW_MODEL,
+  MAX_OPENAI_REVIEW_REQUEST_BYTES,
   OPENAI_RESPONSES_URL,
   OpenAiReviewError,
   buildOpenAiReviewContext,
@@ -100,12 +101,15 @@ function requestFixture(): AiReviewRequest {
       },
       method: {
         chips_modelled: false,
+        bounded_roadmap_modelled: false,
         next_deadline_transfer_modelled: false,
         future_transfers_modelled: false,
       },
       best_action: action("roll"),
       alternatives: [action("transfer")],
       sequential: null,
+      strategy: null,
+      chip_strategy: null,
     },
     lineup: {
       gameweek: 7,
@@ -117,6 +121,116 @@ function requestFixture(): AiReviewRequest {
     },
     squad_context: squad,
   } as unknown as AiReviewRequest;
+}
+
+function withBoundedStrategy(request = requestFixture()): AiReviewRequest {
+  const provisionalTransfer = (outName: string, outTeam: string, inName: string, inTeam: string) => ({
+    position: "MID",
+    out_selling_price_tenths: 50,
+    in_price_tenths: 55,
+    out: { name: outName, team: outTeam },
+    in: { name: inName, team: inTeam },
+  });
+  const strategyGameweeks = Array.from({ length: 8 }, (_, index) => index + 7);
+  request.planner.method.bounded_roadmap_modelled = true;
+  request.planner.method.chips_modelled = true;
+  request.planner.strategy = {
+    horizon: 8,
+    gameweek_window: strategyGameweeks,
+    gw_weights: strategyGameweeks.map((_, index) => 0.85 ** index),
+    modelled_deadlines: 4,
+    maximum_provisional_transfers: 2,
+    first_step_candidate_count: 2,
+    first_step_search: "explicit_bounded_transfer_plans",
+    search_scope: "four_deadlines_max_two_provisional_transfers",
+    future_price_assumption: "fixed_current_prices",
+    assumptions: [
+      "fixed_current_prices",
+      "four_transfer_deadlines_modelled",
+      "recalculate_at_every_real_deadline",
+    ],
+    solver_proven_optimal_within_bounds: true,
+    globally_optimal: false,
+    recalculate_each_deadline: true,
+    first_action: { source: "best_action", alternative_index: null },
+    steps: [0, 1, 2, 3].map((index) => ({
+      deadline_offset: index + 1,
+      provisional: index > 0,
+      target_event: 7 + index,
+      kind: index === 0 ? "roll" : "transfer",
+      transfers: index === 0
+        ? []
+        : [provisionalTransfer(
+            `Roadmap out ${index}`,
+            index === 1 ? "ARS" : "BRE",
+            `Roadmap in ${index}`,
+            index === 1 ? "LIV" : "MCI",
+          )],
+      hit_points: 0,
+      bank_after_tenths: 5,
+      free_transfers_next_gameweek: 1,
+      weighted_projected_points: 50 - index,
+      gameweeks: [{ gameweek: 7 + index, projected_points: 70 - index }],
+    })) as unknown as NonNullable<AiReviewRequest["planner"]["strategy"]>["steps"],
+    weighted_projected_points: 390,
+    total_hit_points: 0,
+    weighted_hit_cost_points: 0,
+    terminal_banked_ft_value_points: 0.8,
+    decision_value_points: 390.8,
+  } as unknown as NonNullable<AiReviewRequest["planner"]["strategy"]>;
+
+  const wildcardSquad = request.squad_context.map((player, index) => ({
+    id: player.id + 200,
+    name: `Wildcard ${index + 1}`,
+    team: index === 0 ? "CHE" : index === 1 ? "LIV" : "ARS",
+    position: player.position,
+    price_tenths: 50,
+    status: "a",
+    price_signal: null,
+  }));
+  const chips = ["wildcard", "freehit", "bboost", "3xc"] as const;
+  request.planner.chip_strategy = {
+    horizon: 8,
+    target_event: 7,
+    inventory: chips.map((chip) => ({
+      chip,
+      used_events: [],
+      available_for_target: true,
+    })),
+    scenarios: chips.map((chip, index) => ({
+      scenario_id: `${chip}-scenario`,
+      chip,
+      event: index === 0 ? 7 : 8 + index,
+      signal: chip === "wildcard" ? "consider" : "watch",
+      available: true,
+      estimated_gain_points: chip === "wildcard" ? 16.2 : 4 + index,
+      baseline_points: 70,
+      chip_points: 74 + index,
+      confidence: "low",
+      model_scope: chip === "wildcard"
+        ? "multiweek_rebuild"
+        : chip === "freehit"
+          ? "confirmed_blank_double_screen"
+          : chip === "bboost"
+            ? "bench_marginal"
+            : "captain_marginal",
+      reason: `Afgrænset ${chip}-scenarie, som skal genberegnes ved deadline.`,
+      squad: chip === "wildcard" ? wildcardSquad : [],
+      change_count: chip === "wildcard" ? 5 : null,
+      bank_after_tenths: chip === "wildcard" ? 3 : null,
+    })),
+    recommendation: {
+      action: "consider",
+      scenario_id: "wildcard-scenario",
+      chip: "wildcard",
+      event: 7,
+      reason: "Overvej kun det leverede Wildcard-scenarie; appen aktiverer det ikke.",
+    },
+    model_scope: "bounded_chip_counterfactuals",
+    globally_optimal: false,
+    recalculate_each_deadline: true,
+  };
+  return request;
 }
 
 function reviewFixture() {
@@ -144,7 +258,7 @@ function reviewFixture() {
         trigger: "Genberegn ved negativt holdnyt.",
         earliest_gameweek: 7,
       }],
-      scope: "advisory_only_no_unmodelled_transfers_or_chips",
+      scope: "solver_bounded_strategy_context_no_new_actions",
     },
     qualitative_evidence: [{
       subject: "Player 13",
@@ -292,7 +406,7 @@ test("exposes the bounded next-deadline preview as provisional AI context", () =
   const context = buildOpenAiReviewContext(request);
   const body = buildOpenAiReviewRequestBody(request, "gpt-5.6-sol");
 
-  assert.equal(context.context_schema, "fpl-ai-review-context-v3");
+  assert.equal(context.context_schema, "fpl-ai-review-context-v4");
   assert.equal(context.forecast.next_deadline_transfer_modelled, true);
   assert.equal(
     context.solver.next_deadline_preview?.next_deadline_step.status,
@@ -300,6 +414,119 @@ test("exposes the bounded next-deadline preview as provisional AI context", () =
   );
   assert.equal(context.solver.next_deadline_preview?.next_deadline_step.transfers[0].in, "Future in");
   assert.equal(body.tools[0].filters.allowed_domains.includes("mancity.com"), true);
+});
+
+test("compacts the four-step roadmap and all four chip scenarios without creating actions", () => {
+  const request = withBoundedStrategy();
+  const context = buildOpenAiReviewContext(request);
+  const body = buildOpenAiReviewRequestBody(request, "gpt-5.6-sol");
+
+  assert.equal(context.context_schema, "fpl-ai-review-context-v4");
+  assert.equal(context.solver.strategy_roadmap?.horizon_gameweeks, 8);
+  assert.equal(context.solver.strategy_roadmap?.steps.length, 4);
+  assert.equal(
+    context.solver.strategy_roadmap?.steps[1].status,
+    "provisional_recalculate_at_deadline",
+  );
+  assert.deepEqual(context.solver.strategy_roadmap?.assumptions, [
+    "fixed_current_prices",
+    "four_transfer_deadlines_modelled",
+    "recalculate_at_every_real_deadline",
+  ]);
+  assert.equal(context.solver.chip_strategy?.scenarios.length, 4);
+  assert.equal(context.solver.chip_strategy?.recommendation.chip, "wildcard");
+  assert.equal(context.solver.chip_strategy?.scenarios[0].scenario_squad.length, 15);
+  assert.equal(body.tools[0].filters.allowed_domains.includes("liverpoolfc.com"), true);
+  assert.equal(body.tools[0].filters.allowed_domains.includes("chelseafc.com"), true);
+  assert.equal(AI_REVIEW_INSTRUCTIONS.includes("Du må ikke opfinde, ændre eller udvide dens transfers"), true);
+  assert.equal(AI_REVIEW_INSTRUCTIONS.includes("appen aktiverer aldrig chips"), true);
+});
+
+test("keeps a worst-case compact strategy request below 65,536 bytes", () => {
+  const request = withBoundedStrategy();
+  const longName = "N".repeat(80);
+  const longTeam = "T".repeat(80);
+  request.forecast.horizon = 5;
+  request.forecast.validation_status = "V".repeat(40);
+  request.squad_context = request.squad_context.map((player) => ({
+    ...player,
+    name: longName,
+    team: longTeam,
+    projections: Array.from({ length: 5 }, (_, index) => ({
+      ...player.projections[0],
+      gameweek: 7 + index,
+    })),
+    price_signal: {
+      selected_by_percent: 100,
+      transfers_in_event: 9_999_999,
+      transfers_out_event: 9_999_999,
+      cost_change_event_tenths: 30,
+    },
+  }));
+
+  const maximalTransfer = (index: number) => ({
+    out_selling_price_tenths: 150,
+    in_price_tenths: 150,
+    position: "MID",
+    out: { name: `${index}${longName}`.slice(0, 80), team: "ARS" },
+    in: { name: `${index}${longName}`.slice(0, 80), team: "LIV" },
+  });
+  const maximalAction = {
+    ...request.planner.best_action,
+    kind: "hit",
+    transfers: Array.from({ length: 5 }, (_, index) => maximalTransfer(index)),
+    gameweeks: Array.from({ length: 5 }, (_, index) => ({
+      gameweek: 7 + index,
+      projected_points: 99.999,
+    })),
+  } as unknown as AiReviewRequest["planner"]["best_action"];
+  request.planner.best_action = maximalAction;
+  request.planner.alternatives = Array.from({ length: 4 }, (_, index) => ({
+    ...maximalAction,
+    transfers: maximalAction.transfers.map((transfer, transferIndex) => ({
+      ...transfer,
+      out: { ...transfer.out, name: `${index}${transferIndex}${longName}`.slice(0, 80) },
+      in: { ...transfer.in, name: `${transferIndex}${index}${longName}`.slice(0, 80) },
+    })),
+  }));
+  if (request.planner.strategy) {
+    request.planner.strategy.assumptions = Array.from(
+      { length: 8 },
+      (_, index) => `${index}${"A".repeat(100)}`.slice(0, 100),
+    );
+    request.planner.strategy.steps.forEach((step, stepIndex) => {
+      step.transfers = (Array.from(
+        { length: stepIndex === 0 ? 5 : 2 },
+        (_, index) => maximalTransfer(stepIndex * 5 + index),
+      ) as unknown as typeof step.transfers);
+      step.gameweeks = (Array.from(
+        { length: stepIndex === 3 ? 7 : 1 },
+        (_, index) => ({ gameweek: 7 + stepIndex + index, projected_points: 99.999 }),
+      ) as unknown as typeof step.gameweeks);
+    });
+  }
+  if (request.planner.chip_strategy) {
+    request.planner.chip_strategy.scenarios.forEach((scenario, index) => {
+      scenario.scenario_id = `${index}${"S".repeat(100)}`.slice(0, 100);
+      scenario.reason = `${index}${"R".repeat(360)}`.slice(0, 360);
+      if (scenario.chip === "wildcard" || scenario.chip === "freehit") {
+        scenario.squad = request.squad_context.map((player) => ({
+          id: player.id + 500,
+          name: longName,
+          team: "CHE",
+          position: player.position,
+          price_tenths: 150,
+          status: "a",
+          price_signal: null,
+        }));
+      }
+    });
+    request.planner.chip_strategy.recommendation.reason = "C".repeat(360);
+  }
+
+  const body = buildOpenAiReviewRequestBody(request, "gpt-5.6-sol", "max");
+  const bytes = new TextEncoder().encode(JSON.stringify(body)).byteLength;
+  assert.equal(bytes < MAX_OPENAI_REVIEW_REQUEST_BYTES, true, `${bytes} byte request`);
 });
 
 test("parses variable output order and keeps only deduplicated allowed citations", () => {

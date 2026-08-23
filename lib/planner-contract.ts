@@ -1,13 +1,18 @@
-export const MANAGER_SYNC_SCHEMA_VERSION = "fpl-manager-state-response-v1" as const;
-export const PERSONAL_STATE_SCHEMA_VERSION = "fpl-personal-state-v1" as const;
-export const SNAPSHOT_SCHEMA_VERSION = "fpl-deadline-state-snapshot-v1" as const;
+export const MANAGER_SYNC_SCHEMA_VERSION = "fpl-manager-state-response-v2" as const;
+export const PERSONAL_STATE_SCHEMA_VERSION = "fpl-personal-state-v2" as const;
+export const SNAPSHOT_SCHEMA_VERSION = "fpl-deadline-state-snapshot-v2" as const;
 export const PRICE_SIGNAL_SCHEMA_VERSION = "fpl-official-price-signals-v1" as const;
 
 export type ForecastVersion = "v2" | "legacy";
 export type PlayerPosition = "GKP" | "DEF" | "MID" | "FWD";
 export type PlayerStatus = "a" | "d" | "i" | "s" | "u" | "n";
 export type ChipName = "wildcard" | "freehit" | "bboost" | "3xc";
-export type ChipStatus = "available" | "used" | "active" | "unavailable";
+export type ChipStatus = "available" | "used" | "unavailable";
+
+export interface ChipUsage {
+  name: ChipName;
+  event: number;
+}
 
 export interface PriceProjection {
   offset_days: number;
@@ -73,6 +78,7 @@ export interface LastDeadlineState {
   event_transfers: number;
   event_transfer_cost: number;
   active_chip: ChipName | null;
+  chip_usage: ChipUsage[];
   limitations: PublicStateLimitation[];
   picks: ManagerSyncPick[];
 }
@@ -83,7 +89,7 @@ export interface PlayerPriceState {
   selling_price_tenths: number;
 }
 
-export type ChipState = Partial<Record<ChipName, ChipStatus>>;
+export type ChipState = Record<ChipName, ChipStatus>;
 
 export interface ManualManagerState {
   current_squad_ids: number[];
@@ -91,8 +97,9 @@ export interface ManualManagerState {
   free_transfers: number;
   player_prices: PlayerPriceState[];
   chips: ChipState;
+  chip_usage: ChipUsage[];
   no_active_chip_confirmed: boolean;
-  effective_event: number | null;
+  effective_event: number;
 }
 
 export type ConfirmationField =
@@ -101,6 +108,7 @@ export type ConfirmationField =
   | "free_transfers"
   | "player_prices"
   | "chips"
+  | "chip_usage"
   | "no_active_chip_confirmed";
 
 export interface ManualStateTemplate {
@@ -239,6 +247,104 @@ export interface PlannerSequentialPlan {
   };
 }
 
+export interface PlannerStrategyStep {
+  deadline_offset: 1 | 2 | 3 | 4;
+  provisional: boolean;
+  target_event: number;
+  kind: PlannerActionKind;
+  transfer_count: number;
+  transfers: EnrichedTransfer[];
+  squad_ids: number[];
+  gameweeks: PlannerActionGameweek[];
+  bank_before_tenths: number;
+  bank_after_tenths: number;
+  free_transfers_before: number;
+  free_transfers_next_gameweek: number;
+  hit_points: number;
+  weighted_projected_points: number;
+  weighted_hit_cost_points: number;
+}
+
+export interface PlannerStrategyPlan {
+  horizon: number;
+  gameweek_window: number[];
+  gw_weights: number[];
+  modelled_deadlines: 4;
+  maximum_provisional_transfers: 2;
+  first_step_candidate_count: number;
+  first_step_search: "explicit_bounded_transfer_plans";
+  search_scope: "four_deadlines_max_two_provisional_transfers";
+  future_price_assumption: "fixed_current_prices";
+  assumptions: string[];
+  solver_proven_optimal_within_bounds: true;
+  globally_optimal: false;
+  recalculate_each_deadline: true;
+  first_action: {
+    source: "best_action" | "alternative";
+    alternative_index: number | null;
+  };
+  steps: [
+    PlannerStrategyStep,
+    PlannerStrategyStep,
+    PlannerStrategyStep,
+    PlannerStrategyStep,
+  ];
+  weighted_projected_points: number;
+  total_hit_points: number;
+  weighted_hit_cost_points: number;
+  terminal_banked_ft_value_points: number;
+  decision_value_points: number;
+}
+
+export interface PlannerChipInventoryEntry {
+  chip: ChipName;
+  used_events: number[];
+  available_for_target: boolean;
+}
+
+export type PlannerChipSignal = "hold" | "watch" | "consider";
+export type PlannerChipConfidence = "low" | "medium";
+export type PlannerChipScenarioScope =
+  | "multiweek_rebuild"
+  | "confirmed_blank_double_screen"
+  | "single_gameweek_counterfactual"
+  | "bench_marginal"
+  | "captain_marginal";
+
+export interface PlannerChipScenario {
+  scenario_id: string;
+  chip: ChipName;
+  event: number | null;
+  signal: PlannerChipSignal;
+  available: boolean;
+  estimated_gain_points: number | null;
+  baseline_points: number | null;
+  chip_points: number | null;
+  confidence: PlannerChipConfidence;
+  model_scope: PlannerChipScenarioScope;
+  reason: string;
+  squad: PlannerPlayerReference[];
+  change_count: number | null;
+  bank_after_tenths: number | null;
+}
+
+export interface PlannerChipStrategy {
+  horizon: number;
+  target_event: number;
+  inventory: PlannerChipInventoryEntry[];
+  scenarios: PlannerChipScenario[];
+  recommendation: {
+    action: "hold" | "consider";
+    scenario_id: string | null;
+    chip: ChipName | null;
+    event: number | null;
+    reason: string;
+  };
+  model_scope: "bounded_chip_counterfactuals";
+  globally_optimal: false;
+  recalculate_each_deadline: true;
+}
+
 export interface PlannerPayload {
   manager_id: number;
   state_fingerprint: string | null;
@@ -253,13 +359,16 @@ export interface PlannerPayload {
   best_action: PlannerAction;
   alternatives: PlannerAction[];
   sequential: PlannerSequentialPlan | null;
+  strategy: PlannerStrategyPlan | null;
+  chip_strategy: PlannerChipStrategy | null;
   method: {
     candidate_count: number;
     plans_per_transfer_count: 5;
     higher_transfer_count_plans: 1;
     maximum_immediate_transfers: number;
     roll_ft_value_points: number;
-    chips_modelled: false;
+    chips_modelled: boolean;
+    bounded_roadmap_modelled: boolean;
     next_deadline_transfer_modelled: boolean;
     future_transfers_modelled: false;
   };
@@ -294,7 +403,15 @@ type UnknownRecord = Record<string, unknown>;
 const POSITIONS = ["GKP", "DEF", "MID", "FWD"] as const;
 const STATUSES = ["a", "d", "i", "s", "u", "n"] as const;
 const CHIP_NAMES = ["wildcard", "freehit", "bboost", "3xc"] as const;
-const CHIP_STATUSES = ["available", "used", "active", "unavailable"] as const;
+const CHIP_STATUSES = ["available", "used", "unavailable"] as const;
+const STRATEGY_ASSUMPTIONS = [
+  "fixed_current_prices",
+  "four_transfer_deadlines_modelled",
+  "maximum_two_transfers_at_each_provisional_deadline",
+  "first_action_restricted_to_supplied_explicit_plans",
+  "no_transfers_after_deadline_four_assumed",
+  "recalculate_at_every_real_deadline",
+] as const;
 const LIMITATIONS: readonly PublicStateLimitation[] = [
   "state_is_locked_at_last_public_deadline",
   "current_free_transfers_not_public",
@@ -308,6 +425,7 @@ const CONFIRMATION_FIELDS: readonly ConfirmationField[] = [
   "free_transfers",
   "player_prices",
   "chips",
+  "chip_usage",
   "no_active_chip_confirmed",
 ];
 const MAX_BANK_TENTHS = 1_000;
@@ -556,33 +674,108 @@ function validatePlayerPrices(value: unknown, path: string, squadIds: readonly n
   return parsed;
 }
 
-function validateChips(value: unknown, path: string): ChipState {
-  const chips = record(value, path);
-  const keys = Object.keys(chips);
-  const unknown = keys.filter((key) => !CHIP_NAMES.includes(key as ChipName));
-  if (unknown.length) fail(path, `contains unsupported chips: ${unknown.join(", ")}`);
-  let active = 0;
-  for (const key of keys) {
-    const status = oneOf(chips[key], `${path}.${key}`, CHIP_STATUSES);
-    if (status === "active") active += 1;
+function chipWindowHalf(chip: ChipName, event: number): 1 | 2 | null {
+  if (event >= 20 && event <= 38) return 2;
+  if (event < 1 || event > 19) return null;
+  if (chip === "wildcard" || chip === "freehit") return event >= 2 ? 1 : null;
+  return 1;
+}
+
+function validateChipUsage(
+  value: unknown,
+  path: string,
+  options: { beforeEvent?: number; throughEvent?: number; requireSorted?: boolean } = {},
+): ChipUsage[] {
+  const rows = array(value, path);
+  if (rows.length > 8) fail(path, "must contain at most two legal uses of each chip");
+  const parsed = rows.map((value, index) => {
+    const rowPath = `${path}[${index}]`;
+    const row = exactRecord(value, rowPath, ["name", "event"]);
+    const name = oneOf(row.name, `${rowPath}.name`, CHIP_NAMES);
+    const event = integer(row.event, `${rowPath}.event`, 1, 38);
+    const half = chipWindowHalf(name, event);
+    if (half === null) fail(rowPath, `${name} cannot be used in GW${event}`);
+    if (options.beforeEvent !== undefined && event >= options.beforeEvent) {
+      fail(`${rowPath}.event`, `must be earlier than event ${options.beforeEvent}`);
+    }
+    if (options.throughEvent !== undefined && event > options.throughEvent) {
+      fail(`${rowPath}.event`, `cannot be later than event ${options.throughEvent}`);
+    }
+    return { name, event, half };
+  });
+  const sorted = [...parsed].sort((left, right) =>
+    left.event - right.event || left.name.localeCompare(right.name),
+  );
+  if (
+    options.requireSorted !== false &&
+    parsed.some((row, index) => row.name !== sorted[index].name || row.event !== sorted[index].event)
+  ) {
+    fail(path, "must be sorted by event and chip name");
   }
-  if (active > 1) fail(path, "at most one chip can be active");
-  return chips as ChipState;
+  const events = new Set<number>();
+  const chipHalves = new Set<string>();
+  for (const row of parsed) {
+    if (events.has(row.event)) fail(path, `cannot contain more than one chip in GW${row.event}`);
+    const key = `${row.name}:${row.half}`;
+    if (chipHalves.has(key)) fail(path, `cannot use ${row.name} twice in half ${row.half}`);
+    events.add(row.event);
+    chipHalves.add(key);
+  }
+  const freeHitEvents = new Set(parsed.filter((row) => row.name === "freehit").map((row) => row.event));
+  if (freeHitEvents.has(19) && freeHitEvents.has(20)) {
+    fail(path, "cannot use Free Hit in consecutive gameweeks 19 and 20");
+  }
+  return parsed.map(({ name, event }) => ({ name, event }));
+}
+
+function expectedChipState(chipUsage: readonly ChipUsage[], effectiveEvent: number): ChipState {
+  const currentHalf = effectiveEvent <= 19 ? 1 : 2;
+  const previousChip = chipUsage.find((row) => row.event === effectiveEvent - 1)?.name ?? null;
+  return Object.fromEntries(CHIP_NAMES.map((name) => {
+    const usedInHalf = chipUsage.some(
+      (row) => row.name === name && chipWindowHalf(row.name, row.event) === currentHalf,
+    );
+    if (usedInHalf) return [name, "used"];
+    const legalNow = chipWindowHalf(name, effectiveEvent) !== null && !(
+      name === "freehit" && previousChip === "freehit" && effectiveEvent === 20
+    );
+    return [name, legalNow ? "available" : "unavailable"];
+  })) as ChipState;
+}
+
+function validateChips(
+  value: unknown,
+  path: string,
+  chipUsage: readonly ChipUsage[],
+  effectiveEvent: number,
+): ChipState {
+  const chips = exactRecord(value, path, CHIP_NAMES);
+  const expected = expectedChipState(chipUsage, effectiveEvent);
+  for (const name of CHIP_NAMES) {
+    const status = oneOf(chips[name], `${path}.${name}`, CHIP_STATUSES);
+    if (status !== expected[name]) {
+      fail(`${path}.${name}`, "is inconsistent with chip_usage and effective_event");
+    }
+  }
+  return chips as unknown as ChipState;
 }
 
 export function parseManualManagerState(value: unknown): ManualManagerState {
   const path = "manager_state";
   const row = exactRecord(value, path, [
-    "current_squad_ids", "bank_tenths", "free_transfers", "player_prices", "chips",
+    "current_squad_ids", "bank_tenths", "free_transfers", "player_prices", "chips", "chip_usage",
     "no_active_chip_confirmed", "effective_event",
   ]);
   const squadIds = uniqueIntegers(row.current_squad_ids, `${path}.current_squad_ids`, 15);
   integer(row.bank_tenths, `${path}.bank_tenths`, 0, MAX_BANK_TENTHS);
   integer(row.free_transfers, `${path}.free_transfers`, 1, 5);
   validatePlayerPrices(row.player_prices, `${path}.player_prices`, squadIds);
-  validateChips(row.chips, `${path}.chips`);
+  const effectiveEvent = integer(row.effective_event, `${path}.effective_event`, 1, 38);
+  const chipUsage = validateChipUsage(row.chip_usage, `${path}.chip_usage`, {
+    beforeEvent: effectiveEvent,
+  });
+  validateChips(row.chips, `${path}.chips`, chipUsage, effectiveEvent);
   boolean(row.no_active_chip_confirmed, `${path}.no_active_chip_confirmed`);
-  nullable(row.effective_event, (item) => integer(item, `${path}.effective_event`, 1, 38));
   return row as unknown as ManualManagerState;
 }
 
@@ -609,7 +802,7 @@ export function parseManagerSyncResponse(value: unknown): ManagerSyncResponse {
   const state = exactRecord(root.last_deadline_state, "sync.last_deadline_state", [
     "schema_version", "state_kind", "event", "bank_tenths", "squad_value_tenths",
     "total_transfers_at_deadline", "event_transfers", "event_transfer_cost", "active_chip",
-    "limitations", "picks",
+    "chip_usage", "limitations", "picks",
   ]);
   literal(state.schema_version, "sync.last_deadline_state.schema_version", PERSONAL_STATE_SCHEMA_VERSION);
   literal(state.state_kind, "sync.last_deadline_state.state_kind", "public_last_deadline");
@@ -621,6 +814,18 @@ export function parseManagerSyncResponse(value: unknown): ManagerSyncResponse {
   integer(state.event_transfers, "sync.last_deadline_state.event_transfers", 0);
   integer(state.event_transfer_cost, "sync.last_deadline_state.event_transfer_cost", 0);
   const activeChip = nullable(state.active_chip, (item) => oneOf(item, "sync.last_deadline_state.active_chip", CHIP_NAMES));
+  const chipUsage = validateChipUsage(
+    state.chip_usage,
+    "sync.last_deadline_state.chip_usage",
+    { throughEvent: sourceEvent },
+  );
+  const chipsAtSourceEvent = chipUsage.filter((row) => row.event === sourceEvent);
+  if (
+    chipsAtSourceEvent.length !== (activeChip === null ? 0 : 1) ||
+    (activeChip !== null && chipsAtSourceEvent[0]?.name !== activeChip)
+  ) {
+    fail("sync.last_deadline_state.active_chip", "must match chip_usage at the source event");
+  }
   exactStringArray(state.limitations, "sync.last_deadline_state.limitations", LIMITATIONS);
   const pickValues = array(state.picks, "sync.last_deadline_state.picks");
   if (pickValues.length !== 15) fail("sync.last_deadline_state.picks", "must contain exactly 15 picks");
@@ -658,7 +863,9 @@ export function parseManagerSyncResponse(value: unknown): ManagerSyncResponse {
   if (manualState.bank_tenths !== bankTenths) fail("sync.manual_state_template.state.bank_tenths", "must match last_deadline_state.bank_tenths");
   if (manualState.free_transfers !== 1) fail("sync.manual_state_template.state.free_transfers", "must use the public-data default of 1");
   if (manualState.effective_event !== targetEvent) fail("sync.manual_state_template.state.effective_event", "must match target.event");
-  if (Object.keys(manualState.chips).length !== 0) fail("sync.manual_state_template.state.chips", "must be empty until confirmed manually");
+  if (!sameJson(manualState.chip_usage, chipUsage)) {
+    fail("sync.manual_state_template.state.chip_usage", "must match last_deadline_state.chip_usage");
+  }
   if (manualState.no_active_chip_confirmed) fail("sync.manual_state_template.state.no_active_chip_confirmed", "must be false until confirmed manually");
   const byPickId = new Map(picks.map((pick) => [pick.element_id, pick]));
   for (const price of manualState.player_prices) {
@@ -737,6 +944,7 @@ function cloneManualState(state: ManualManagerState): ManualManagerState {
     free_transfers: state.free_transfers,
     player_prices: state.player_prices.map((price) => ({ ...price })),
     chips: { ...state.chips },
+    chip_usage: state.chip_usage.map((usage) => ({ ...usage })),
     no_active_chip_confirmed: state.no_active_chip_confirmed,
     effective_event: state.effective_event,
   };
@@ -946,7 +1154,7 @@ function validateSequentialStep(
   value: unknown,
   path: string,
   options: {
-    deadlineOffset: 1 | 2;
+    deadlineOffset: number;
     provisional: boolean;
     targetEvent: number;
     gameweekWindow: readonly number[];
@@ -955,6 +1163,7 @@ function validateSequentialStep(
     bankBefore: number;
     freeTransfersBefore: number;
     fixedPurchasePrices?: ReadonlyMap<number, number>;
+    maximumTransfers?: number;
   },
 ): ValidatedSequentialStep {
   const row = exactRecord(value, path, [
@@ -969,7 +1178,7 @@ function validateSequentialStep(
 
   const kind = oneOf(row.kind, `${path}.kind`, ["roll", "transfer", "hit"] as const);
   const transferCount = integer(row.transfer_count, `${path}.transfer_count`, 0, 5);
-  if (transferCount > Math.max(2, options.freeTransfersBefore)) {
+  if (transferCount > (options.maximumTransfers ?? Math.max(2, options.freeTransfersBefore))) {
     fail(`${path}.transfer_count`, "exceeds the bounded immediate-transfer search");
   }
   const transferValues = array(row.transfers, `${path}.transfers`);
@@ -1027,7 +1236,7 @@ function validateSequentialStep(
       fail(transferPath, "enriched players must match the transfer ids, position and fixed prices");
     }
     if (!sameJson(outgoing, options.priorSquad.get(outId))) {
-      fail(`${transferPath}.out`, "must match the player in the preceding sequential squad");
+      fail(`${transferPath}.out`, "must match the player in the preceding chained squad");
     }
     if (selling !== sellingPrice(purchase, current)) {
       fail(`${transferPath}.out_selling_price_tenths`, "does not follow the FPL half-profit rule");
@@ -1355,10 +1564,570 @@ function validateSequentialPlan(
   } as unknown as PlannerSequentialPlan;
 }
 
+function validateStrategyPlan(
+  value: unknown,
+  options: {
+    targetEvent: number;
+    confirmedSquad: ReadonlyMap<number, PlannerPlayerReference>;
+    confirmedPurchasePrices: ReadonlyMap<number, number>;
+    bank: number;
+    freeTransfers: number;
+    bestAction: PlannerAction;
+    alternatives: readonly PlannerAction[];
+    rollFtValuePoints: number;
+  },
+): PlannerStrategyPlan {
+  const root = exactRecord(value, "planner.strategy", [
+    "horizon", "gameweek_window", "gw_weights", "modelled_deadlines",
+    "maximum_provisional_transfers", "first_step_candidate_count", "first_step_search",
+    "search_scope", "future_price_assumption", "assumptions",
+    "solver_proven_optimal_within_bounds", "globally_optimal", "recalculate_each_deadline",
+    "first_action", "steps", "weighted_projected_points", "total_hit_points",
+    "weighted_hit_cost_points", "terminal_banked_ft_value_points", "decision_value_points",
+  ]);
+  const horizon = integer(root.horizon, "planner.strategy.horizon", 6, 10);
+  const window = array(root.gameweek_window, "planner.strategy.gameweek_window").map(
+    (event, index) => integer(event, `planner.strategy.gameweek_window[${index}]`, 1, 38),
+  );
+  if (window.length !== horizon) {
+    fail("planner.strategy.gameweek_window", "length must match the strategy horizon");
+  }
+  if (window[0] !== options.targetEvent) {
+    fail("planner.strategy.gameweek_window[0]", "must begin at planner.target_event");
+  }
+  if (window.some((event, index) => index > 0 && event !== window[index - 1] + 1)) {
+    fail("planner.strategy.gameweek_window", "must be a contiguous gameweek window");
+  }
+  const weights = array(root.gw_weights, "planner.strategy.gw_weights").map((weight, index) =>
+    finiteNumber(weight, `planner.strategy.gw_weights[${index}]`, 0.000_001, 1),
+  );
+  if (weights.length !== horizon) fail("planner.strategy.gw_weights", "length must match horizon");
+  if (!closeEnough(weights[0], 1)) fail("planner.strategy.gw_weights[0]", "must equal 1");
+  if (weights.some((weight, index) => index > 0 && weight > weights[index - 1])) {
+    fail("planner.strategy.gw_weights", "must be non-increasing");
+  }
+  literal(root.modelled_deadlines, "planner.strategy.modelled_deadlines", 4);
+  literal(root.maximum_provisional_transfers, "planner.strategy.maximum_provisional_transfers", 2);
+  const candidateCount = integer(
+    root.first_step_candidate_count,
+    "planner.strategy.first_step_candidate_count",
+    1,
+    16,
+  );
+  if (candidateCount !== options.alternatives.length + 1) {
+    fail(
+      "planner.strategy.first_step_candidate_count",
+      "must equal the visible best action plus alternatives",
+    );
+  }
+  literal(
+    root.first_step_search,
+    "planner.strategy.first_step_search",
+    "explicit_bounded_transfer_plans",
+  );
+  literal(
+    root.search_scope,
+    "planner.strategy.search_scope",
+    "four_deadlines_max_two_provisional_transfers",
+  );
+  literal(
+    root.future_price_assumption,
+    "planner.strategy.future_price_assumption",
+    "fixed_current_prices",
+  );
+  exactStringArray(root.assumptions, "planner.strategy.assumptions", STRATEGY_ASSUMPTIONS);
+  literal(
+    root.solver_proven_optimal_within_bounds,
+    "planner.strategy.solver_proven_optimal_within_bounds",
+    true,
+  );
+  literal(root.globally_optimal, "planner.strategy.globally_optimal", false);
+  literal(root.recalculate_each_deadline, "planner.strategy.recalculate_each_deadline", true);
+
+  const firstActionRow = exactRecord(root.first_action, "planner.strategy.first_action", [
+    "source", "alternative_index",
+  ]);
+  const source = oneOf(
+    firstActionRow.source,
+    "planner.strategy.first_action.source",
+    ["best_action", "alternative"] as const,
+  );
+  let alternativeIndex: number | null = null;
+  let selectedAction = options.bestAction;
+  if (source === "best_action") {
+    literal(firstActionRow.alternative_index, "planner.strategy.first_action.alternative_index", null);
+  } else {
+    alternativeIndex = integer(
+      firstActionRow.alternative_index,
+      "planner.strategy.first_action.alternative_index",
+      0,
+      options.alternatives.length - 1,
+    );
+    selectedAction = options.alternatives[alternativeIndex];
+  }
+
+  const stepValues = array(root.steps, "planner.strategy.steps");
+  if (stepValues.length !== 4) fail("planner.strategy.steps", "must contain exactly four steps");
+  const stepWindows = [
+    window.slice(0, 1),
+    window.slice(1, 2),
+    window.slice(2, 3),
+    window.slice(3),
+  ];
+  const stepWeights = [
+    weights.slice(0, 1),
+    weights.slice(1, 2),
+    weights.slice(2, 3),
+    weights.slice(3),
+  ];
+  let priorSquad = new Map(options.confirmedSquad);
+  let bankBefore = options.bank;
+  let freeTransfersBefore = options.freeTransfers;
+  const fixedPurchasePrices = new Map(options.confirmedPurchasePrices);
+  const steps: PlannerStrategyStep[] = [];
+  for (let index = 0; index < stepValues.length; index += 1) {
+    const path = `planner.strategy.steps[${index}]`;
+    const validated = validateSequentialStep(stepValues[index], path, {
+      deadlineOffset: index + 1,
+      provisional: index > 0,
+      targetEvent: window[index],
+      gameweekWindow: stepWindows[index],
+      gameweekWeights: stepWeights[index],
+      priorSquad,
+      bankBefore,
+      freeTransfersBefore,
+      fixedPurchasePrices,
+      maximumTransfers: index === 0 ? Math.max(2, options.freeTransfers) : 2,
+    });
+    const step = validated.step as unknown as PlannerStrategyStep;
+    if (index === 0) {
+      const matchesSelectedAction = (
+        step.kind === selectedAction.kind &&
+        step.transfer_count === selectedAction.transfer_count &&
+        sameJson(step.transfers, selectedAction.transfers) &&
+        sameJson(step.squad_ids, selectedAction.squad_ids) &&
+        step.bank_before_tenths === selectedAction.bank_before_tenths &&
+        step.bank_after_tenths === selectedAction.bank_after_tenths &&
+        step.free_transfers_before === selectedAction.free_transfers_before &&
+        step.free_transfers_next_gameweek === selectedAction.free_transfers_next_gameweek &&
+        step.hit_points === selectedAction.hit_points &&
+        sameJson(step.gameweeks[0], selectedAction.gameweeks[0])
+      );
+      if (!matchesSelectedAction) {
+        fail(path, "must exactly match the referenced visible action at the first deadline");
+      }
+    }
+    for (const transfer of step.transfers) {
+      fixedPurchasePrices.delete(transfer.out_id);
+      fixedPurchasePrices.set(transfer.in_id, transfer.in_price_tenths);
+    }
+    steps.push(step);
+    priorSquad = validated.squad;
+    bankBefore = step.bank_after_tenths;
+    freeTransfersBefore = step.free_transfers_next_gameweek;
+  }
+
+  const weightedProjectedPoints = finiteNumber(
+    root.weighted_projected_points,
+    "planner.strategy.weighted_projected_points",
+    0,
+  );
+  reconcileNumber(
+    weightedProjectedPoints,
+    steps.reduce((total, step) => total + step.weighted_projected_points, 0),
+    "planner.strategy.weighted_projected_points",
+  );
+  const totalHitPoints = integer(root.total_hit_points, "planner.strategy.total_hit_points", 0, 64);
+  if (totalHitPoints !== steps.reduce((total, step) => total + step.hit_points, 0)) {
+    fail("planner.strategy.total_hit_points", "must equal all four steps' hit points");
+  }
+  const weightedHitCostPoints = finiteNumber(
+    root.weighted_hit_cost_points,
+    "planner.strategy.weighted_hit_cost_points",
+    0,
+  );
+  reconcileNumber(
+    weightedHitCostPoints,
+    steps.reduce((total, step) => total + step.weighted_hit_cost_points, 0),
+    "planner.strategy.weighted_hit_cost_points",
+  );
+  const terminalFtValue = finiteNumber(
+    root.terminal_banked_ft_value_points,
+    "planner.strategy.terminal_banked_ft_value_points",
+    0,
+  );
+  const terminalFreeTransfers = Math.min(5, freeTransfersBefore + horizon - 4);
+  reconcileNumber(
+    terminalFtValue,
+    Math.max(0, terminalFreeTransfers - 1) * options.rollFtValuePoints,
+    "planner.strategy.terminal_banked_ft_value_points",
+  );
+  const decisionValue = finiteNumber(
+    root.decision_value_points,
+    "planner.strategy.decision_value_points",
+  );
+  reconcileNumber(
+    decisionValue,
+    weightedProjectedPoints - weightedHitCostPoints + terminalFtValue,
+    "planner.strategy.decision_value_points",
+  );
+
+  return {
+    ...root,
+    horizon,
+    gameweek_window: window,
+    gw_weights: weights,
+    first_action: { source, alternative_index: alternativeIndex },
+    steps: steps as PlannerStrategyPlan["steps"],
+  } as unknown as PlannerStrategyPlan;
+}
+
+function chipAvailableAt(
+  chip: ChipName,
+  event: number,
+  usedEvents: readonly number[],
+): boolean {
+  const half = chipWindowHalf(chip, event);
+  if (half === null) return false;
+  if (usedEvents.some((usedEvent) => chipWindowHalf(chip, usedEvent) === half)) return false;
+  return !(chip === "freehit" && event === 20 && usedEvents.includes(19));
+}
+
+function validateChipStrategy(
+  value: unknown,
+  options: {
+    strategy: PlannerStrategyPlan;
+    confirmedSquad: ReadonlyMap<number, PlannerPlayerReference>;
+    confirmedSellingPrices: ReadonlyMap<number, number>;
+    confirmedBank: number;
+  },
+): PlannerChipStrategy {
+  const root = exactRecord(value, "planner.chip_strategy", [
+    "horizon", "target_event", "inventory", "scenarios", "recommendation",
+    "model_scope", "globally_optimal", "recalculate_each_deadline",
+  ]);
+  literal(root.horizon, "planner.chip_strategy.horizon", options.strategy.horizon);
+  literal(root.target_event, "planner.chip_strategy.target_event", options.strategy.gameweek_window[0]);
+  literal(root.model_scope, "planner.chip_strategy.model_scope", "bounded_chip_counterfactuals");
+  literal(root.globally_optimal, "planner.chip_strategy.globally_optimal", false);
+  literal(root.recalculate_each_deadline, "planner.chip_strategy.recalculate_each_deadline", true);
+
+  const inventoryValues = array(root.inventory, "planner.chip_strategy.inventory");
+  if (inventoryValues.length !== 4) {
+    fail("planner.chip_strategy.inventory", "must contain all four chips exactly once");
+  }
+  const usageRows: ChipUsage[] = [];
+  const inventory = inventoryValues.map((value, index) => {
+    const path = `planner.chip_strategy.inventory[${index}]`;
+    const row = exactRecord(value, path, ["chip", "used_events", "available_for_target"]);
+    const chip = oneOf(row.chip, `${path}.chip`, CHIP_NAMES);
+    const usedEvents = array(row.used_events, `${path}.used_events`).map((event, eventIndex) =>
+      integer(event, `${path}.used_events[${eventIndex}]`, 1, 38),
+    );
+    if (
+      usedEvents.length > 2 ||
+      new Set(usedEvents).size !== usedEvents.length ||
+      usedEvents.some((event, eventIndex) => eventIndex > 0 && event <= usedEvents[eventIndex - 1])
+    ) {
+      fail(`${path}.used_events`, "must contain up to two unique increasing events");
+    }
+    usageRows.push(...usedEvents.map((event) => ({ name: chip, event })));
+    const availableForTarget = boolean(row.available_for_target, `${path}.available_for_target`);
+    if (availableForTarget !== chipAvailableAt(chip, options.strategy.gameweek_window[0], usedEvents)) {
+      fail(`${path}.available_for_target`, "is inconsistent with used_events and target_event");
+    }
+    return { chip, used_events: usedEvents, available_for_target: availableForTarget };
+  });
+  if (new Set(inventory.map((entry) => entry.chip)).size !== 4) {
+    fail("planner.chip_strategy.inventory", "must contain all four chips exactly once");
+  }
+  validateChipUsage(usageRows, "planner.chip_strategy.inventory.used_events", {
+    beforeEvent: options.strategy.gameweek_window[0],
+    requireSorted: false,
+  });
+  const inventoryByChip = new Map(inventory.map((entry) => [entry.chip, entry]));
+  const roadmapGameweeks = new Map(
+    options.strategy.steps.flatMap((step) => step.gameweeks).map((gameweek) => [
+      gameweek.gameweek,
+      gameweek,
+    ]),
+  );
+  const roadmapSquads = new Map(
+    options.strategy.steps.flatMap((step) => step.gameweeks.map((gameweek) => [
+      gameweek.gameweek,
+      step.squad_ids,
+    ] as const)),
+  );
+
+  const scenarioValues = array(root.scenarios, "planner.chip_strategy.scenarios");
+  if (scenarioValues.length !== 4) {
+    fail("planner.chip_strategy.scenarios", "must contain one scenario for each chip");
+  }
+  const scopes: Record<ChipName, PlannerChipScenarioScope> = {
+    wildcard: "multiweek_rebuild",
+    freehit: "confirmed_blank_double_screen",
+    bboost: "bench_marginal",
+    "3xc": "captain_marginal",
+  };
+  const scenarios = scenarioValues.map((value, index) => {
+    const path = `planner.chip_strategy.scenarios[${index}]`;
+    const row = exactRecord(value, path, [
+      "scenario_id", "chip", "event", "signal", "available", "estimated_gain_points",
+      "baseline_points", "chip_points", "confidence", "model_scope", "reason", "squad",
+      "change_count", "bank_after_tenths",
+    ]);
+    const chip = oneOf(row.chip, `${path}.chip`, CHIP_NAMES);
+    const scenarioId = text(row.scenario_id, `${path}.scenario_id`);
+    const event = row.event === null
+      ? null
+      : integer(row.event, `${path}.event`, options.strategy.gameweek_window[0], options.strategy.gameweek_window.at(-1));
+    const signal = oneOf(row.signal, `${path}.signal`, ["hold", "watch", "consider"] as const);
+    const available = boolean(row.available, `${path}.available`);
+    const confidence = oneOf(row.confidence, `${path}.confidence`, ["low", "medium"] as const);
+    const modelScope = oneOf(
+      row.model_scope,
+      `${path}.model_scope`,
+      chip === "freehit"
+        ? ["confirmed_blank_double_screen", "single_gameweek_counterfactual"] as const
+        : [scopes[chip]],
+    );
+    text(row.reason, `${path}.reason`);
+    const inventoryEntry = inventoryByChip.get(chip)!;
+    const expectedAvailability = chip === "wildcard"
+      ? inventoryEntry.available_for_target
+      : options.strategy.gameweek_window.some((candidateEvent) =>
+          chipAvailableAt(chip, candidateEvent, inventoryEntry.used_events),
+        );
+    if (available !== expectedAvailability) {
+      fail(`${path}.available`, "is inconsistent with inventory and the strategy window");
+    }
+    if (event !== null && !chipAvailableAt(chip, event, inventoryEntry.used_events)) {
+      fail(`${path}.event`, "is not a legal available event for this chip inventory");
+    }
+    if (event !== null && !available) fail(`${path}.available`, "must be true when an event is selected");
+    if (!available && (event !== null || signal !== "hold" || confidence !== "low")) {
+      fail(path, "an unavailable scenario must be a low-confidence hold without an event");
+    }
+    if (event === null && signal !== "hold") fail(`${path}.signal`, "must be hold without an event");
+
+    const metricValues = [row.estimated_gain_points, row.baseline_points, row.chip_points];
+    const metricsAreNull = metricValues.every((metric) => metric === null);
+    const metricsArePresent = metricValues.every((metric) => typeof metric === "number");
+    if (!metricsAreNull && !metricsArePresent) {
+      fail(path, "gain, baseline and chip points must either all be null or all be numbers");
+    }
+    let estimatedGain: number | null = null;
+    let baselinePoints: number | null = null;
+    let chipPoints: number | null = null;
+    if (metricsArePresent) {
+      estimatedGain = finiteNumber(row.estimated_gain_points, `${path}.estimated_gain_points`);
+      baselinePoints = finiteNumber(row.baseline_points, `${path}.baseline_points`, 0);
+      chipPoints = finiteNumber(row.chip_points, `${path}.chip_points`, 0);
+      reconcileNumber(chipPoints, baselinePoints + estimatedGain, `${path}.chip_points`);
+    }
+    if (signal === "consider" && (event === null || !available || estimatedGain === null)) {
+      fail(`${path}.signal`, "consider requires an available event and a quantified gain");
+    }
+
+    const expectedScenarioId = event === null
+      ? chip === "freehit" && available
+        ? "freehit-no-confirmed-trigger"
+        : `${chip}-unavailable`
+      : chip === "freehit"
+        ? modelScope === "single_gameweek_counterfactual"
+          ? `freehit-gw${event}`
+          : `freehit-gw${event}-screen`
+        : `${chip}-gw${event}`;
+    if (scenarioId !== expectedScenarioId) {
+      fail(`${path}.scenario_id`, `must be ${expectedScenarioId}`);
+    }
+
+    const squadValues = array(row.squad, `${path}.squad`);
+    let squad: PlannerPlayerReference[] = [];
+    let changeCount: number | null = null;
+    let bankAfter: number | null = null;
+    if (chip === "wildcard") {
+      if (squadValues.length !== 0 && squadValues.length !== 15) {
+        fail(`${path}.squad`, "must contain either zero or exactly 15 players");
+      }
+      squad = squadValues.map((player, playerIndex) =>
+        validatePlayerReference(player, `${path}.squad[${playerIndex}]`),
+      );
+      if (squad.length === 15) {
+        if (new Set(squad.map((player) => player.id)).size !== 15) {
+          fail(`${path}.squad`, "player ids must be unique");
+        }
+        validatePositionQuotas(squad, `${path}.squad`);
+        const clubCounts = new Map<string, number>();
+        for (const player of squad) clubCounts.set(player.team, (clubCounts.get(player.team) ?? 0) + 1);
+        if ([...clubCounts.values()].some((count) => count > 3)) {
+          fail(`${path}.squad`, "cannot contain more than three players from one club");
+        }
+        changeCount = integer(row.change_count, `${path}.change_count`, 0, 15);
+        const expectedChanges = [...options.confirmedSquad.keys()].filter(
+          (id) => !squad.some((player) => player.id === id),
+        ).length;
+        if (changeCount !== expectedChanges) {
+          fail(`${path}.change_count`, "must match the confirmed players removed by the Wildcard");
+        }
+        bankAfter = integer(row.bank_after_tenths, `${path}.bank_after_tenths`, 0, MAX_BANK_TENTHS);
+        const currentBudget = options.confirmedBank + [...options.confirmedSellingPrices.values()]
+          .reduce((total, price) => total + price, 0);
+        const wildcardCost = squad.reduce((total, player) => total + player.price_tenths, 0);
+        if (bankAfter !== currentBudget - wildcardCost) {
+          fail(`${path}.bank_after_tenths`, "does not reconcile with the confirmed Wildcard budget");
+        }
+      } else if (row.change_count !== null || row.bank_after_tenths !== null) {
+        fail(path, "an unsolved Wildcard scenario cannot include change count or bank");
+      }
+      if (baselinePoints !== null) {
+        reconcileNumber(
+          baselinePoints,
+          options.strategy.decision_value_points,
+          `${path}.baseline_points`,
+        );
+      }
+    } else if (chip === "freehit" && modelScope === "single_gameweek_counterfactual") {
+      if (event === null || !metricsArePresent || squadValues.length !== 15) {
+        fail(path, "a solved Free Hit must include an event, metrics and exactly 15 players");
+      }
+      squad = squadValues.map((player, playerIndex) =>
+        validatePlayerReference(player, `${path}.squad[${playerIndex}]`),
+      );
+      if (new Set(squad.map((player) => player.id)).size !== 15) {
+        fail(`${path}.squad`, "player ids must be unique");
+      }
+      validatePositionQuotas(squad, `${path}.squad`);
+      const clubCounts = new Map<string, number>();
+      for (const player of squad) clubCounts.set(player.team, (clubCounts.get(player.team) ?? 0) + 1);
+      if ([...clubCounts.values()].some((count) => count > 3)) {
+        fail(`${path}.squad`, "cannot contain more than three players from one club");
+      }
+      const permanentSquad = roadmapSquads.get(event);
+      if (!permanentSquad) fail(`${path}.event`, "must reference a roadmap squad");
+      changeCount = integer(row.change_count, `${path}.change_count`, 0, 15);
+      const expectedChanges = permanentSquad.filter(
+        (id) => !squad.some((player) => player.id === id),
+      ).length;
+      if (changeCount !== expectedChanges) {
+        fail(`${path}.change_count`, "must match the roadmap players replaced by the Free Hit");
+      }
+      literal(row.bank_after_tenths, `${path}.bank_after_tenths`, null);
+      const currentBudget = options.confirmedBank + [...options.confirmedSellingPrices.values()]
+        .reduce((total, price) => total + price, 0);
+      const freeHitCost = squad.reduce((total, player) => total + player.price_tenths, 0);
+      if (freeHitCost > currentBudget) {
+        fail(`${path}.squad`, "exceeds the confirmed Free Hit budget");
+      }
+      const roadmapGameweek = roadmapGameweeks.get(event);
+      if (!roadmapGameweek) fail(`${path}.event`, "must reference a roadmap gameweek");
+      reconcileNumber(baselinePoints!, roadmapGameweek.projected_points, `${path}.baseline_points`);
+    } else {
+      if (squadValues.length !== 0 || row.change_count !== null || row.bank_after_tenths !== null) {
+        fail(path, "only a solved Wildcard or Free Hit scenario may include squad or change count");
+      }
+      if (chip === "freehit" && modelScope === "confirmed_blank_double_screen" && !metricsAreNull) {
+        fail(path, "an unsolved Free Hit screen cannot include quantified points");
+      }
+      if (baselinePoints !== null && event !== null) {
+        const roadmapGameweek = roadmapGameweeks.get(event);
+        if (!roadmapGameweek) fail(`${path}.event`, "must reference a roadmap gameweek");
+        reconcileNumber(baselinePoints, roadmapGameweek.projected_points, `${path}.baseline_points`);
+      }
+    }
+
+    return {
+      scenario_id: scenarioId,
+      chip,
+      event,
+      signal,
+      available,
+      estimated_gain_points: estimatedGain,
+      baseline_points: baselinePoints,
+      chip_points: chipPoints,
+      confidence,
+      model_scope: modelScope,
+      reason: row.reason as string,
+      squad,
+      change_count: changeCount,
+      bank_after_tenths: bankAfter,
+    } satisfies PlannerChipScenario;
+  });
+  if (
+    new Set(scenarios.map((scenario) => scenario.chip)).size !== 4 ||
+    new Set(scenarios.map((scenario) => scenario.scenario_id)).size !== 4
+  ) {
+    fail("planner.chip_strategy.scenarios", "must contain four unique chip scenarios");
+  }
+
+  const recommendationRow = exactRecord(
+    root.recommendation,
+    "planner.chip_strategy.recommendation",
+    ["action", "scenario_id", "chip", "event", "reason"],
+  );
+  const action = oneOf(
+    recommendationRow.action,
+    "planner.chip_strategy.recommendation.action",
+    ["hold", "consider"] as const,
+  );
+  text(recommendationRow.reason, "planner.chip_strategy.recommendation.reason");
+  let recommendedScenarioId: string | null = null;
+  let recommendedChip: ChipName | null = null;
+  let recommendedEvent: number | null = null;
+  if (action === "hold") {
+    literal(recommendationRow.scenario_id, "planner.chip_strategy.recommendation.scenario_id", null);
+    literal(recommendationRow.chip, "planner.chip_strategy.recommendation.chip", null);
+    literal(recommendationRow.event, "planner.chip_strategy.recommendation.event", null);
+  } else {
+    recommendedScenarioId = text(
+      recommendationRow.scenario_id,
+      "planner.chip_strategy.recommendation.scenario_id",
+    );
+    recommendedChip = oneOf(
+      recommendationRow.chip,
+      "planner.chip_strategy.recommendation.chip",
+      CHIP_NAMES,
+    );
+    recommendedEvent = integer(
+      recommendationRow.event,
+      "planner.chip_strategy.recommendation.event",
+      options.strategy.gameweek_window[0],
+      options.strategy.gameweek_window[0],
+    );
+    const scenario = scenarios.find((candidate) => candidate.scenario_id === recommendedScenarioId);
+    if (
+      !scenario || scenario.signal !== "consider" || !scenario.available ||
+      scenario.chip !== recommendedChip || scenario.event !== recommendedEvent
+    ) {
+      fail(
+        "planner.chip_strategy.recommendation",
+        "must reference an existing available consider scenario at the target event",
+      );
+    }
+  }
+
+  return {
+    horizon: options.strategy.horizon,
+    target_event: options.strategy.gameweek_window[0],
+    inventory,
+    scenarios,
+    recommendation: {
+      action,
+      scenario_id: recommendedScenarioId,
+      chip: recommendedChip,
+      event: recommendedEvent,
+      reason: recommendationRow.reason as string,
+    },
+    model_scope: "bounded_chip_counterfactuals",
+    globally_optimal: false,
+    recalculate_each_deadline: true,
+  };
+}
+
 export function parsePlannerPayload(value: unknown): PlannerPayload {
   const root = exactRecord(value, "planner", [
     "manager_id", "state_fingerprint", "source_event", "target_event", "confirmed_state",
-    "best_action", "alternatives", "sequential", "method",
+    "best_action", "alternatives", "sequential", "strategy", "chip_strategy", "method",
   ]);
   integer(root.manager_id, "planner.manager_id", 1);
   if (root.state_fingerprint !== null && (typeof root.state_fingerprint !== "string" || !HEX_64.test(root.state_fingerprint))) fail("planner.state_fingerprint", "must be null or a SHA-256 checksum");
@@ -1396,7 +2165,8 @@ export function parsePlannerPayload(value: unknown): PlannerPayload {
 
   const method = exactRecord(root.method, "planner.method", [
     "candidate_count", "plans_per_transfer_count", "higher_transfer_count_plans", "maximum_immediate_transfers",
-    "roll_ft_value_points", "chips_modelled", "next_deadline_transfer_modelled", "future_transfers_modelled",
+    "roll_ft_value_points", "chips_modelled", "bounded_roadmap_modelled",
+    "next_deadline_transfer_modelled", "future_transfers_modelled",
   ]);
   const candidateCount = integer(method.candidate_count, "planner.method.candidate_count", 15);
   literal(method.plans_per_transfer_count, "planner.method.plans_per_transfer_count", 5);
@@ -1405,20 +2175,21 @@ export function parsePlannerPayload(value: unknown): PlannerPayload {
   if (maximumImmediateTransfers !== Math.max(2, freeTransfers)) fail("planner.method.maximum_immediate_transfers", "must cover all available free transfers");
   if ([best, ...parsedAlternatives].some((action) => action.transfer_count > maximumImmediateTransfers)) fail("planner.method.maximum_immediate_transfers", "must cover every returned action");
   const rollFtValuePoints = finiteNumber(method.roll_ft_value_points, "planner.method.roll_ft_value_points", 0);
-  literal(method.chips_modelled, "planner.method.chips_modelled", false);
+  const chipsModelled = boolean(method.chips_modelled, "planner.method.chips_modelled");
+  const boundedRoadmapModelled = boolean(
+    method.bounded_roadmap_modelled,
+    "planner.method.bounded_roadmap_modelled",
+  );
   const nextDeadlineTransferModelled = boolean(
     method.next_deadline_transfer_modelled,
     "planner.method.next_deadline_transfer_modelled",
   );
   literal(method.future_transfers_modelled, "planner.method.future_transfers_modelled", false);
+  if (root.sequential !== null && root.strategy !== null) {
+    fail("planner", "cannot contain both the fallback sequential plan and the long-range strategy");
+  }
   if (horizon === 1 && root.sequential !== null) {
     fail("planner.sequential", "must be null when the planner horizon is one gameweek");
-  }
-  if (nextDeadlineTransferModelled !== (root.sequential !== null)) {
-    fail(
-      "planner.method.next_deadline_transfer_modelled",
-      "must be true exactly when a sequential plan is present",
-    );
   }
   let parsedSequential: PlannerSequentialPlan | null = null;
   if (root.sequential !== null) {
@@ -1434,12 +2205,63 @@ export function parsePlannerPayload(value: unknown): PlannerPayload {
       rollFtValuePoints,
     });
   }
+  let parsedStrategy: PlannerStrategyPlan | null = null;
+  if (root.strategy !== null) {
+    parsedStrategy = validateStrategyPlan(root.strategy, {
+      targetEvent,
+      confirmedSquad: confirmedMap,
+      confirmedPurchasePrices,
+      bank,
+      freeTransfers,
+      bestAction: best,
+      alternatives: parsedAlternatives,
+      rollFtValuePoints,
+    });
+  }
+  let parsedChipStrategy: PlannerChipStrategy | null = null;
+  if (root.chip_strategy !== null) {
+    if (parsedStrategy === null) {
+      fail("planner.chip_strategy", "requires a validated long-range strategy");
+    }
+    parsedChipStrategy = validateChipStrategy(root.chip_strategy, {
+      strategy: parsedStrategy,
+      confirmedSquad: confirmedMap,
+      confirmedSellingPrices: new Map(
+        [...confirmedPrices].map(([id, prices]) => [id, prices.selling]),
+      ),
+      confirmedBank: bank,
+    });
+  }
+  if (boundedRoadmapModelled !== (parsedStrategy !== null)) {
+    fail(
+      "planner.method.bounded_roadmap_modelled",
+      "must be true exactly when a strategy is present",
+    );
+  }
+  if (chipsModelled !== (parsedChipStrategy !== null)) {
+    fail(
+      "planner.method.chips_modelled",
+      "must be true exactly when a chip strategy is present",
+    );
+  }
+  if (nextDeadlineTransferModelled !== (parsedSequential !== null || parsedStrategy !== null)) {
+    fail(
+      "planner.method.next_deadline_transfer_modelled",
+      "must be true exactly when a sequential plan or strategy is present",
+    );
+  }
   const referencedIds = new Set([
     ...(best.transfers ?? []),
     ...parsedAlternatives.flatMap((action) => action.transfers),
     ...(parsedSequential?.best_sequence.steps.flatMap((step) => step.transfers) ?? []),
+    ...(parsedStrategy?.steps.flatMap((step) => step.transfers) ?? []),
   ].flatMap((transfer) => [transfer.out_id, transfer.in_id]));
-  if (candidateCount < new Set([...confirmedMap.keys(), ...referencedIds]).size) fail("planner.method.candidate_count", "is smaller than the referenced candidate set");
+  const referencedPlayerIds = new Set([
+    ...confirmedMap.keys(),
+    ...referencedIds,
+    ...(parsedChipStrategy?.scenarios.flatMap((scenario) => scenario.squad.map((player) => player.id)) ?? []),
+  ]);
+  if (candidateCount < referencedPlayerIds.size) fail("planner.method.candidate_count", "is smaller than the referenced candidate set");
   return root as unknown as PlannerPayload;
 }
 

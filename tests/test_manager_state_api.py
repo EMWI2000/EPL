@@ -9,6 +9,7 @@ import pytest
 
 from api import manager_state
 from fpl_app.services.personal_fpl_state import (
+    ChipUsage,
     PublicLastDeadlineState,
     PublicPick,
     PublicTransfer,
@@ -50,6 +51,11 @@ def _public_state(*, active_chip: str | None = None) -> PublicLastDeadlineState:
         event_transfers=1,
         event_transfer_cost=0,
         active_chip=active_chip,
+        chip_usage=(
+            (ChipUsage(name=active_chip, event=6),)
+            if active_chip is not None
+            else ()
+        ),
         public_transfers=(
             PublicTransfer(
                 event=2,
@@ -216,6 +222,10 @@ def test_manager_sync_enriches_prices_and_returns_confirmation_draft(
         "name": "Gameweek 7",
         "deadline_time": "2026-08-30T17:30:00Z",
     }
+    assert response["schema_version"] == "fpl-manager-state-response-v2"
+    assert response["last_deadline_state"]["chip_usage"] == [
+        {"name": "freehit", "event": 6}
+    ]
 
     picks = response["last_deadline_state"]["picks"]
     assert len(picks) == 15
@@ -243,11 +253,21 @@ def test_manager_sync_enriches_prices_and_returns_confirmation_draft(
 
     template = response["manual_state_template"]
     assert template["state"]["free_transfers"] == 1
+    assert template["state"]["chips"] == {
+        "3xc": "available",
+        "bboost": "available",
+        "freehit": "used",
+        "wildcard": "available",
+    }
+    assert template["state"]["chip_usage"] == [
+        {"name": "freehit", "event": 6}
+    ]
     assert template["state"]["no_active_chip_confirmed"] is False
     assert template["state"]["effective_event"] == 7
     assert template["confirmation_required"] is True
     assert "free_transfers" in template["fields_requiring_confirmation"]
     assert "no_active_chip_confirmed" in template["fields_requiring_confirmation"]
+    assert "chip_usage" in template["fields_requiring_confirmation"]
     assert len(template["state"]["player_prices"]) == 15
     assert response["snapshot"]["persisted"] is False
     assert len(response["snapshot"]["checksum_sha256"]) == 64

@@ -22,11 +22,18 @@ import {
 } from "@/lib/decision-history";
 import { resolveInitialFplManagerId } from "@/lib/fpl-manager-config";
 import {
+  type ChipName,
+  type ChipStatus,
   type ManagerSyncResponse,
   type ManualManagerState,
   type PlannerAction,
+  type PlannerChipScenario,
+  type PlannerChipSignal,
+  type PlannerChipStrategy,
   type PlannerPayload,
   type PlannerSequentialPlan,
+  type PlannerStrategyPlan,
+  type PlannerStrategyStep,
   isPlannerPayload,
   parseBankTenths,
   parseFreeTransfers,
@@ -683,6 +690,241 @@ function SequentialPlanPanel({
   );
 }
 
+function strategyStepLabel(step: PlannerStrategyStep) {
+  if (step.kind === "roll") return "Rul transferen";
+  return step.transfers
+    .map((transfer) => `${transfer.out.name} → ${transfer.in.name}`)
+    .join(" + ");
+}
+
+function strategyAssumptionLabel(assumption: string) {
+  const labels: Record<string, string> = {
+    fixed_current_prices: "Dagens spillerpriser holdes faste i hele beregningen",
+    four_transfer_deadlines_modelled: "Fire transferdeadlines er modelleret",
+    maximum_two_transfers_at_each_provisional_deadline: "Højst to transfers pr. foreløbig deadline",
+    first_action_restricted_to_supplied_explicit_plans: "Første træk vælges blandt de validerede ugeplaner",
+    no_transfers_after_deadline_four_assumed: "Ingen yderligere transfers antages efter deadline fire",
+    recalculate_at_every_real_deadline: "Planen genberegnes ved hver rigtig deadline",
+  };
+  return labels[assumption] ?? assumption.replaceAll("_", " ");
+}
+
+function chipScopeLabel(scenario: PlannerChipScenario) {
+  if (scenario.model_scope === "multiweek_rebuild") {
+    return "15-mands genopbygning over samme prognosevindue";
+  }
+  if (scenario.model_scope === "single_gameweek_counterfactual") {
+    return "Midlertidig 15-mands trup mod roadmapets permanente hold";
+  }
+  if (scenario.model_scope === "confirmed_blank_double_screen") {
+    return "Screening af officielt placerede blanke og dobbelte runder";
+  }
+  if (scenario.model_scope === "bench_marginal") {
+    return "Ekstra bænkpoint ud over normal indskiftningsværdi";
+  }
+  return "Ekstra kaptajnpoint ud over normal dobbeltkaptajn";
+}
+
+function ChipScenarioCard({
+  scenario,
+  strategy,
+}: {
+  scenario: PlannerChipScenario;
+  strategy: PlannerChipStrategy;
+}) {
+  const inventory = strategy.inventory.find((entry) => entry.chip === scenario.chip);
+  const gain = scenario.estimated_gain_points === null
+    ? "Ikke beregnet"
+    : `${signedPoints(scenario.estimated_gain_points)} EP`;
+  const confidence = scenario.confidence === "medium" ? "Mellem" : "Lav";
+
+  return (
+    <article className={classNames("chip-scenario", `chip-scenario--${scenario.signal}`)}>
+      <div className="chip-scenario__header">
+        <div>
+          <span>{chipNames[scenario.chip]}</span>
+          <small>{scenario.event === null ? "Intet valgt vindue" : `Bedste vindue: GW${scenario.event}`}</small>
+        </div>
+        <strong>{chipSignalLabels[scenario.signal]}</strong>
+      </div>
+      <div className="chip-scenario__gain">
+        <span>Modeldifference mod no-chip</span>
+        <strong>{gain}</strong>
+        {scenario.baseline_points !== null && scenario.chip_points !== null && (
+          <small>No-chip {formatPoints(scenario.baseline_points)} · chip {formatPoints(scenario.chip_points)}</small>
+        )}
+      </div>
+      <p>{scenario.reason}</p>
+      <dl className="chip-scenario__facts">
+        <div>
+          <dt>Tilgængelighed</dt>
+          <dd>{scenario.available ? "Ledig i scenariet" : "Ikke ledig i scenariet"}</dd>
+        </div>
+        <div>
+          <dt>Modelsikkerhed</dt>
+          <dd>{confidence}</dd>
+        </div>
+      </dl>
+      <small className="chip-scenario__scope">{chipScopeLabel(scenario)}</small>
+      {inventory && inventory.used_events.length > 0 && (
+        <small className="chip-scenario__used">Tidligere brug: {inventory.used_events.map((event) => `GW${event}`).join(", ")}</small>
+      )}
+      {(scenario.chip === "wildcard" || scenario.chip === "freehit") && scenario.squad.length > 0 && (
+        <details className="wildcard-squad">
+          <summary>
+            <span>Se foreløbig {scenario.chip === "wildcard" ? "Wildcard" : "Free Hit"}-trup</span>
+            <small>{scenario.change_count ?? 0} ændringer{scenario.bank_after_tenths === null ? "" : ` · ${formatPrice(scenario.bank_after_tenths / 10)} tilbage`}</small>
+            <ChevronIcon />
+          </summary>
+          <div className="wildcard-squad__players">
+            {scenario.squad.map((player) => (
+              <span key={player.id}>
+                <strong>{player.name}</strong>
+                <small>{player.position} · {player.team} · {formatPrice(player.price_tenths / 10)}</small>
+              </span>
+            ))}
+          </div>
+          <p>Truppen er kun et modelscenarie. {scenario.chip === "wildcard" ? "Wildcard" : "Free Hit"} aktiveres ikke her og skal beregnes igen tæt på deadline.</p>
+        </details>
+      )}
+    </article>
+  );
+}
+
+function StrategyPlanPanel({
+  strategy,
+  chipStrategy,
+}: {
+  strategy: PlannerStrategyPlan;
+  chipStrategy: PlannerChipStrategy | null;
+}) {
+  const firstStep = strategy.steps[0];
+  const futureSteps = strategy.steps.slice(1);
+  const horizonEnd = strategy.gameweek_window[strategy.gameweek_window.length - 1];
+
+  return (
+    <section className="strategy-plan" aria-labelledby="strategy-plan-heading">
+      <div className="strategy-plan__header">
+        <div>
+          <p className="eyebrow">Rullende strategi · GW{strategy.gameweek_window[0]}–GW{horizonEnd}</p>
+          <h2 id="strategy-plan-heading">Din kampplan over {strategy.horizon} runder</h2>
+          <p>Fire transferdeadlines hænger sammen. Kun første træk er aktuelt; alt efter den solide startlinje er foreløbigt.</p>
+        </div>
+        <div className="strategy-plan__score">
+          <strong>{formatPoints(strategy.decision_value_points)}</strong>
+          <span>afgrænset strategiscore</span>
+        </div>
+      </div>
+
+      {strategy.first_action.source === "alternative" && (
+        <p className="strategy-plan__signal"><InfoIcon /> Strategimodellen foretrækker alternativ {(strategy.first_action.alternative_index ?? 0) + 1} som første skridt frem for den kortere hovedplan ovenfor.</p>
+      )}
+
+      <div className="strategy-plan__body">
+        <section className="strategy-roadmap" aria-labelledby="strategy-roadmap-heading">
+          <div className="strategy-plan__subheading">
+            <div>
+              <p className="eyebrow">Transfer-rute</p>
+              <h3 id="strategy-roadmap-heading">Fire deadlines, én sammenhæng</h3>
+            </div>
+            <span>Solid = nu · stiplet = foreløbig</span>
+          </div>
+          <div className="strategy-route" aria-label="Fire beregnede transferdeadlines">
+            <article className="strategy-route__item strategy-route__item--current">
+              <span className="strategy-route__ball" aria-hidden="true"><span /></span>
+              <div className="strategy-route__current">
+                <div className="strategy-route__summary-copy">
+                  <small>GW{firstStep.target_event} · plan nu</small>
+                  <strong>{strategyStepLabel(firstStep)}</strong>
+                  <span>{firstStep.hit_points === 0 ? "Intet hit" : `−${firstStep.hit_points} point i hit`} · {formatPrice(firstStep.bank_after_tenths / 10)} tilbage · {firstStep.free_transfers_next_gameweek} FT videre</span>
+                </div>
+              </div>
+            </article>
+
+            {futureSteps.map((step) => (
+              <div className="strategy-route__item strategy-route__item--future" key={step.deadline_offset}>
+                <span className="strategy-route__ball" aria-hidden="true"><span /></span>
+                <details>
+                  <summary>
+                    <div className="strategy-route__summary-copy">
+                      <small>GW{step.target_event} · foreløbig deadline {step.deadline_offset}</small>
+                      <strong>{strategyStepLabel(step)}</strong>
+                      <span>{step.hit_points === 0 ? "Intet beregnet hit" : `−${step.hit_points} point i hit`} · {formatPrice(step.bank_after_tenths / 10)} tilbage · {step.free_transfers_next_gameweek} FT videre</span>
+                    </div>
+                    <ChevronIcon />
+                  </summary>
+                  <div className="strategy-route__details">
+                    {step.transfers.length === 0 ? (
+                      <p>Modellen ruller transferen ved denne foreløbige deadline.</p>
+                    ) : (
+                      <div className="strategy-route__moves">
+                        {step.transfers.map((transfer) => (
+                          <div key={`${transfer.out_id}-${transfer.in_id}`}>
+                            <span><small>UD</small><strong>{transfer.out.name}</strong></span>
+                            <ArrowRightIcon />
+                            <span><small>IND</small><strong>{transfer.in.name}</strong></span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <div className="strategy-route__gameweeks">
+                      {step.gameweeks.map((gameweek) => (
+                        <span key={gameweek.gameweek}>GW{gameweek.gameweek} · {gameweek.formation} · {formatPoints(gameweek.projected_points)} EP</span>
+                      ))}
+                    </div>
+                    <p>Dette trin er ikke låst. Skader, roller, priser og kampændringer kræver en ny beregning ved deadline.</p>
+                  </div>
+                </details>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="chip-strategy" aria-labelledby="chip-strategy-heading">
+          <div className="strategy-plan__subheading">
+            <div>
+              <p className="eyebrow">Chipscenarier</p>
+              <h3 id="chip-strategy-heading">Gem, følg eller overvej</h3>
+            </div>
+            <span>Ingen chip aktiveres i appen</span>
+          </div>
+          {chipStrategy ? (
+            <>
+              <div className={classNames("chip-strategy__recommendation", `chip-strategy__recommendation--${chipStrategy.recommendation.action}`)}>
+                <strong>{chipStrategy.recommendation.action === "consider" && chipStrategy.recommendation.chip
+                  ? `Overvej ${chipNames[chipStrategy.recommendation.chip]}${chipStrategy.recommendation.event ? ` i GW${chipStrategy.recommendation.event}` : ""}`
+                  : "Hold chips"}</strong>
+                <span>{chipStrategy.recommendation.reason}</span>
+              </div>
+              <div className="chip-strategy__grid">
+                {chipOrder.map((chip) => chipStrategy.scenarios.find((scenario) => scenario.chip === chip))
+                  .filter((scenario): scenario is PlannerChipScenario => Boolean(scenario))
+                  .map((scenario) => (
+                    <ChipScenarioCard key={scenario.scenario_id} scenario={scenario} strategy={chipStrategy} />
+                  ))}
+              </div>
+            </>
+          ) : (
+            <p className="chip-strategy__unavailable"><InfoIcon /> Chipscenarierne kunne ikke bevises inden for denne beregnings tidsbudget. Behold chips og beregn igen ved næste deadline.</p>
+          )}
+        </section>
+      </div>
+
+      <div className="strategy-plan__recalculate">
+        <RefreshIcon />
+        <div>
+          <strong>Genberegn ved hver deadline</strong>
+          <span>Stiplede trin og chipscenarier er følsomme over for nye minutter, skader, priser og kamptidspunkter. De er pejlemærker, ikke kommende ordrer.</span>
+        </div>
+      </div>
+      <div className="strategy-plan__assumptions" aria-label="Modellens antagelser">
+        {strategy.assumptions.map((assumption) => <span key={assumption}>{strategyAssumptionLabel(assumption)}</span>)}
+        <span>Bevist optimal i det afgrænsede søgerum, ikke globalt</span>
+      </div>
+    </section>
+  );
+}
+
 function historyActionLabel(entry: DecisionHistoryEntry) {
   if (entry.selection.kind === "wait") return entry.ai?.headline ?? "Afvent og genberegn";
   if (!entry.action || entry.action.kind === "roll") return "Rul transferen";
@@ -779,6 +1021,27 @@ const qualitativeCategoryLabels: Record<AiReviewQualitativeEvidence["category"],
   manager_comments: "Managerudtalelse",
   price_market: "Pris og marked",
   other: "Øvrigt signal",
+};
+
+const chipOrder = ["wildcard", "freehit", "bboost", "3xc"] as const satisfies readonly ChipName[];
+
+const chipNames: Record<ChipName, string> = {
+  wildcard: "Wildcard",
+  freehit: "Free Hit",
+  bboost: "Bench Boost",
+  "3xc": "Triple Captain",
+};
+
+const chipStatusLabels: Record<ChipStatus, string> = {
+  available: "Ledig",
+  used: "Brugt",
+  unavailable: "Ikke tilgængelig",
+};
+
+const chipSignalLabels: Record<PlannerChipSignal, string> = {
+  hold: "Hold",
+  watch: "Watch",
+  consider: "Consider",
 };
 
 const qualitativeBasisLabels: Record<AiReviewQualitativeEvidence["basis"], string> = {
@@ -1517,6 +1780,7 @@ export function FplDashboard({
         free_transfers: parseFreeTransfers(String(freeTransfers)),
         player_prices: managerSync.manual_state_template.state.player_prices.map((price) => ({ ...price })),
         chips: { ...managerSync.manual_state_template.state.chips },
+        chip_usage: managerSync.manual_state_template.state.chip_usage.map((usage) => ({ ...usage })),
         no_active_chip_confirmed: true,
       };
     } catch (parseError) {
@@ -1614,7 +1878,7 @@ export function FplDashboard({
       const parsed = parseAiReviewResponse(
         body,
         recommendation.planner.alternatives.length,
-        recommendation.meta.horizon,
+        recommendation.planner.strategy?.horizon ?? recommendation.meta.horizon,
       );
       if (
         new Date(parsed.recommendation_generated_at).getTime() !== new Date(recommendation.meta.generated_at).getTime() ||
@@ -1901,6 +2165,29 @@ export function FplDashboard({
                     </div>
                   </div>
 
+                  <div className="planner-chip-inventory" aria-label="Chipbeholdning til næste deadline">
+                    <div className="planner-chip-inventory__heading">
+                      <strong>Chipbeholdning til GW{managerSync.target.event}</strong>
+                      <small>Afledt af din officielle chiphistorik</small>
+                    </div>
+                    <div className="planner-chip-inventory__list">
+                      {chipOrder.map((chip) => {
+                        const status = managerSync.manual_state_template.state.chips[chip];
+                        const usedEvents = managerSync.manual_state_template.state.chip_usage
+                          .filter((usage) => usage.name === chip)
+                          .map((usage) => `GW${usage.event}`)
+                          .join(", ");
+                        return (
+                          <span className={classNames("planner-chip-inventory__item", `is-${status}`)} key={chip}>
+                            <strong>{chipNames[chip]}</strong>
+                            <small>{chipStatusLabels[status]}{usedEvents ? ` · ${usedEvents}` : ""}</small>
+                          </span>
+                        );
+                      })}
+                    </div>
+                    <p><InfoIcon /> Beholdningen er kun input til scenarier. Appen kan ikke aktivere en chip.</p>
+                  </div>
+
                   {hasFreeHitWarning && (
                     <p className="planner-warning" role="alert"><InfoIcon /> Sidste offentlige hold var et Free Hit-hold og er midlertidigt. Denne version kan ikke sikkert genskabe den permanente trup endnu.</p>
                   )}
@@ -1914,7 +2201,7 @@ export function FplDashboard({
                           setSyncError(null);
                         }}
                       />
-                      <span>Jeg bekræfter, at truppen og spillerpriserne er uændrede siden GW{managerSync.last_deadline_state.event}, at bank samt frie transfers er korrekte, og at ingen chip er aktiv til næste deadline.</span>
+                      <span>Jeg bekræfter, at truppen og spillerpriserne er uændrede siden GW{managerSync.last_deadline_state.event}, at bank, frie transfers og chipbeholdningen ovenfor er korrekte, og at ingen chip er aktiv til næste deadline.</span>
                     </label>
                   )}
                   {syncError && <p className="planner-warning" role="alert"><InfoIcon /> {syncError}</p>}
@@ -2042,9 +2329,14 @@ export function FplDashboard({
                 {recommendation.planner && (
                   <>
                     <TransferDecision action={recommendation.planner.best_action} horizon={recommendation.meta.horizon} />
-                    {recommendation.planner.sequential && (
+                    {recommendation.planner.strategy ? (
+                      <StrategyPlanPanel
+                        strategy={recommendation.planner.strategy}
+                        chipStrategy={recommendation.planner.chip_strategy}
+                      />
+                    ) : recommendation.planner.sequential ? (
                       <SequentialPlanPanel plan={recommendation.planner.sequential} planner={recommendation.planner} />
-                    )}
+                    ) : null}
                     <AiReviewPanel
                       response={aiReview}
                       planner={recommendation.planner}

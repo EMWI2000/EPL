@@ -45,6 +45,20 @@ from fpl_app.logic.sequential_transfers import (
     SequentialTransferError,
     optimize_two_deadline_sequence,
 )
+from fpl_app.logic.strategy_planner import (
+    DEFAULT_STRATEGY_GW_WEIGHTS,
+    DEFAULT_STRATEGY_HORIZON,
+    DEFAULT_STRATEGY_SOLVER_BUDGET_SECONDS,
+    MIN_STRATEGY_HORIZON,
+    BoundedStrategyResult,
+    StrategyPlannerError,
+    optimize_strategy_roadmap,
+)
+from fpl_app.logic.chip_strategy import (
+    ChipStrategyError,
+    ChipStrategyResult,
+    evaluate_chip_strategy,
+)
 from fpl_app.logic.projections import overlay_solio_projections
 from fpl_app.services.fpl_price_signals import (
     OfficialPricePayloadError,
@@ -91,6 +105,8 @@ COMPUTE_SOFT_DEADLINE_SECONDS = 50.0
 COMPUTE_TAIL_RESERVE_SECONDS = 5.0
 MIN_SOLVER_BUDGET_SECONDS = 0.5
 SEQUENTIAL_SOLVER_BUDGET_SECONDS = 12.0
+WILDCARD_SOLVER_BUDGET_SECONDS = 4.0
+WILDCARD_SOLVER_RESERVE_SECONDS = 4.5
 FORECAST_VERSIONS = frozenset({"v2", "legacy"})
 OPTIMIZER_CANDIDATE_LIMITS = {"GKP": 6, "DEF": 15, "MID": 15, "FWD": 9}
 EXPERIMENTAL_NOTICE_DA = (
@@ -894,11 +910,9 @@ def _serialize_sequential_plan(
 ) -> dict[str, Any]:
     by_id = pool.set_index("id", drop=False)
     sequence = result.best_sequence
-    first_index = int(sequence.first_step_candidate_index)
-    first_action = {
-        "source": "best_action" if first_index == 0 else "alternative",
-        "alternative_index": None if first_index == 0 else first_index - 1,
-    }
+    # The caller promotes the chosen first candidate to the response's
+    # canonical best_action before serialization.
+    first_action = {"source": "best_action", "alternative_index": None}
     steps: list[dict[str, Any]] = []
     for step in sequence.steps:
         transfers = [
@@ -971,11 +985,150 @@ def _serialize_sequential_plan(
     }
 
 
+def _serialize_strategy_plan(
+    result: BoundedStrategyResult,
+    *,
+    pool: pd.DataFrame,
+    window: list[int],
+) -> dict[str, Any]:
+    """Serialize the proven bounded roadmap with absolute FPL events."""
+
+    if len(window) != result.horizon:
+        raise RecommendationUnavailableError(
+            "The strategy roadmap does not match its forecast window."
+        )
+    by_id = pool.set_index("id", drop=False)
+    roadmap = result.best_roadmap
+    # The caller promotes the roadmap's chosen first candidate to the
+    # response's canonical best_action before serialization.
+    first_action = {"source": "best_action", "alternative_index": None}
+    steps: list[dict[str, Any]] = []
+    for step in roadmap.steps:
+        transfers = [
+            {
+                **move.as_dict(),
+                "out": _planner_player_reference(by_id.loc[int(move.out_id)]),
+                "in": _planner_player_reference(by_id.loc[int(move.in_id)]),
+            }
+            for move in step.transfers
+        ]
+        kind = "roll" if step.transfer_count == 0 else (
+            "hit" if step.hit_points > 0 else "transfer"
+        )
+        steps.append(
+            {
+                "deadline_offset": int(step.deadline_offset),
+                "provisional": bool(step.provisional),
+                "target_event": int(window[step.deadline_offset - 1]),
+                "kind": kind,
+                "transfer_count": int(step.transfer_count),
+                "transfers": transfers,
+                "squad_ids": [int(player_id) for player_id in step.squad_ids],
+                "gameweeks": [
+                    {
+                        **gameweek.as_dict(),
+                        "gameweek": int(window[int(gameweek.gameweek) - 1]),
+                    }
+                    for gameweek in step.gameweeks
+                ],
+                "bank_before_tenths": int(step.bank_before_tenths),
+                "bank_after_tenths": int(step.bank_after_tenths),
+                "free_transfers_before": int(step.free_transfers_before),
+                "free_transfers_next_gameweek": int(
+                    step.free_transfers_next_gameweek
+                ),
+                "hit_points": int(step.hit_points),
+                "weighted_projected_points": _round(
+                    step.weighted_projected_points
+                ),
+                "weighted_hit_cost_points": _round(
+                    step.weighted_hit_cost_points
+                ),
+            }
+        )
+    return {
+        "horizon": int(result.horizon),
+        "gameweek_window": [int(event) for event in window],
+        "gw_weights": [_round(weight, 6) for weight in result.gw_weights],
+        "modelled_deadlines": int(result.modelled_deadlines),
+        "maximum_provisional_transfers": int(
+            result.maximum_provisional_transfers
+        ),
+        "first_step_candidate_count": int(result.first_step_candidate_count),
+        "first_step_search": result.first_step_search,
+        "search_scope": result.search_scope,
+        "future_price_assumption": result.future_price_assumption,
+        "assumptions": list(result.assumptions),
+        "solver_proven_optimal_within_bounds": bool(
+            result.solver_proven_optimal_within_bounds
+        ),
+        "globally_optimal": bool(result.globally_optimal),
+        "recalculate_each_deadline": True,
+        "first_action": first_action,
+        "steps": steps,
+        "weighted_projected_points": _round(
+            roadmap.weighted_projected_points
+        ),
+        "total_hit_points": int(roadmap.total_hit_points),
+        "weighted_hit_cost_points": _round(
+            roadmap.weighted_hit_cost_points
+        ),
+        "terminal_banked_ft_value_points": _round(
+            roadmap.terminal_banked_ft_value_points
+        ),
+        "decision_value_points": _round(roadmap.decision_value_points),
+    }
+
+
+def _serialize_chip_strategy(
+    result: ChipStrategyResult,
+    *,
+    pool: pd.DataFrame,
+) -> dict[str, Any]:
+    """Serialize compact chip counterfactuals without exposing solver internals."""
+
+    by_id = pool.set_index("id", drop=False)
+    scenarios: list[dict[str, Any]] = []
+    for scenario in result.scenarios:
+        scenarios.append(
+            {
+                "scenario_id": scenario.scenario_id,
+                "chip": scenario.chip,
+                "event": scenario.event,
+                "signal": scenario.signal,
+                "available": scenario.available,
+                "estimated_gain_points": scenario.estimated_gain_points,
+                "baseline_points": scenario.baseline_points,
+                "chip_points": scenario.chip_points,
+                "confidence": scenario.confidence,
+                "model_scope": scenario.model_scope,
+                "reason": scenario.reason,
+                "squad": [
+                    _planner_player_reference(by_id.loc[int(player_id)])
+                    for player_id in scenario.squad_ids
+                ],
+                "change_count": scenario.change_count,
+                "bank_after_tenths": scenario.bank_after_tenths,
+            }
+        )
+    return {
+        "horizon": int(result.horizon),
+        "target_event": int(result.target_event),
+        "inventory": [entry.as_dict() for entry in result.inventory],
+        "scenarios": scenarios,
+        "recommendation": result.recommendation.as_dict(),
+        "model_scope": result.model_scope,
+        "globally_optimal": bool(result.globally_optimal),
+        "recalculate_each_deadline": bool(result.recalculate_each_deadline),
+    }
+
+
 def _build_weekly_plan(
     *,
     pool: pd.DataFrame,
     options: Mapping[str, Any],
     window: list[int],
+    strategy_window: list[int],
     request_deadline_monotonic: float | None = None,
 ) -> tuple[SquadPlanResult, pd.DataFrame, int, dict[str, Any]]:
     deadline = request_deadline_monotonic
@@ -1039,6 +1192,37 @@ def _build_weekly_plan(
         owned_mask, "id"
     ].map(lambda value: prices[int(value)].selling_price_tenths)
 
+    strategy_pool = optimizer_pool
+    if len(strategy_window) >= MIN_STRATEGY_HORIZON:
+        strategy_shortlist = _shortlist_optimizer_pool(
+            eligible,
+            len(strategy_window),
+        )
+        strategy_pool = (
+            pd.concat(
+                [strategy_shortlist, optimizer_pool, current],
+                ignore_index=True,
+            )
+            .drop_duplicates(subset=["id"], keep="first")
+            .sort_values("id", kind="stable")
+            .reset_index(drop=True)
+        )
+        strategy_pool["purchase_price"] = pd.NA
+        strategy_pool["selling_price"] = pd.NA
+        strategy_owned_mask = strategy_pool["id"].isin(state.current_squad_ids)
+        strategy_pool.loc[
+            strategy_owned_mask,
+            "purchase_price",
+        ] = strategy_pool.loc[strategy_owned_mask, "id"].map(
+            lambda value: prices[int(value)].purchase_price_tenths
+        )
+        strategy_pool.loc[
+            strategy_owned_mask,
+            "selling_price",
+        ] = strategy_pool.loc[strategy_owned_mask, "id"].map(
+            lambda value: prices[int(value)].selling_price_tenths
+        )
+
     immediate_budget = min(
         DEFAULT_ROLLING_SOLVER_BUDGET_SECONDS,
         deadline - monotonic() - COMPUTE_TAIL_RESERVE_SECONDS,
@@ -1064,40 +1248,122 @@ def _build_weekly_plan(
         raise RecommendationUnavailableError(message) from exc
 
     first_step_candidates = _bounded_first_step_candidates(rolling)
-    displayed_alternatives = first_step_candidates[1:]
+    strategy_result: BoundedStrategyResult | None = None
+    chip_result: ChipStrategyResult | None = None
     sequential_result: BoundedSequentialTransferResult | None = None
-    sequential_budget = min(
-        SEQUENTIAL_SOLVER_BUDGET_SECONDS,
-        deadline - monotonic() - COMPUTE_TAIL_RESERVE_SECONDS,
-    )
-    if (
-        int(options["horizon"]) >= 2
-        and sequential_budget >= MIN_SOLVER_BUDGET_SECONDS
-    ):
+
+    strategy_budget = -1.0
+    if len(strategy_window) >= MIN_STRATEGY_HORIZON:
+        strategy_budget = min(
+            DEFAULT_STRATEGY_SOLVER_BUDGET_SECONDS,
+            deadline
+            - monotonic()
+            - COMPUTE_TAIL_RESERVE_SECONDS
+            - WILDCARD_SOLVER_RESERVE_SECONDS,
+        )
+    if strategy_budget >= MIN_SOLVER_BUDGET_SECONDS:
         try:
-            sequential_result = optimize_two_deadline_sequence(
-                optimizer_pool,
+            strategy_result = optimize_strategy_roadmap(
+                strategy_pool,
                 first_step_candidates,
-                horizon=int(options["horizon"]),
-                gw_weights=DEFAULT_GW_WEIGHTS[: int(options["horizon"])],
+                horizon=len(strategy_window),
+                gw_weights=DEFAULT_STRATEGY_GW_WEIGHTS[: len(strategy_window)],
                 roll_ft_value_points=float(rolling.roll_ft_value_points),
                 eligible_transfer_in_ids={
                     int(player_id)
-                    for player_id in optimizer_pool.loc[
-                        optimizer_pool["status"].isin(statuses),
+                    for player_id in strategy_pool.loc[
+                        strategy_pool["status"].isin(statuses),
                         "id",
                     ]
                 },
-                solver_budget_seconds=sequential_budget,
+                solver_budget_seconds=strategy_budget,
             )
-        except SequentialTransferError:
-            # The executable immediate result remains valid if the optional
-            # bounded look-ahead cannot prove its optimum inside the serverless
-            # budget. Do not leak manager-specific solver details into logs.
-            LOGGER.warning("Bounded sequential transfer planning was unavailable")
+        except StrategyPlannerError:
+            LOGGER.warning("Bounded long-range strategy planning was unavailable")
+
+    if strategy_result is not None:
+        wildcard_budget = min(
+            WILDCARD_SOLVER_BUDGET_SECONDS,
+            deadline - monotonic() - COMPUTE_TAIL_RESERVE_SECONDS,
+        )
+        if wildcard_budget >= MIN_SOLVER_BUDGET_SECONDS:
+            try:
+                chip_usage: dict[str, list[int]] = {
+                    name: [] for name in ("wildcard", "freehit", "bboost", "3xc")
+                }
+                for row in state.chip_usage:
+                    chip_usage[row.name].append(int(row.event))
+                chip_result = evaluate_chip_strategy(
+                    strategy_pool,
+                    strategy_result,
+                    target_event=int(strategy_window[0]),
+                    chip_usage=chip_usage,
+                    current_squad_ids=state.current_squad_ids,
+                    bank_tenths=state.bank_tenths,
+                    free_transfers=state.free_transfers,
+                    eligible_transfer_in_ids={
+                        int(player_id)
+                        for player_id in strategy_pool.loc[
+                            strategy_pool["status"].isin(statuses),
+                            "id",
+                        ]
+                    },
+                    chip_solver_budget_seconds=wildcard_budget,
+                )
+            except ChipStrategyError:
+                LOGGER.warning("Bounded chip counterfactuals were unavailable")
+    else:
+        sequential_budget = min(
+            SEQUENTIAL_SOLVER_BUDGET_SECONDS,
+            deadline - monotonic() - COMPUTE_TAIL_RESERVE_SECONDS,
+        )
+        if (
+            int(options["horizon"]) >= 2
+            and sequential_budget >= MIN_SOLVER_BUDGET_SECONDS
+        ):
+            try:
+                sequential_result = optimize_two_deadline_sequence(
+                    optimizer_pool,
+                    first_step_candidates,
+                    horizon=int(options["horizon"]),
+                    gw_weights=DEFAULT_GW_WEIGHTS[: int(options["horizon"])],
+                    roll_ft_value_points=float(rolling.roll_ft_value_points),
+                    eligible_transfer_in_ids={
+                        int(player_id)
+                        for player_id in optimizer_pool.loc[
+                            optimizer_pool["status"].isin(statuses),
+                            "id",
+                        ]
+                    },
+                    solver_budget_seconds=sequential_budget,
+                )
+            except SequentialTransferError:
+                # The executable immediate result remains valid if optional
+                # look-ahead cannot prove its optimum within the shared budget.
+                LOGGER.warning("Bounded sequential transfer planning was unavailable")
+
+    canonical_candidate_index = 0
+    if strategy_result is not None:
+        canonical_candidate_index = int(
+            strategy_result.best_roadmap.first_step_candidate_index
+        )
+    elif sequential_result is not None:
+        canonical_candidate_index = int(
+            sequential_result.best_sequence.first_step_candidate_index
+        )
+    if not 0 <= canonical_candidate_index < len(first_step_candidates):
+        raise RecommendationUnavailableError(
+            "The bounded planner selected an unknown first action."
+        )
+    canonical_action = first_step_candidates[canonical_candidate_index]
+    displayed_alternatives = tuple(
+        plan
+        for index, plan in enumerate(first_step_candidates)
+        if index != canonical_candidate_index
+    )
 
     result = _transfer_plan_as_squad_result(
-        rolling.best_action,
+        canonical_action,
         optimizer_pool,
         horizon=int(options["horizon"]),
     )
@@ -1130,7 +1396,7 @@ def _build_weekly_plan(
             ],
         },
         "best_action": _serialize_transfer_action(
-            rolling.best_action,
+            canonical_action,
             pool=optimizer_pool,
             window=window,
             roll=rolling.roll,
@@ -1153,18 +1419,40 @@ def _build_weekly_plan(
             if sequential_result is not None
             else None
         ),
+        "strategy": (
+            _serialize_strategy_plan(
+                strategy_result,
+                pool=strategy_pool,
+                window=strategy_window,
+            )
+            if strategy_result is not None
+            else None
+        ),
+        "chip_strategy": (
+            _serialize_chip_strategy(chip_result, pool=strategy_pool)
+            if chip_result is not None
+            else None
+        ),
         "method": {
-            "candidate_count": int(len(optimizer_pool)),
+            "candidate_count": int(
+                len(strategy_pool) if strategy_result is not None else len(optimizer_pool)
+            ),
             "plans_per_transfer_count": 5,
             "higher_transfer_count_plans": 1,
             "maximum_immediate_transfers": max(2, int(state.free_transfers)),
             "roll_ft_value_points": _round(rolling.roll_ft_value_points),
-            "chips_modelled": False,
+            "chips_modelled": chip_result is not None,
+            "bounded_roadmap_modelled": strategy_result is not None,
             "future_transfers_modelled": False,
-            "next_deadline_transfer_modelled": sequential_result is not None,
+            "next_deadline_transfer_modelled": (
+                strategy_result is not None or sequential_result is not None
+            ),
         },
     }
-    return result, visible_pool, len(optimizer_pool), planner_payload
+    candidate_count = (
+        len(strategy_pool) if strategy_result is not None else len(optimizer_pool)
+    )
+    return result, visible_pool, candidate_count, planner_payload
 
 
 def _serialize_recommendation(
@@ -1377,15 +1665,24 @@ def generate_recommendation(payload: Any = None) -> dict[str, Any]:
     if len(window) != int(options["horizon"]):
         options = {**options, "horizon": len(window)}
 
+    strategy_window = list(window)
+    if options["manager_state"] is not None:
+        strategy_window = gameweek_window(
+            fixture_table,
+            n=DEFAULT_STRATEGY_HORIZON,
+            start_event=start_event,
+        )
+    forecast_horizon = max(len(window), len(strategy_window))
+
     pool = _build_forecast_pool(
         official_players,
         fixture_table,
         teams,
-        options["horizon"],
+        forecast_horizon,
         start_event,
         options["forecast_version"],
     )
-    pool = _ensure_optimizer_contract(pool, options["horizon"])
+    pool = _ensure_optimizer_contract(pool, forecast_horizon)
     pool, price_metadata = _attach_official_price_signals(pool, bootstrap)
     solio_metadata = _empty_solio_metadata(requested=options["use_solio"])
     if options["use_solio"]:
@@ -1401,6 +1698,7 @@ def generate_recommendation(payload: Any = None) -> dict[str, Any]:
             pool=pool,
             options=options,
             window=window,
+            strategy_window=strategy_window,
             request_deadline_monotonic=request_deadline_monotonic,
         )
     else:

@@ -26,7 +26,18 @@ SQUAD_QUOTA = {
 }
 MAX_PER_TEAM = SQUAD.max_players_per_club
 POSITION_ORDER = {"GKP": 0, "DEF": 1, "MID": 2, "FWD": 3}
-DEFAULT_GW_WEIGHTS = (1.0, 0.85, 0.70, 0.55, 0.40)
+DEFAULT_GW_WEIGHTS = (
+    1.0,
+    0.85,
+    0.70,
+    0.55,
+    0.40,
+    0.32,
+    0.25,
+    0.19,
+    0.14,
+    0.10,
+)
 DEFAULT_BENCH_WEIGHTS = (0.12, 0.08, 0.04, 0.02)
 DEFAULT_SOLVER_TIME_LIMIT_SECONDS = 15.0
 
@@ -205,10 +216,15 @@ def _solve_or_raise(
         raise SquadPlanError(f"the optimisation solver could not run: {exc}") from exc
     finally:
         solver.timeLimit = original_time_limit
-    if pulp.LpStatus.get(model.status) != "Optimal":
-        status = pulp.LpStatus.get(model.status, str(model.status))
+    status = pulp.LpStatus.get(model.status, str(model.status))
+    solution_status = getattr(model, "sol_status", None)
+    proven_optimal = status == "Optimal" and solution_status in {
+        None,
+        pulp.LpSolutionOptimal,
+    }
+    if not proven_optimal:
         raise SquadPlanInfeasibleError(
-            "no valid squad plan exists for the supplied candidates and budget "
+            "no proven optimal squad plan exists for the supplied candidates and budget "
             f"(status: {status})"
         )
 
@@ -220,6 +236,7 @@ def optimize_squad_plan(
     gw_weights: Optional[Sequence[float]] = None,
     budget_tenths: int = SQUAD.initial_budget_tenths,
     bench_weights: Sequence[float] = DEFAULT_BENCH_WEIGHTS,
+    solver_time_limit_seconds: float = DEFAULT_SOLVER_TIME_LIMIT_SECONDS,
     solver: Optional[pulp.LpSolver] = None,
 ) -> SquadPlanResult:
     """Select one squad and a separate legal XI and bench for every gameweek.
@@ -235,14 +252,19 @@ def optimize_squad_plan(
     captain forecasts already have availability reflected in ``ep_gwN``.
     """
 
-    if not isinstance(horizon, int) or isinstance(horizon, bool) or not 1 <= horizon <= 5:
-        raise SquadPlanError("horizon must be an integer from 1 to 5")
+    if not isinstance(horizon, int) or isinstance(horizon, bool) or not 1 <= horizon <= 10:
+        raise SquadPlanError("horizon must be an integer from 1 to 10")
     if (
         not isinstance(budget_tenths, int)
         or isinstance(budget_tenths, bool)
         or budget_tenths < 0
     ):
         raise SquadPlanError("budget_tenths must be a non-negative integer")
+    time_limit = float(solver_time_limit_seconds)
+    if not isfinite(time_limit) or time_limit <= 0:
+        raise SquadPlanError(
+            "solver_time_limit_seconds must be finite and positive"
+        )
 
     weights = _numeric_sequence(
         gw_weights if gw_weights is not None else DEFAULT_GW_WEIGHTS[:horizon],
@@ -360,7 +382,7 @@ def optimize_squad_plan(
         # keep both its LP perturbation and branch search reproducible.
         options=["randomSeed 17", "randomCbcSeed 17"],
     )
-    _solve_or_raise(model, selected_solver)
+    _solve_or_raise(model, selected_solver, time_limit_seconds=time_limit)
 
     chosen = [index for index in indices if pulp.value(squad[index]) > 0.5]
 

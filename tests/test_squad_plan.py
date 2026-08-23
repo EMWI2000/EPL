@@ -4,8 +4,9 @@ from collections import Counter
 
 import pandas as pd
 import pulp
+import pytest
 
-from fpl_app.logic.squad_plan import optimize_squad_plan
+from fpl_app.logic.squad_plan import SquadPlanInfeasibleError, optimize_squad_plan
 
 
 def _fixed_squad_two_gameweeks() -> pd.DataFrame:
@@ -190,3 +191,43 @@ def test_cbc_solver_is_capped_at_fifteen_seconds(monkeypatch) -> None:
 
     assert observed_limits == [15.0]
     assert solver.timeLimit == 60
+
+
+def test_supports_a_separate_eight_gameweek_strategy_horizon(monkeypatch) -> None:
+    players = _candidate_pool()
+    for offset in range(3, 9):
+        players[f"ep_gw{offset}"] = players["ep_gw2"] * (0.97 ** (offset - 2))
+        players[f"appearance_prob_gw{offset}"] = 1.0
+        players[f"no_show_prob_gw{offset}"] = 0.0
+    solver = pulp.PULP_CBC_CMD(msg=False, threads=1, timeLimit=60)
+    observed_limits: list[float] = []
+    actual_solve = solver.actualSolve
+
+    def record_actual_solve(model, **kwargs):
+        observed_limits.append(float(solver.timeLimit))
+        return actual_solve(model, **kwargs)
+
+    monkeypatch.setattr(solver, "actualSolve", record_actual_solve)
+    result = optimize_squad_plan(
+        players,
+        horizon=8,
+        solver_time_limit_seconds=3.0,
+        solver=solver,
+    )
+
+    assert result.horizon == 8
+    assert len(result.gameweeks) == 8
+    assert observed_limits == [3.0]
+    assert solver.timeLimit == 60
+
+
+def test_rejects_a_time_limited_incumbent_that_is_not_proven_optimal(monkeypatch) -> None:
+    def pretend_incumbent(model, solver):
+        model.status = pulp.LpStatusOptimal
+        model.sol_status = pulp.LpSolutionIntegerFeasible
+        return model.status
+
+    monkeypatch.setattr(pulp.LpProblem, "solve", pretend_incumbent)
+
+    with pytest.raises(SquadPlanInfeasibleError, match="proven optimal"):
+        optimize_squad_plan(_candidate_pool(), horizon=1)

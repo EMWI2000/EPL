@@ -35,6 +35,7 @@ from fpl_app.services.personal_fpl_state import (
     PublicLastDeadlineState,
     PublicManagerSummary,
     PublicManagerStateClient,
+    chip_statuses_for_event,
     parse_public_manager_summary,
     serialize_deadline_snapshot,
 )
@@ -45,7 +46,7 @@ MAX_REQUEST_BYTES = 16_384
 INTERNAL_TOKEN_ENV = "INTERNAL_API_TOKEN"
 INTERNAL_TOKEN_HEADER = "X-Internal-Token"
 MIN_INTERNAL_TOKEN_BYTES = 32
-RESPONSE_SCHEMA_VERSION = "fpl-manager-state-response-v1"
+RESPONSE_SCHEMA_VERSION = "fpl-manager-state-response-v2"
 ALLOWED_REQUEST_FIELDS = frozenset({"manager_id"})
 
 
@@ -493,7 +494,8 @@ def _manual_state_template(
             "bank_tenths": state.bank_tenths,
             "free_transfers": 1,
             "player_prices": player_prices,
-            "chips": {},
+            "chips": chip_statuses_for_event(state.chip_usage, target_event),
+            "chip_usage": [row.to_server_dict() for row in state.chip_usage],
             "no_active_chip_confirmed": False,
             "effective_event": target_event,
         },
@@ -504,6 +506,7 @@ def _manual_state_template(
             "free_transfers",
             "player_prices",
             "chips",
+            "chip_usage",
             "no_active_chip_confirmed",
         ],
         "free_transfers_default_reason": "current_free_transfers_are_not_public",
@@ -643,6 +646,7 @@ def generate_manager_state(
             "event_transfers": public_state.event_transfers,
             "event_transfer_cost": public_state.event_transfer_cost,
             "active_chip": public_state.active_chip,
+            "chip_usage": [row.to_server_dict() for row in public_state.chip_usage],
             "limitations": list(public_state.limitations),
             "picks": picks,
         },

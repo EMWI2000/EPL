@@ -76,7 +76,7 @@ function syncResponse(): Record<string, any> {
     selling_price_tenths: pick.estimated_selling_price_tenths,
   }));
   return {
-    schema_version: "fpl-manager-state-response-v1",
+    schema_version: "fpl-manager-state-response-v2",
     generated_at: "2026-08-23T12:00:00Z",
     manager: {
       id: 123,
@@ -90,7 +90,7 @@ function syncResponse(): Record<string, any> {
       deadline_time: "2026-08-30T17:30:00Z",
     },
     last_deadline_state: {
-      schema_version: "fpl-personal-state-v1",
+      schema_version: "fpl-personal-state-v2",
       state_kind: "public_last_deadline",
       event: 6,
       bank_tenths: 8,
@@ -99,6 +99,7 @@ function syncResponse(): Record<string, any> {
       event_transfers: 1,
       event_transfer_cost: 0,
       active_chip: null,
+      chip_usage: [],
       limitations,
       picks,
     },
@@ -118,7 +119,13 @@ function syncResponse(): Record<string, any> {
         bank_tenths: 8,
         free_transfers: 1,
         player_prices: playerPrices,
-        chips: {},
+        chips: {
+          wildcard: "available",
+          freehit: "available",
+          bboost: "available",
+          "3xc": "available",
+        },
+        chip_usage: [],
         no_active_chip_confirmed: false,
         effective_event: 7,
       },
@@ -129,12 +136,13 @@ function syncResponse(): Record<string, any> {
         "free_transfers",
         "player_prices",
         "chips",
+        "chip_usage",
         "no_active_chip_confirmed",
       ],
       free_transfers_default_reason: "current_free_transfers_are_not_public",
     },
     snapshot: {
-      schema_version: "fpl-deadline-state-snapshot-v1",
+      schema_version: "fpl-deadline-state-snapshot-v2",
       observed_at: "2026-08-23T12:00:00.000000Z",
       source: "fpl_public_last_deadline",
       checksum_sha256: "a".repeat(64),
@@ -245,6 +253,8 @@ function plannerPayload(): Record<string, any> {
     best_action: action("roll"),
     alternatives: [action("transfer")],
     sequential: null,
+    strategy: null,
+    chip_strategy: null,
     method: {
       candidate_count: 45,
       plans_per_transfer_count: 5,
@@ -252,6 +262,7 @@ function plannerPayload(): Record<string, any> {
       maximum_immediate_transfers: 2,
       roll_ft_value_points: 0.8,
       chips_modelled: false,
+      bounded_roadmap_modelled: false,
       next_deadline_transfer_modelled: false,
       future_transfers_modelled: false,
     },
@@ -340,6 +351,174 @@ function sequentialPlan(payload: Record<string, any>): Record<string, any> {
   };
 }
 
+function strategyPlan(payload: Record<string, any>): Record<string, any> {
+  const gameweekWindow = Array.from({ length: 8 }, (_, index) => 7 + index);
+  const weights = gameweekWindow.map((_, index) => 0.85 ** index);
+  const points = [72.5, 70, 68, 66, 64, 62, 60, 58];
+  const starters = [...payload.best_action.gameweeks[0].starting_ids];
+  const gameweek = (index: number) => ({
+    gameweek: gameweekWindow[index],
+    starting_ids: [...starters],
+    captain_id: 13,
+    formation: "3-4-3",
+    projected_points: points[index],
+  });
+  const step = (
+    deadlineOffset: number,
+    freeTransfersBefore: number,
+    governedOffsets: number[],
+  ) => ({
+    deadline_offset: deadlineOffset,
+    provisional: deadlineOffset > 1,
+    target_event: gameweekWindow[deadlineOffset - 1],
+    kind: "roll",
+    transfer_count: 0,
+    transfers: [],
+    squad_ids: [...payload.best_action.squad_ids],
+    gameweeks: governedOffsets.map(gameweek),
+    bank_before_tenths: 10,
+    bank_after_tenths: 10,
+    free_transfers_before: freeTransfersBefore,
+    free_transfers_next_gameweek: Math.min(5, freeTransfersBefore + 1),
+    hit_points: 0,
+    weighted_projected_points: governedOffsets.reduce(
+      (total, offset) => total + points[offset] * weights[offset],
+      0,
+    ),
+    weighted_hit_cost_points: 0,
+  });
+  const steps = [
+    step(1, 1, [0]),
+    step(2, 2, [1]),
+    step(3, 3, [2]),
+    step(4, 4, [3, 4, 5, 6, 7]),
+  ];
+  const weightedProjectedPoints = steps.reduce(
+    (total, value) => total + value.weighted_projected_points,
+    0,
+  );
+  const terminalFtValue = 3.2;
+  return {
+    horizon: 8,
+    gameweek_window: gameweekWindow,
+    gw_weights: weights,
+    modelled_deadlines: 4,
+    maximum_provisional_transfers: 2,
+    first_step_candidate_count: 2,
+    first_step_search: "explicit_bounded_transfer_plans",
+    search_scope: "four_deadlines_max_two_provisional_transfers",
+    future_price_assumption: "fixed_current_prices",
+    assumptions: [
+      "fixed_current_prices",
+      "four_transfer_deadlines_modelled",
+      "maximum_two_transfers_at_each_provisional_deadline",
+      "first_action_restricted_to_supplied_explicit_plans",
+      "no_transfers_after_deadline_four_assumed",
+      "recalculate_at_every_real_deadline",
+    ],
+    solver_proven_optimal_within_bounds: true,
+    globally_optimal: false,
+    recalculate_each_deadline: true,
+    first_action: { source: "best_action", alternative_index: null },
+    steps,
+    weighted_projected_points: weightedProjectedPoints,
+    total_hit_points: 0,
+    weighted_hit_cost_points: 0,
+    terminal_banked_ft_value_points: terminalFtValue,
+    decision_value_points: weightedProjectedPoints + terminalFtValue,
+  };
+}
+
+function chipStrategy(payload: Record<string, any>): Record<string, any> {
+  const strategy = payload.strategy;
+  const wildcardSquad = Array.from({ length: 15 }, (_, index) => playerReference(index + 1));
+  return {
+    horizon: strategy.horizon,
+    target_event: 7,
+    inventory: ["wildcard", "freehit", "bboost", "3xc"].map((chip) => ({
+      chip,
+      used_events: [],
+      available_for_target: true,
+    })),
+    scenarios: [
+      {
+        scenario_id: "wildcard-gw7",
+        chip: "wildcard",
+        event: 7,
+        signal: "hold",
+        available: true,
+        estimated_gain_points: 0,
+        baseline_points: strategy.decision_value_points,
+        chip_points: strategy.decision_value_points,
+        confidence: "low",
+        model_scope: "multiweek_rebuild",
+        reason: "Bounded Wildcard comparison.",
+        squad: wildcardSquad,
+        change_count: 0,
+        bank_after_tenths: 10,
+      },
+      {
+        scenario_id: "freehit-no-confirmed-trigger",
+        chip: "freehit",
+        event: null,
+        signal: "hold",
+        available: true,
+        estimated_gain_points: null,
+        baseline_points: null,
+        chip_points: null,
+        confidence: "low",
+        model_scope: "confirmed_blank_double_screen",
+        reason: "No confirmed blank or double.",
+        squad: [],
+        change_count: null,
+        bank_after_tenths: null,
+      },
+      {
+        scenario_id: "bboost-gw8",
+        chip: "bboost",
+        event: 8,
+        signal: "watch",
+        available: true,
+        estimated_gain_points: 5,
+        baseline_points: 70,
+        chip_points: 75,
+        confidence: "medium",
+        model_scope: "bench_marginal",
+        reason: "Best bench margin.",
+        squad: [],
+        change_count: null,
+        bank_after_tenths: null,
+      },
+      {
+        scenario_id: "3xc-gw7",
+        chip: "3xc",
+        event: 7,
+        signal: "consider",
+        available: true,
+        estimated_gain_points: 8,
+        baseline_points: 72.5,
+        chip_points: 80.5,
+        confidence: "medium",
+        model_scope: "captain_marginal",
+        reason: "Best captain margin.",
+        squad: [],
+        change_count: null,
+        bank_after_tenths: null,
+      },
+    ],
+    recommendation: {
+      action: "consider",
+      scenario_id: "3xc-gw7",
+      chip: "3xc",
+      event: 7,
+      reason: "Review the quantified current scenario manually.",
+    },
+    model_scope: "bounded_chip_counterfactuals",
+    globally_optimal: false,
+    recalculate_each_deadline: true,
+  };
+}
+
 test("validates the exact manager sync response and its cross-field invariants", () => {
   const payload = syncResponse();
   assert.strictEqual(parseManagerSyncResponse(payload), payload);
@@ -347,6 +526,9 @@ test("validates the exact manager sync response and its cross-field invariants",
 
   const freeHit = syncResponse();
   freeHit.last_deadline_state.active_chip = "freehit";
+  freeHit.last_deadline_state.chip_usage = [{ name: "freehit", event: 6 }];
+  freeHit.manual_state_template.state.chip_usage = [{ name: "freehit", event: 6 }];
+  freeHit.manual_state_template.state.chips.freehit = "used";
   freeHit.warnings.push({
     code: "free_hit_squad_is_temporary",
     message: "Confirm the permanent squad.",
@@ -368,6 +550,47 @@ test("sync validation fails closed for unknown, contradictory, or credential-sha
   assert.throws(
     () => parseManagerSyncResponse(wrongDraft),
     /must match the public price estimates/,
+  );
+
+  const wrongChipStatus = syncResponse();
+  wrongChipStatus.manual_state_template.state.chips.wildcard = "used";
+  assert.throws(
+    () => parseManagerSyncResponse(wrongChipStatus),
+    /inconsistent with chip_usage/,
+  );
+
+  const missingChip = syncResponse();
+  delete missingChip.manual_state_template.state.chips["3xc"];
+  assert.throws(() => parseManagerSyncResponse(missingChip), PlannerContractError);
+
+  const duplicateChipEvent = syncResponse();
+  duplicateChipEvent.last_deadline_state.chip_usage = [
+    { name: "freehit", event: 2 },
+    { name: "wildcard", event: 2 },
+  ];
+  assert.throws(() => parseManagerSyncResponse(duplicateChipEvent), /more than one chip/);
+
+  const consecutiveBoundaryFreeHits = syncResponse();
+  consecutiveBoundaryFreeHits.last_deadline_state.event = 20;
+  consecutiveBoundaryFreeHits.target.event = 21;
+  consecutiveBoundaryFreeHits.last_deadline_state.active_chip = "freehit";
+  consecutiveBoundaryFreeHits.last_deadline_state.chip_usage = [
+    { name: "freehit", event: 19 },
+    { name: "freehit", event: 20 },
+  ];
+  consecutiveBoundaryFreeHits.manual_state_template.state.effective_event = 21;
+  consecutiveBoundaryFreeHits.manual_state_template.state.chip_usage = [
+    { name: "freehit", event: 19 },
+    { name: "freehit", event: 20 },
+  ];
+  consecutiveBoundaryFreeHits.manual_state_template.state.chips.freehit = "used";
+  consecutiveBoundaryFreeHits.warnings.push({
+    code: "free_hit_squad_is_temporary",
+    message: "Confirm the permanent squad.",
+  });
+  assert.throws(
+    () => parseManagerSyncResponse(consecutiveBoundaryFreeHits),
+    /consecutive gameweeks 19 and 20/,
   );
 
   const missingWarning = syncResponse();
@@ -478,6 +701,140 @@ test("validates an additive bounded two-deadline sequence and reconciles its tot
   assert.equal(parsed.sequential?.best_sequence.steps[1].target_event, 8);
   assert.equal(parsed.sequential?.best_sequence.steps[1].transfers[0].in_id, 101);
   assert.equal(parsed.method.future_transfers_modelled, false);
+});
+
+test("validates a bounded eight-gameweek roadmap and four personalized chip scenarios", () => {
+  const payload = plannerPayload();
+  payload.strategy = strategyPlan(payload);
+  payload.chip_strategy = chipStrategy(payload);
+  payload.method.bounded_roadmap_modelled = true;
+  payload.method.chips_modelled = true;
+  payload.method.next_deadline_transfer_modelled = true;
+
+  const parsed = parsePlannerPayload(payload);
+
+  assert.strictEqual(parsed, payload);
+  assert.equal(parsed.strategy?.horizon, 8);
+  assert.equal(parsed.strategy?.steps.length, 4);
+  assert.equal(parsed.strategy?.steps[3].gameweeks.length, 5);
+  assert.equal(parsed.strategy?.globally_optimal, false);
+  assert.equal(parsed.chip_strategy?.inventory.length, 4);
+  assert.equal(parsed.chip_strategy?.recommendation.scenario_id, "3xc-gw7");
+  assert.equal(parsed.method.future_transfers_modelled, false);
+});
+
+test("validates a solved Free Hit counterfactual with its temporary squad", () => {
+  const payload = plannerPayload();
+  payload.strategy = strategyPlan(payload);
+  payload.chip_strategy = chipStrategy(payload);
+  payload.chip_strategy.scenarios[1] = {
+    scenario_id: "freehit-gw8",
+    chip: "freehit",
+    event: 8,
+    signal: "watch",
+    available: true,
+    estimated_gain_points: 5,
+    baseline_points: 70,
+    chip_points: 75,
+    confidence: "low",
+    model_scope: "single_gameweek_counterfactual",
+    reason: "One temporary squad solved against the permanent roadmap team.",
+    squad: Array.from({ length: 15 }, (_, index) => playerReference(index + 1)),
+    change_count: 0,
+    bank_after_tenths: null,
+  };
+  payload.method.bounded_roadmap_modelled = true;
+  payload.method.chips_modelled = true;
+  payload.method.next_deadline_transfer_modelled = true;
+
+  const parsed = parsePlannerPayload(payload);
+  const freeHit = parsed.chip_strategy?.scenarios.find((scenario) => scenario.chip === "freehit");
+  assert.equal(freeHit?.model_scope, "single_gameweek_counterfactual");
+  assert.equal(freeHit?.squad.length, 15);
+  assert.equal(freeHit?.change_count, 0);
+});
+
+test("roadmap validation rejects a broken window, first action, provisional flag and totals", () => {
+  const brokenWindow = plannerPayload();
+  brokenWindow.strategy = strategyPlan(brokenWindow);
+  brokenWindow.strategy.gameweek_window[4] += 1;
+  brokenWindow.method.bounded_roadmap_modelled = true;
+  brokenWindow.method.next_deadline_transfer_modelled = true;
+  assert.throws(() => parsePlannerPayload(brokenWindow), /contiguous gameweek window/);
+
+  const wrongFirstAction = plannerPayload();
+  wrongFirstAction.strategy = strategyPlan(wrongFirstAction);
+  wrongFirstAction.strategy.steps[0].free_transfers_next_gameweek = 1;
+  wrongFirstAction.method.bounded_roadmap_modelled = true;
+  wrongFirstAction.method.next_deadline_transfer_modelled = true;
+  assert.throws(() => parsePlannerPayload(wrongFirstAction), /free-transfer rule|referenced visible action/);
+
+  const executableFuture = plannerPayload();
+  executableFuture.strategy = strategyPlan(executableFuture);
+  executableFuture.strategy.steps[2].provisional = false;
+  executableFuture.method.bounded_roadmap_modelled = true;
+  executableFuture.method.next_deadline_transfer_modelled = true;
+  assert.throws(() => parsePlannerPayload(executableFuture), /provisional/);
+
+  const tooManyFutureTransfers = plannerPayload();
+  tooManyFutureTransfers.strategy = strategyPlan(tooManyFutureTransfers);
+  tooManyFutureTransfers.strategy.steps[1].transfer_count = 3;
+  tooManyFutureTransfers.method.bounded_roadmap_modelled = true;
+  tooManyFutureTransfers.method.next_deadline_transfer_modelled = true;
+  assert.throws(() => parsePlannerPayload(tooManyFutureTransfers), /exceeds the bounded/);
+
+  const wrongTotal = plannerPayload();
+  wrongTotal.strategy = strategyPlan(wrongTotal);
+  wrongTotal.strategy.decision_value_points += 1;
+  wrongTotal.method.bounded_roadmap_modelled = true;
+  wrongTotal.method.next_deadline_transfer_modelled = true;
+  assert.throws(() => parsePlannerPayload(wrongTotal), /does not reconcile/);
+});
+
+test("chip strategy validation rejects inventory, scenario and recommendation contradictions", () => {
+  const wrongAvailability = plannerPayload();
+  wrongAvailability.strategy = strategyPlan(wrongAvailability);
+  wrongAvailability.chip_strategy = chipStrategy(wrongAvailability);
+  wrongAvailability.chip_strategy.inventory[0].available_for_target = false;
+  wrongAvailability.method.bounded_roadmap_modelled = true;
+  wrongAvailability.method.chips_modelled = true;
+  wrongAvailability.method.next_deadline_transfer_modelled = true;
+  assert.throws(() => parsePlannerPayload(wrongAvailability), /available_for_target/);
+
+  const duplicateScenario = plannerPayload();
+  duplicateScenario.strategy = strategyPlan(duplicateScenario);
+  duplicateScenario.chip_strategy = chipStrategy(duplicateScenario);
+  duplicateScenario.chip_strategy.scenarios[1] = structuredClone(
+    duplicateScenario.chip_strategy.scenarios[0],
+  );
+  duplicateScenario.method.bounded_roadmap_modelled = true;
+  duplicateScenario.method.chips_modelled = true;
+  duplicateScenario.method.next_deadline_transfer_modelled = true;
+  assert.throws(() => parsePlannerPayload(duplicateScenario), /four unique chip scenarios/);
+
+  const partialWildcard = plannerPayload();
+  partialWildcard.strategy = strategyPlan(partialWildcard);
+  partialWildcard.chip_strategy = chipStrategy(partialWildcard);
+  partialWildcard.chip_strategy.scenarios[0].squad.pop();
+  partialWildcard.method.bounded_roadmap_modelled = true;
+  partialWildcard.method.chips_modelled = true;
+  partialWildcard.method.next_deadline_transfer_modelled = true;
+  assert.throws(() => parsePlannerPayload(partialWildcard), /zero or exactly 15/);
+
+  const inventedRecommendation = plannerPayload();
+  inventedRecommendation.strategy = strategyPlan(inventedRecommendation);
+  inventedRecommendation.chip_strategy = chipStrategy(inventedRecommendation);
+  inventedRecommendation.chip_strategy.recommendation.scenario_id = "wildcard-gw7";
+  inventedRecommendation.chip_strategy.recommendation.chip = "wildcard";
+  inventedRecommendation.method.bounded_roadmap_modelled = true;
+  inventedRecommendation.method.chips_modelled = true;
+  inventedRecommendation.method.next_deadline_transfer_modelled = true;
+  assert.throws(() => parsePlannerPayload(inventedRecommendation), /available consider scenario/);
+
+  const falseMethodFlag = plannerPayload();
+  falseMethodFlag.strategy = strategyPlan(falseMethodFlag);
+  falseMethodFlag.method.next_deadline_transfer_modelled = true;
+  assert.throws(() => parsePlannerPayload(falseMethodFlag), /bounded_roadmap_modelled/);
 });
 
 test("sequential validation rejects unknown fields, a mismatched first action and broken chaining", () => {

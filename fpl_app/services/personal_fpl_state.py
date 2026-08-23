@@ -26,10 +26,12 @@ from typing import Any, Callable, Mapping, Sequence
 
 import requests
 
+from fpl_app.domain.rules import Chip, can_play_chip, chip_window
+
 
 FPL_API_BASE = "https://fantasy.premierleague.com/api"
-STATE_SCHEMA_VERSION = "fpl-personal-state-v1"
-SNAPSHOT_SCHEMA_VERSION = "fpl-deadline-state-snapshot-v1"
+STATE_SCHEMA_VERSION = "fpl-personal-state-v2"
+SNAPSHOT_SCHEMA_VERSION = "fpl-deadline-state-snapshot-v2"
 PUBLIC_SOURCE = "fpl_public_last_deadline"
 MANUAL_SOURCE = "manual_manager_input"
 
@@ -39,16 +41,19 @@ _MANUAL_REQUIRED_FIELDS = frozenset(
         "bank_tenths",
         "free_transfers",
         "player_prices",
+        "chips",
+        "chip_usage",
         "no_active_chip_confirmed",
+        "effective_event",
     }
 )
-_MANUAL_OPTIONAL_FIELDS = frozenset({"chips", "effective_event"})
+_MANUAL_OPTIONAL_FIELDS = frozenset()
 _FORBIDDEN_CREDENTIAL_KEY = re.compile(
     r"(?:password|passwd|cookie|token|authorization|bearer|session|csrf|email)",
     re.IGNORECASE,
 )
-_CHIP_NAMES = frozenset({"wildcard", "freehit", "bboost", "3xc"})
-_CHIP_STATUSES = frozenset({"available", "used", "active", "unavailable"})
+_CHIP_NAMES = frozenset(chip.value for chip in Chip)
+_CHIP_STATUSES = frozenset({"available", "used", "unavailable"})
 
 
 class PersonalFplStateError(ValueError):
@@ -172,6 +177,17 @@ class PublicTransfer:
 
 
 @dataclass(frozen=True)
+class ChipUsage:
+    """One official chip activation, identified only by chip code and event."""
+
+    name: str
+    event: int
+
+    def to_server_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "event": self.event}
+
+
+@dataclass(frozen=True)
 class PublicManagerSummary:
     """Allowlisted manager-summary fields shared by server-side consumers."""
 
@@ -205,6 +221,7 @@ class PublicLastDeadlineState:
     event_transfers: int
     event_transfer_cost: int
     active_chip: str | None
+    chip_usage: tuple[ChipUsage, ...]
     public_transfers: tuple[PublicTransfer, ...]
     source_urls: tuple[str, ...]
     limitations: tuple[str, ...] = (
@@ -234,6 +251,7 @@ class PublicLastDeadlineState:
             "event_transfers": self.event_transfers,
             "event_transfer_cost": self.event_transfer_cost,
             "active_chip": self.active_chip,
+            "chip_usage": [row.to_server_dict() for row in self.chip_usage],
             "public_transfers": [row.to_server_dict() for row in self.public_transfers],
             "source_urls": list(self.source_urls),
             "limitations": list(self.limitations),
@@ -264,7 +282,8 @@ class ManualCurrentState:
     player_prices: tuple[PlayerPriceState, ...]
     no_active_chip_confirmed: bool
     chips: tuple[tuple[str, str], ...]
-    effective_event: int | None
+    chip_usage: tuple[ChipUsage, ...]
+    effective_event: int
     schema_version: str = STATE_SCHEMA_VERSION
 
     def to_server_dict(self) -> dict[str, Any]:
@@ -277,6 +296,7 @@ class ManualCurrentState:
             "player_prices": [row.to_server_dict() for row in self.player_prices],
             "no_active_chip_confirmed": self.no_active_chip_confirmed,
             "chips": {name: status for name, status in self.chips},
+            "chip_usage": [row.to_server_dict() for row in self.chip_usage],
             "effective_event": self.effective_event,
         }
 
@@ -293,6 +313,179 @@ def _scan_for_credentials(value: Any, path: str = "manual_state") -> None:
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         for index, child in enumerate(value):
             _scan_for_credentials(child, f"{path}[{index}]")
+
+
+def _validated_chip_usage(
+    rows: Sequence[ChipUsage],
+    *,
+    field: str,
+    error_type: type[PersonalFplStateError],
+) -> tuple[ChipUsage, ...]:
+    """Validate season windows and cross-row rules shared by public/manual state."""
+
+    seen_chip_halves: set[tuple[str, int]] = set()
+    seen_events: set[int] = set()
+    free_hit_events: set[int] = set()
+    for row in rows:
+        try:
+            chip = Chip(row.name)
+        except ValueError as exc:
+            raise error_type(
+                f"{field} contains unknown chip name: {row.name!r}"
+            ) from exc
+        window = chip_window(chip, row.event)
+        if window is None:
+            raise error_type(
+                f"{field} contains {row.name} in event {row.event}, outside its legal window"
+            )
+        chip_half = (row.name, window.half)
+        if chip_half in seen_chip_halves:
+            raise error_type(
+                f"{field} contains duplicate {row.name} usage in half {window.half}"
+            )
+        if row.event in seen_events:
+            raise error_type(
+                f"{field} contains more than one chip in event {row.event}"
+            )
+        seen_chip_halves.add(chip_half)
+        seen_events.add(row.event)
+        if chip is Chip.FREE_HIT:
+            free_hit_events.add(row.event)
+
+    if {19, 20}.issubset(free_hit_events):
+        raise error_type(f"{field} cannot use Free Hit in consecutive events 19 and 20")
+    return tuple(sorted(rows, key=lambda row: (row.event, row.name)))
+
+
+def _parse_manual_chip_usage(payload: Any) -> tuple[ChipUsage, ...]:
+    if isinstance(payload, (str, bytes, bytearray)) or not isinstance(
+        payload, Sequence
+    ):
+        raise ManualStateValidationError("chip_usage must be a JSON array")
+    rows: list[ChipUsage] = []
+    for index, raw in enumerate(payload):
+        if not isinstance(raw, Mapping):
+            raise ManualStateValidationError(
+                f"chip_usage[{index}] must be a JSON object"
+            )
+        if set(raw) != {"name", "event"}:
+            raise ManualStateValidationError(
+                f"chip_usage[{index}] must contain exactly: event, name"
+            )
+        name = raw["name"]
+        if not isinstance(name, str) or name not in _CHIP_NAMES:
+            raise ManualStateValidationError(
+                f"chip_usage[{index}].name must be one of: "
+                + ", ".join(sorted(_CHIP_NAMES))
+            )
+        try:
+            event = _strict_int(
+                raw["event"], f"chip_usage[{index}].event", minimum=1, maximum=38
+            )
+        except PersonalFplStateError as exc:
+            raise ManualStateValidationError(str(exc)) from exc
+        rows.append(ChipUsage(name=name, event=event))
+    return _validated_chip_usage(
+        rows,
+        field="chip_usage",
+        error_type=ManualStateValidationError,
+    )
+
+
+def _parse_public_chip_usage(payload: Any) -> tuple[ChipUsage, ...]:
+    if isinstance(payload, (str, bytes, bytearray)) or not isinstance(
+        payload, Sequence
+    ):
+        raise PublicFplPayloadError("entry history.chips must be a JSON array")
+    rows: list[ChipUsage] = []
+    for index, raw in enumerate(payload):
+        if not isinstance(raw, Mapping):
+            raise PublicFplPayloadError(
+                f"entry history.chips[{index}] must be a JSON object"
+            )
+        if set(raw) != {"name", "event", "time"}:
+            raise PublicFplPayloadError(
+                f"entry history.chips[{index}] must contain exactly: event, name, time"
+            )
+        name = raw["name"]
+        if not isinstance(name, str) or name not in _CHIP_NAMES:
+            raise PublicFplPayloadError(
+                f"entry history.chips[{index}].name must be one of: "
+                + ", ".join(sorted(_CHIP_NAMES))
+            )
+        try:
+            event = _strict_int(
+                raw["event"],
+                f"entry history.chips[{index}].event",
+                minimum=1,
+                maximum=38,
+            )
+            played_at = _optional_str(
+                raw["time"], f"entry history.chips[{index}].time"
+            )
+        except PersonalFplStateError as exc:
+            raise PublicFplPayloadError(str(exc)) from exc
+        if played_at is None:
+            raise PublicFplPayloadError(
+                f"entry history.chips[{index}].time must be a non-empty string"
+            )
+        candidate = played_at[:-1] + "+00:00" if played_at.endswith("Z") else played_at
+        try:
+            parsed_time = datetime.fromisoformat(candidate)
+        except ValueError as exc:
+            raise PublicFplPayloadError(
+                f"entry history.chips[{index}].time must be an ISO UTC timestamp"
+            ) from exc
+        if (
+            parsed_time.tzinfo is None
+            or parsed_time.utcoffset() is None
+            or parsed_time.utcoffset().total_seconds() != 0
+        ):
+            raise PublicFplPayloadError(
+                f"entry history.chips[{index}].time must be an ISO UTC timestamp"
+            )
+        rows.append(ChipUsage(name=name, event=event))
+    return _validated_chip_usage(
+        rows,
+        field="entry history.chips",
+        error_type=PublicFplPayloadError,
+    )
+
+
+def chip_statuses_for_event(
+    chip_usage: Sequence[ChipUsage],
+    effective_event: int,
+) -> dict[str, str]:
+    """Return all four statuses for the chip set covering ``effective_event``."""
+
+    event = _strict_int(
+        effective_event, "effective_event", minimum=1, maximum=38
+    )
+    current_half = 1 if event <= 19 else 2
+    usage_by_event = {row.event: row.name for row in chip_usage}
+    statuses: dict[str, str] = {}
+    for name in sorted(_CHIP_NAMES):
+        used_halves = {
+            window.half
+            for row in chip_usage
+            if row.name == name
+            for window in (chip_window(name, row.event),)
+            if window is not None
+        }
+        if current_half in used_halves:
+            statuses[name] = "used"
+            continue
+        statuses[name] = (
+            "available"
+            if can_play_chip(
+                name,
+                event,
+                used_halves=used_halves,
+                previous_gameweek_chip=usage_by_event.get(event - 1),
+            )
+            else "unavailable"
+        )
+    return statuses
 
 
 def parse_manual_current_state(
@@ -384,32 +577,42 @@ def parse_manual_current_state(
             )
         price_rows.sort(key=lambda row: row.element_id)
 
-        raw_chips = data.get("chips", {})
-        chips_mapping = _require_mapping(raw_chips, "chips")
-        unknown_chips = sorted(set(chips_mapping) - _CHIP_NAMES)
-        if unknown_chips:
+        event = _strict_int(
+            data["effective_event"], "effective_event", minimum=1, maximum=38
+        )
+        chip_usage = _parse_manual_chip_usage(data["chip_usage"])
+        future_usage = [row for row in chip_usage if row.event >= event]
+        if future_usage:
             raise ManualStateValidationError(
-                "chips contains unknown names: " + ", ".join(unknown_chips)
+                "chip_usage events must be earlier than effective_event"
+            )
+
+        raw_chips = data["chips"]
+        chips_mapping = _require_mapping(raw_chips, "chips")
+        missing_chips = sorted(_CHIP_NAMES - set(chips_mapping))
+        unknown_chips = sorted(set(chips_mapping) - _CHIP_NAMES)
+        if missing_chips or unknown_chips:
+            details: list[str] = []
+            if missing_chips:
+                details.append("missing " + ", ".join(missing_chips))
+            if unknown_chips:
+                details.append("unknown " + ", ".join(unknown_chips))
+            raise ManualStateValidationError(
+                "chips must contain exactly all four chip names (" + "; ".join(details) + ")"
             )
         chips: list[tuple[str, str]] = []
-        active_count = 0
         for name in sorted(chips_mapping):
             status = chips_mapping[name]
             if not isinstance(status, str) or status not in _CHIP_STATUSES:
                 raise ManualStateValidationError(
                     f"chips.{name} must be one of: {', '.join(sorted(_CHIP_STATUSES))}"
                 )
-            active_count += status == "active"
             chips.append((name, status))
-        if active_count > 1:
-            raise ManualStateValidationError("at most one chip can be active")
-
-        raw_event = data.get("effective_event")
-        event = (
-            None
-            if raw_event is None
-            else _strict_int(raw_event, "effective_event", minimum=1, maximum=38)
-        )
+        expected_chips = chip_statuses_for_event(chip_usage, event)
+        if dict(chips) != expected_chips:
+            raise ManualStateValidationError(
+                "chips statuses are inconsistent with chip_usage and effective_event"
+            )
         return ManualCurrentState(
             current_squad_ids=squad_ids,
             bank_tenths=bank,
@@ -417,6 +620,7 @@ def parse_manual_current_state(
             player_prices=tuple(price_rows),
             no_active_chip_confirmed=no_active_chip_confirmed,
             chips=tuple(chips),
+            chip_usage=chip_usage,
             effective_event=event,
         )
     except ManualStateValidationError:
@@ -539,6 +743,7 @@ class PublicManagerStateClient:
                 )
             summary = validated_summary
         history = _require_mapping(self._get(history_url), "entry history")
+        chip_usage = _parse_public_chip_usage(history.get("chips"))
 
         raw_current = _require_sequence(history.get("current"), "entry history.current")
         history_by_event: dict[int, Mapping[str, Any]] = {}
@@ -555,6 +760,13 @@ class PublicManagerStateClient:
         if not summary.started_event <= public_event <= summary.current_event:
             raise PublicFplPayloadError(
                 "latest entry history event is outside the manager summary range"
+            )
+        if any(
+            row.event < summary.started_event or row.event > public_event
+            for row in chip_usage
+        ):
+            raise PublicFplPayloadError(
+                "entry history.chips contains usage outside the public manager event range"
             )
         picks_url = _entry_url(entry, f"event/{public_event}/picks/")
         try:
@@ -628,6 +840,17 @@ class PublicManagerStateClient:
         transfers.sort(key=lambda row: (row.event, row.confirmed_at or "", row.element_in))
 
         active_chip = _optional_str(picks_payload.get("active_chip"), "active_chip")
+        if active_chip is not None and active_chip not in _CHIP_NAMES:
+            raise PublicFplPayloadError(
+                "active_chip must be null or a known official chip name"
+            )
+        chips_at_public_event = [
+            row.name for row in chip_usage if row.event == public_event
+        ]
+        if chips_at_public_event != ([active_chip] if active_chip is not None else []):
+            raise PublicFplPayloadError(
+                "active_chip is inconsistent with entry history.chips"
+            )
         return PublicLastDeadlineState(
             entry_id=entry,
             event=public_event,
@@ -645,6 +868,7 @@ class PublicManagerStateClient:
             event_transfers=_strict_int(event_history.get("event_transfers"), "entry_history.event_transfers"),
             event_transfer_cost=_strict_int(event_history.get("event_transfers_cost"), "entry_history.event_transfers_cost"),
             active_chip=active_chip,
+            chip_usage=chip_usage,
             public_transfers=tuple(transfers),
             source_urls=(summary_url, history_url, picks_url, transfers_url),
         )
@@ -686,7 +910,7 @@ def verify_deadline_snapshot(snapshot: Any) -> dict[str, Any]:
         "checksum_sha256",
     }
     if set(data) != expected_fields:
-        raise DeadlineSnapshotError("snapshot fields do not match the v1 schema")
+        raise DeadlineSnapshotError("snapshot fields do not match the v2 schema")
     if data.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
         raise DeadlineSnapshotError("unsupported snapshot schema_version")
     if data.get("source") not in {PUBLIC_SOURCE, MANUAL_SOURCE}:
@@ -725,6 +949,7 @@ def verify_deadline_snapshot(snapshot: Any) -> dict[str, Any]:
 
 
 __all__ = [
+    "ChipUsage",
     "DeadlineSnapshotError",
     "MANUAL_SOURCE",
     "ManualCurrentState",
@@ -741,6 +966,7 @@ __all__ = [
     "PublicTransfer",
     "SNAPSHOT_SCHEMA_VERSION",
     "STATE_SCHEMA_VERSION",
+    "chip_statuses_for_event",
     "parse_manual_current_state",
     "parse_public_manager_summary",
     "serialize_deadline_snapshot",

@@ -7,6 +7,7 @@ import json
 import pytest
 
 from fpl_app.services.personal_fpl_state import (
+    ChipUsage,
     DeadlineSnapshotError,
     MANUAL_SOURCE,
     ManualStateValidationError,
@@ -14,6 +15,7 @@ from fpl_app.services.personal_fpl_state import (
     PublicFplNotFound,
     PublicFplPayloadError,
     PublicManagerStateClient,
+    chip_statuses_for_event,
     parse_manual_current_state,
     parse_public_manager_summary,
     serialize_deadline_snapshot,
@@ -41,6 +43,7 @@ def _manual_payload() -> dict:
             "freehit": "available",
             "wildcard": "available",
         },
+        "chip_usage": [{"name": "bboost", "event": 1}],
         "effective_event": 7,
     }
 
@@ -81,7 +84,17 @@ def _public_payloads(entry_id: int = 123) -> tuple[dict[str, object], dict[str, 
             "summary_overall_points": 55,
             "summary_overall_rank": 1234,
         },
-        history_url: {"current": [event_history], "past": [], "chips": []},
+        history_url: {
+            "current": [event_history],
+            "past": [],
+            "chips": [
+                {
+                    "name": "bboost",
+                    "event": 1,
+                    "time": "2026-08-12T03:54:21.742807Z",
+                }
+            ],
+        },
         transfers_url: [
             {
                 "event": 1,
@@ -125,11 +138,14 @@ def test_manual_state_is_strict_complete_and_json_safe() -> None:
     )
 
     assert state.current_squad_ids == tuple(range(1, 16))
+    assert state.schema_version == "fpl-personal-state-v2"
     assert state.free_transfers == 3
     assert state.no_active_chip_confirmed is True
     assert state.player_prices[0].element_id == 1
     assert dict(state.chips)["wildcard"] == "available"
+    assert [(row.name, row.event) for row in state.chip_usage] == [("bboost", 1)]
     encoded = json.dumps(state.to_server_dict(), allow_nan=False)
+    assert '"chip_usage": [{"name": "bboost", "event": 1}]' in encoded
     assert "password" not in encoded.casefold()
     assert "cookie" not in encoded.casefold()
 
@@ -158,11 +174,34 @@ def test_manual_state_is_strict_complete_and_json_safe() -> None:
             lambda value: value["player_prices"].pop(),
             "exactly one row",
         ),
+        (lambda value: value["chips"].pop("3xc"), "exactly all four"),
+        (
+            lambda value: value["chips"].update({"bboost": "available"}),
+            "inconsistent",
+        ),
         (
             lambda value: value.update(
-                {"chips": {"wildcard": "active", "freehit": "active"}}
+                {"chip_usage": [{"name": "wildcard", "event": 1}]}
             ),
-            "at most one",
+            "legal window",
+        ),
+        (
+            lambda value: value["chip_usage"].append(
+                {"name": "bboost", "event": 2}
+            ),
+            "duplicate bboost usage",
+        ),
+        (
+            lambda value: value["chip_usage"].append(
+                {"name": "3xc", "event": 1}
+            ),
+            "more than one chip",
+        ),
+        (
+            lambda value: value.update(
+                {"chip_usage": [{"name": "bboost", "event": 7}]}
+            ),
+            "earlier than effective_event",
         ),
     ],
 )
@@ -176,6 +215,82 @@ def test_manual_state_fails_closed(mutator, message: str) -> None:
 def test_manual_state_rejects_ids_outside_official_player_pool() -> None:
     with pytest.raises(ManualStateValidationError, match="unknown player ids"):
         parse_manual_current_state(_manual_payload(), known_player_ids=set(range(1, 15)))
+
+
+def test_chip_statuses_follow_current_half_and_free_hit_boundary() -> None:
+    usage = (ChipUsage(name="freehit", event=19),)
+
+    assert chip_statuses_for_event(usage, 20) == {
+        "3xc": "available",
+        "bboost": "available",
+        "freehit": "unavailable",
+        "wildcard": "available",
+    }
+    assert chip_statuses_for_event(usage, 21)["freehit"] == "available"
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        (
+            1,
+            {
+                "3xc": "available",
+                "bboost": "available",
+                "freehit": "unavailable",
+                "wildcard": "unavailable",
+            },
+        ),
+        (19, {name: "available" for name in ("3xc", "bboost", "freehit", "wildcard")}),
+        (20, {name: "available" for name in ("3xc", "bboost", "freehit", "wildcard")}),
+        (38, {name: "available" for name in ("3xc", "bboost", "freehit", "wildcard")}),
+    ],
+)
+def test_empty_chip_inventory_statuses_cover_window_boundaries(
+    event: int,
+    expected: dict[str, str],
+) -> None:
+    assert chip_statuses_for_event((), event) == expected
+
+
+def test_manual_state_rejects_consecutive_free_hits_across_halves() -> None:
+    payload = _manual_payload()
+    payload["effective_event"] = 21
+    payload["chip_usage"] = [
+        {"name": "freehit", "event": 19},
+        {"name": "freehit", "event": 20},
+    ]
+    payload["chips"] = {
+        "3xc": "available",
+        "bboost": "available",
+        "freehit": "used",
+        "wildcard": "available",
+    }
+
+    with pytest.raises(ManualStateValidationError, match="consecutive events 19 and 20"):
+        parse_manual_current_state(payload)
+
+
+def test_manual_state_accepts_one_use_per_chip_in_each_half() -> None:
+    payload = _manual_payload()
+    payload["effective_event"] = 21
+    payload["chip_usage"] = [
+        {"name": "bboost", "event": 1},
+        {"name": "bboost", "event": 20},
+    ]
+    payload["chips"] = {
+        "3xc": "available",
+        "bboost": "used",
+        "freehit": "available",
+        "wildcard": "available",
+    }
+
+    state = parse_manual_current_state(payload)
+
+    assert [(row.name, row.event) for row in state.chip_usage] == [
+        ("bboost", 1),
+        ("bboost", 20),
+    ]
 
 
 def test_public_client_uses_latest_history_event_without_probing_future_picks() -> None:
@@ -193,6 +308,7 @@ def test_public_client_uses_latest_history_event_without_probing_future_picks() 
     assert state.bank_tenths == 9
     assert state.squad_value_tenths == 1004
     assert state.active_chip == "bboost"
+    assert [(row.name, row.event) for row in state.chip_usage] == [("bboost", 1)]
     assert len(state.public_transfers) == 1
     assert "current_free_transfers_not_public" in state.limitations
     assert calls == [
@@ -203,6 +319,91 @@ def test_public_client_uses_latest_history_event_without_probing_future_picks() 
     ]
     assert urls["gw2"] not in calls
     json.dumps(state.to_server_dict(), allow_nan=False)
+    assert state.to_server_dict()["chip_usage"] == [
+        {"name": "bboost", "event": 1}
+    ]
+    assert "2026-08-12T03:54:21.742807Z" not in json.dumps(
+        state.to_server_dict(), allow_nan=False
+    )
+
+
+@pytest.mark.parametrize(
+    ("chip_rows", "active_chip", "message"),
+    [
+        (
+            [{"name": "assistant_manager", "event": 1, "time": "2026-08-12T00:00:00Z"}],
+            None,
+            "must be one of",
+        ),
+        (
+            [{"name": "wildcard", "event": 1, "time": "2026-08-12T00:00:00Z"}],
+            None,
+            "legal window",
+        ),
+        (
+            [
+                {"name": "bboost", "event": 1, "time": "2026-08-12T00:00:00Z"},
+                {"name": "bboost", "event": 2, "time": "2026-08-22T00:00:00Z"},
+            ],
+            None,
+            "duplicate bboost usage",
+        ),
+        ([], "bboost", "inconsistent"),
+        (
+            [{"name": "bboost", "event": 1, "time": "2026-08-12T00:00:00Z"}],
+            None,
+            "inconsistent",
+        ),
+        (
+            [{"name": "bboost", "event": 20, "time": "2027-01-06T18:30:00Z"}],
+            None,
+            "outside the public manager event range",
+        ),
+        (
+            [{"name": "bboost", "event": 1, "time": "not-a-timestamp"}],
+            "bboost",
+            "ISO UTC timestamp",
+        ),
+        (
+            [
+                {
+                    "name": "bboost",
+                    "event": 1,
+                    "time": "2026-08-12T00:00:00Z",
+                    "extra": True,
+                }
+            ],
+            "bboost",
+            "contain exactly",
+        ),
+        (
+            [
+                {"name": "freehit", "event": 19, "time": "2027-01-01T00:00:00Z"},
+                {"name": "freehit", "event": 20, "time": "2027-01-03T00:00:00Z"},
+            ],
+            None,
+            "consecutive events 19 and 20",
+        ),
+    ],
+)
+def test_public_client_rejects_invalid_chip_history(
+    chip_rows: list[dict[str, object]],
+    active_chip: str | None,
+    message: str,
+) -> None:
+    payloads, urls = _public_payloads()
+    history = payloads[urls["history"]]
+    picks = payloads[urls["gw1"]]
+    assert isinstance(history, dict)
+    assert isinstance(picks, dict)
+    history["chips"] = chip_rows
+    picks["active_chip"] = active_chip
+
+    def transport(url: str):
+        return deepcopy(payloads[url])
+
+    with pytest.raises(PublicFplPayloadError, match=message):
+        PublicManagerStateClient(transport).fetch_last_deadline_state(123)
 
 
 def test_public_client_selects_max_event_from_unsorted_history() -> None:
@@ -220,6 +421,7 @@ def test_public_client_selects_max_event_from_unsorted_history() -> None:
     gw_two = deepcopy(payloads[urls["gw1"]])
     assert isinstance(gw_two, dict)
     gw_two["entry_history"] = event_two_history
+    gw_two["active_chip"] = None
     payloads[urls["gw2"]] = gw_two
     calls: list[str] = []
 
@@ -293,6 +495,7 @@ def test_deadline_snapshot_is_deterministic_and_detects_tampering() -> None:
     )
 
     assert first == second
+    assert first["schema_version"] == "fpl-deadline-state-snapshot-v2"
     assert first["observed_at"] == "2026-08-22T12:30:00.000000Z"
     assert len(first["checksum_sha256"]) == 64
     assert verify_deadline_snapshot(first) == first

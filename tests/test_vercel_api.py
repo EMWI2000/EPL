@@ -435,7 +435,13 @@ def test_weekly_recommendation_rolls_when_no_transfer_candidate_exists(monkeypat
         "_load_official_data",
         lambda: (bootstrap, official, fixtures, teams),
     )
-    monkeypatch.setattr(compute, "_build_forecast_pool", lambda *args: pool.copy())
+    def forecast_pool(*args):
+        forecast = _synthetic_pool(horizon=args[3])
+        forecast.loc[forecast["id"] == 1, "status"] = "i"
+        return forecast
+
+    monkeypatch.setattr(compute, "_build_forecast_pool", forecast_pool)
+    monkeypatch.setattr(compute, "MIN_STRATEGY_HORIZON", 9)
     real_sequential_optimizer = compute.optimize_two_deadline_sequence
     observed_eligible_ids: set[int] = set()
 
@@ -460,7 +466,13 @@ def test_weekly_recommendation_rolls_when_no_transfer_candidate_exists(monkeypat
             }
             for player_id in pool["id"]
         ],
-        "chips": {},
+        "chips": {
+            "wildcard": "available",
+            "freehit": "available",
+            "bboost": "available",
+            "3xc": "available",
+        },
+        "chip_usage": [],
         "no_active_chip_confirmed": True,
         "effective_event": 7,
     }
@@ -525,3 +537,98 @@ def test_weekly_recommendation_rolls_when_no_transfer_candidate_exists(monkeypat
     assert fallback["planner"]["sequential"] is None
     assert fallback["planner"]["method"]["next_deadline_transfer_modelled"] is False
     assert fallback["planner"]["best_action"]["kind"] == "roll"
+
+
+def test_weekly_recommendation_adds_bounded_strategy_and_chip_scenarios(monkeypatch):
+    pool = _synthetic_pool(horizon=8)
+    official = pd.DataFrame({"id": pool["id"]})
+    fixtures = pd.DataFrame(
+        {
+            "event": list(range(7, 15)),
+            "home_team": [1, 2, 3, 4, 5, 1, 2, 3],
+            "away_team": [2, 3, 4, 5, 1, 3, 4, 5],
+            "home_fdr": [3] * 8,
+            "away_fdr": [3] * 8,
+        }
+    )
+    teams = pd.DataFrame(
+        {
+            "team_id": range(1, 6),
+            "name": [f"Team {index}" for index in range(1, 6)],
+            "short_name": [f"T{index}" for index in range(1, 6)],
+        }
+    )
+    bootstrap = {
+        "events": [
+            {
+                "id": 7,
+                "is_next": True,
+                "deadline_time": "2099-08-01T17:30:00Z",
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        compute,
+        "_load_official_data",
+        lambda: (bootstrap, official, fixtures, teams),
+    )
+    monkeypatch.setattr(compute, "_build_forecast_pool", lambda *args: pool.copy())
+    state = {
+        "current_squad_ids": pool["id"].tolist(),
+        "bank_tenths": 0,
+        "free_transfers": 1,
+        "player_prices": [
+            {
+                "element_id": int(player_id),
+                "purchase_price_tenths": 50,
+                "selling_price_tenths": 50,
+            }
+            for player_id in pool["id"]
+        ],
+        "chips": {
+            "wildcard": "available",
+            "freehit": "available",
+            "bboost": "available",
+            "3xc": "available",
+        },
+        "chip_usage": [],
+        "no_active_chip_confirmed": True,
+        "effective_event": 7,
+    }
+
+    response = compute.generate_recommendation(
+        {
+            "horizon": 5,
+            "manager_id": 123,
+            "source_event": 6,
+            "manager_state": state,
+            "use_solio": False,
+        }
+    )
+
+    planner = response["planner"]
+    assert planner["sequential"] is None
+    assert planner["strategy"]["gameweek_window"] == list(range(7, 15))
+    assert len(planner["strategy"]["steps"]) == 4
+    assert planner["strategy"]["steps"][0]["provisional"] is False
+    assert planner["strategy"]["first_action"] == {
+        "source": "best_action",
+        "alternative_index": None,
+    }
+    assert planner["strategy"]["steps"][0]["squad_ids"] == planner["best_action"]["squad_ids"]
+    assert [row["id"] for row in response["team"]["squad"]] == planner["best_action"]["squad_ids"]
+    assert all(step["provisional"] for step in planner["strategy"]["steps"][1:])
+    assert planner["strategy"]["solver_proven_optimal_within_bounds"] is True
+    assert planner["strategy"]["globally_optimal"] is False
+    assert planner["chip_strategy"]["target_event"] == 7
+    assert {row["chip"] for row in planner["chip_strategy"]["inventory"]} == {
+        "wildcard",
+        "freehit",
+        "bboost",
+        "3xc",
+    }
+    assert len(planner["chip_strategy"]["scenarios"]) == 4
+    assert planner["method"]["chips_modelled"] is True
+    assert planner["method"]["bounded_roadmap_modelled"] is True
+    assert planner["method"]["future_transfers_modelled"] is False
+    json.dumps(response, allow_nan=False)

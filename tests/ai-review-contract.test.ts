@@ -105,6 +105,8 @@ function plannerFixture(): PlannerPayload {
     best_action: action("roll"),
     alternatives: [action("transfer")],
     sequential: null,
+    strategy: null,
+    chip_strategy: null,
     method: {
       candidate_count: 45,
       plans_per_transfer_count: 5,
@@ -112,6 +114,7 @@ function plannerFixture(): PlannerPayload {
       maximum_immediate_transfers: 2,
       roll_ft_value_points: 0.8,
       chips_modelled: false,
+      bounded_roadmap_modelled: false,
       next_deadline_transfer_modelled: false,
       future_transfers_modelled: false,
     },
@@ -211,7 +214,7 @@ function reviewFixture(): AiReviewModelOutput {
         trigger: "Genberegn ved holdnyt.",
         earliest_gameweek: 7,
       }],
-      scope: "advisory_only_no_unmodelled_transfers_or_chips",
+      scope: "solver_bounded_strategy_context_no_new_actions",
     },
     qualitative_evidence: [{
       subject: "Player 13",
@@ -305,6 +308,32 @@ test("model output can only select an existing solver action", () => {
       strategic_outlook: { ...best.strategic_outlook, horizon_gameweeks: 3 },
     }, 1, 2, 7),
     /solver horizon/,
+  );
+
+  const tenGameweekOutlook = {
+    ...best,
+    strategic_outlook: {
+      ...best.strategic_outlook,
+      horizon_gameweeks: 10,
+      watchpoints: [{
+        ...best.strategic_outlook.watchpoints[0],
+        earliest_gameweek: 16,
+      }],
+    },
+  };
+  assert.equal(
+    parseAiReviewModelOutput(tenGameweekOutlook, 1, 10, 7).strategic_outlook.horizon_gameweeks,
+    10,
+  );
+  assert.throws(
+    () => parseAiReviewModelOutput({
+      ...tenGameweekOutlook,
+      strategic_outlook: {
+        ...tenGameweekOutlook.strategic_outlook,
+        horizon_gameweeks: 11,
+      },
+    }, 1),
+    /horizon_gameweeks/,
   );
 });
 
