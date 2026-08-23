@@ -12,6 +12,7 @@ import {
 
 export const DEFAULT_OPENAI_REVIEW_MODEL = "gpt-5.6-sol";
 export const DEFAULT_OPENAI_REASONING_EFFORT: AiReviewReasoningEffort = "xhigh";
+export const DEFAULT_OPENAI_REVIEW_TIMEOUT_MS = 270_000;
 export const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 
 const ALLOWED_OPENAI_REVIEW_MODELS = new Set([DEFAULT_OPENAI_REVIEW_MODEL]);
@@ -418,7 +419,7 @@ export async function requestOpenAiReview(
       body: JSON.stringify(body),
       cache: "no-store",
       redirect: "error",
-      signal: AbortSignal.timeout(options.timeoutMs ?? 105_000),
+      signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_OPENAI_REVIEW_TIMEOUT_MS),
     });
   } catch (error) {
     const name = error instanceof Error ? error.name : "";

@@ -5,6 +5,7 @@ import type { AiReviewRequest } from "../lib/ai-review-contract.ts";
 import {
   AI_REVIEW_INSTRUCTIONS,
   DEFAULT_OPENAI_REASONING_EFFORT,
+  DEFAULT_OPENAI_REVIEW_TIMEOUT_MS,
   DEFAULT_OPENAI_REVIEW_MODEL,
   OPENAI_RESPONSES_URL,
   OpenAiReviewError,
@@ -216,6 +217,7 @@ test("uses the standard API key variable first and accepts the server-side FANTA
 test("pins the review to Sol and allowlisted high reasoning levels", () => {
   assert.equal(DEFAULT_OPENAI_REVIEW_MODEL, "gpt-5.6-sol");
   assert.equal(DEFAULT_OPENAI_REASONING_EFFORT, "xhigh");
+  assert.equal(DEFAULT_OPENAI_REVIEW_TIMEOUT_MS, 270_000);
   assert.equal(configuredOpenAiReviewModel(undefined), "gpt-5.6-sol");
   assert.equal(configuredOpenAiReasoningEffort(undefined), "xhigh");
   assert.equal(configuredOpenAiReasoningEffort(" max "), "max");

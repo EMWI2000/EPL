@@ -17,7 +17,7 @@ import { hasValidPublicOrigin } from "@/lib/public-request-origin";
 import { getCurrentSession } from "@/lib/require-user";
 
 export const runtime = "nodejs";
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 const MAX_REQUEST_BYTES = 65_536;
 const COOLDOWN_MS = 60_000;
