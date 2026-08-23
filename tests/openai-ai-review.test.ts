@@ -196,7 +196,7 @@ test("builds a bounded stateless Responses request without account identifiers",
   assert.equal(body.store, false);
   assert.equal(body.tool_choice, "required");
   assert.equal(body.max_tool_calls, 4);
-  assert.equal(body.max_output_tokens, 8_000);
+  assert.equal(body.max_output_tokens, 16_000);
   assert.deepEqual(body.reasoning, { effort: "xhigh", context: "current_turn" });
   assert.equal(body.tools[0].search_context_size, "medium");
   assert.equal(body.tools[0].filters.allowed_domains.includes("arsenal.com"), true);
@@ -217,7 +217,7 @@ test("uses the standard API key variable first and accepts the server-side FANTA
 test("pins the review to Sol and allowlisted high reasoning levels", () => {
   assert.equal(DEFAULT_OPENAI_REVIEW_MODEL, "gpt-5.6-sol");
   assert.equal(DEFAULT_OPENAI_REASONING_EFFORT, "xhigh");
-  assert.equal(DEFAULT_OPENAI_REVIEW_TIMEOUT_MS, 270_000);
+  assert.equal(DEFAULT_OPENAI_REVIEW_TIMEOUT_MS, 285_000);
   assert.equal(configuredOpenAiReviewModel(undefined), "gpt-5.6-sol");
   assert.equal(configuredOpenAiReasoningEffort(undefined), "xhigh");
   assert.equal(configuredOpenAiReasoningEffort(" max "), "max");
@@ -255,8 +255,14 @@ test("parses variable output order and keeps only deduplicated allowed citations
 
 test("fails closed on incomplete, refusal, missing research and malformed structured output", () => {
   assert.throws(
-    () => parseOpenAiReviewResponseBody({ status: "incomplete", output: [] }, 1),
-    (error: unknown) => error instanceof OpenAiReviewError && error.kind === "incomplete",
+    () => parseOpenAiReviewResponseBody({
+      status: "incomplete",
+      incomplete_details: { reason: "max_output_tokens" },
+      output: [],
+    }, 1),
+    (error: unknown) => error instanceof OpenAiReviewError &&
+      error.kind === "incomplete" &&
+      error.message.includes("max_output_tokens"),
   );
   assert.throws(
     () => parseOpenAiReviewResponseBody({

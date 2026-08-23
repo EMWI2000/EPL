@@ -13,7 +13,7 @@ import {
 
 export const DEFAULT_OPENAI_REVIEW_MODEL = "gpt-5.6-sol";
 export const DEFAULT_OPENAI_REASONING_EFFORT: AiReviewReasoningEffort = "xhigh";
-export const DEFAULT_OPENAI_REVIEW_TIMEOUT_MS = 270_000;
+export const DEFAULT_OPENAI_REVIEW_TIMEOUT_MS = 285_000;
 export const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 
 const ALLOWED_OPENAI_REVIEW_MODELS = new Set([DEFAULT_OPENAI_REVIEW_MODEL]);
@@ -338,7 +338,7 @@ export function buildOpenAiReviewRequestBody(
     tool_choice: "required",
     max_tool_calls: 4,
     include: ["web_search_call.action.sources"],
-    max_output_tokens: 8_000,
+    max_output_tokens: 16_000,
     text: {
       verbosity: "medium",
       format: {
@@ -386,8 +386,14 @@ export function parseOpenAiReviewResponseBody(
   const root = unknownRecord(value);
   if (!root) throw new OpenAiReviewError("invalid_response", "OpenAI returned invalid JSON.");
   if (root.status !== "completed") {
-    const kind = root.status === "incomplete" ? "incomplete" : "invalid_response";
-    throw new OpenAiReviewError(kind, "OpenAI did not complete the review.");
+    if (root.status === "incomplete") {
+      const details = unknownRecord(root.incomplete_details);
+      const safeReason = details?.reason === "max_output_tokens"
+        ? " because max_output_tokens was reached"
+        : "";
+      throw new OpenAiReviewError("incomplete", `OpenAI did not complete the review${safeReason}.`);
+    }
+    throw new OpenAiReviewError("invalid_response", "OpenAI did not complete the review.");
   }
   if (!Array.isArray(root.output)) {
     throw new OpenAiReviewError("invalid_response", "OpenAI returned no output.");
