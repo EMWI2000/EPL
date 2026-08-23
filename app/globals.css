@@ -1476,14 +1476,19 @@ main {
 }
 
 .ai-review__verdict small {
+  max-width: 250px;
   color: var(--review-accent);
   font-size: 11px;
   font-weight: 850;
-  white-space: nowrap;
+  line-height: 1.4;
+  text-align: right;
 }
 
 .ai-review__lead,
+.ai-review__execution,
 .ai-review__grid,
+.ai-review__strategy,
+.ai-review__qualitative,
 .ai-review__deadline,
 .ai-review__evidence,
 .ai-review__gaps {
@@ -1503,6 +1508,88 @@ main {
   color: var(--ink-soft);
   font-size: 14px;
   line-height: 1.65;
+}
+
+.ai-review__execution {
+  padding: 18px 20px;
+  border: 1px solid #cbd8cf;
+  border-left: 5px solid var(--review-accent);
+  border-radius: 15px;
+  background: white;
+}
+
+.ai-review__execution-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.ai-review__execution-heading h3 {
+  margin: 4px 0 0;
+  font-size: 19px;
+  letter-spacing: -0.025em;
+}
+
+.ai-review__execution-heading > span {
+  padding: 6px 9px;
+  border-radius: 8px;
+  background: var(--forest-deep);
+  color: white;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 10px;
+  font-weight: 850;
+}
+
+.ai-review__execution-facts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin: 16px 0;
+}
+
+.ai-review__execution-facts span {
+  display: grid;
+  gap: 3px;
+  padding: 10px;
+  border-radius: 10px;
+  background: #f4f7f3;
+  color: var(--forest-deep);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.ai-review__execution-facts strong {
+  color: #7a8882;
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.ai-review__execution > p {
+  margin: 7px 0 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.ai-review__execution > p > strong {
+  margin-right: 8px;
+  color: var(--forest-deep);
+}
+
+.ai-review__execution > p > small,
+.ai-review__execution-note {
+  color: #7b8983;
+  font-size: 10px;
+}
+
+.ai-review__execution-note {
+  display: block;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  line-height: 1.5;
 }
 
 .ai-review__grid {
@@ -1558,6 +1645,108 @@ main {
 .ai-review__list > p {
   margin: 0;
   color: #82908b;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ai-review__strategy {
+  padding: 20px 22px;
+  border: 1px solid #cddccf;
+  border-radius: 17px;
+  background: linear-gradient(135deg, #f7fbf2, #eef6ed);
+}
+
+.ai-review__strategy-heading,
+.ai-review__qualitative-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.ai-review__strategy-heading h3,
+.ai-review__qualitative-heading h3 {
+  margin: 4px 0 0;
+  font-size: 21px;
+  letter-spacing: -0.03em;
+}
+
+.ai-review__strategy-heading > span,
+.ai-review__qualitative-heading > span {
+  padding: 6px 9px;
+  border-radius: 999px;
+  background: var(--forest-deep);
+  color: white;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 9px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.ai-review__strategy > p {
+  max-width: 900px;
+  margin: 12px 0 17px;
+  color: var(--ink-soft);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.ai-review__strategy-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+  gap: 10px;
+}
+
+.ai-review__qualitative {
+  padding-top: 19px;
+  border-top: 1px solid var(--line);
+}
+
+.ai-review__qualitative-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.ai-review__qualitative-grid article {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: #fbfcf9;
+}
+
+.ai-review__qualitative-grid article > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 9px;
+}
+
+.ai-review__qualitative-grid article > div span {
+  color: var(--forest-mid);
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.ai-review__qualitative-grid article > div small,
+.ai-review__qualitative-grid footer {
+  color: #7d8a85;
+  font-size: 9px;
+  font-weight: 750;
+}
+
+.ai-review__qualitative-grid article > strong {
+  font-size: 13px;
+}
+
+.ai-review__qualitative-grid article > p {
+  margin: 6px 0 11px;
+  color: var(--ink-soft);
   font-size: 12px;
   line-height: 1.5;
 }
@@ -3565,7 +3754,10 @@ tbody tr:hover {
   }
 
   .ai-review__lead,
+  .ai-review__execution,
   .ai-review__grid,
+  .ai-review__strategy,
+  .ai-review__qualitative,
   .ai-review__deadline,
   .ai-review__evidence,
   .ai-review__gaps {
@@ -3573,10 +3765,46 @@ tbody tr:hover {
     margin-left: 18px;
   }
 
+  .ai-review__execution {
+    padding: 16px;
+  }
+
+  .ai-review__execution-heading {
+    display: grid;
+  }
+
+  .ai-review__execution-heading > span {
+    justify-self: start;
+  }
+
+  .ai-review__execution-facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .ai-review__deadline {
     grid-template-columns: 1fr;
     gap: 18px;
     padding: 18px;
+  }
+
+  .ai-review__strategy,
+  .ai-review__qualitative {
+    padding: 18px;
+  }
+
+  .ai-review__strategy-heading,
+  .ai-review__qualitative-heading {
+    display: grid;
+  }
+
+  .ai-review__strategy-heading > span,
+  .ai-review__qualitative-heading > span {
+    justify-self: start;
+  }
+
+  .ai-review__strategy-grid,
+  .ai-review__qualitative-grid {
+    grid-template-columns: 1fr;
   }
 
   .ai-review__meta {

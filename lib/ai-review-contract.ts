@@ -9,14 +9,51 @@ import type {
 } from "@/lib/planner-contract";
 
 export const AI_REVIEW_REQUEST_SCHEMA_VERSION = "fpl-ai-review-request-v1" as const;
-export const AI_REVIEW_RESPONSE_SCHEMA_VERSION = "fpl-ai-review-response-v1" as const;
+export const AI_REVIEW_RESPONSE_SCHEMA_VERSION = "fpl-ai-review-response-v2" as const;
 export const MAX_AI_REVIEW_RECOMMENDATION_AGE_MS = 24 * 60 * 60 * 1_000;
 
-export const AI_REVIEW_ALLOWED_SOURCE_DOMAINS = [
+const AI_REVIEW_BASE_SOURCE_DOMAINS = [
   "premierleague.com",
   "bbc.com",
   "bbc.co.uk",
 ] as const;
+
+const AI_REVIEW_OFFICIAL_CLUB_DOMAINS: Readonly<Record<string, string>> = {
+  ARS: "arsenal.com",
+  AVL: "avfc.co.uk",
+  BOU: "afcb.co.uk",
+  BRE: "brentfordfc.com",
+  BHA: "brightonandhovealbion.com",
+  CHE: "chelseafc.com",
+  COV: "ccfc.co.uk",
+  CRY: "cpfc.co.uk",
+  EVE: "evertonfc.com",
+  FUL: "fulhamfc.com",
+  HUL: "wearehullcity.co.uk",
+  IPS: "itfc.co.uk",
+  LEE: "leedsunited.com",
+  LIV: "liverpoolfc.com",
+  MCI: "mancity.com",
+  MUN: "manutd.com",
+  NEW: "newcastleunited.com",
+  NFO: "nottinghamforest.co.uk",
+  SUN: "safc.com",
+  TOT: "tottenhamhotspur.com",
+};
+
+export const AI_REVIEW_ALLOWED_SOURCE_DOMAINS: readonly string[] = [
+  ...AI_REVIEW_BASE_SOURCE_DOMAINS,
+  ...new Set(Object.values(AI_REVIEW_OFFICIAL_CLUB_DOMAINS)),
+];
+
+export function aiReviewSourceDomainsForTeams(teams: readonly string[]): string[] {
+  const domains = new Set<string>(AI_REVIEW_BASE_SOURCE_DOMAINS);
+  for (const team of teams) {
+    const domain = AI_REVIEW_OFFICIAL_CLUB_DOMAINS[team.trim().toUpperCase()];
+    if (domain) domains.add(domain);
+  }
+  return [...domains];
+}
 
 export type ManagerRankBand =
   | "top_10k"
@@ -91,9 +128,56 @@ export type AiReviewVerdict =
   | "wait_for_information"
   | "prefer_alternative";
 
+export type AiReviewReasoningEffort = "high" | "xhigh" | "max";
+
+export interface AiReviewStrategicWatchpoint {
+  subject: string;
+  reason: string;
+  trigger: string;
+  earliest_gameweek: number | null;
+}
+
+export interface AiReviewStrategicOutlook {
+  horizon_gameweeks: number;
+  posture:
+    | "preserve_flexibility"
+    | "attack_upside"
+    | "repair_minutes"
+    | "improve_structure"
+    | "insufficient_data";
+  summary: string;
+  priorities: string[];
+  watchpoints: AiReviewStrategicWatchpoint[];
+  scope: "advisory_only_no_unmodelled_transfers_or_chips";
+}
+
+export interface AiReviewQualitativeEvidence {
+  subject: string;
+  category:
+    | "availability"
+    | "minutes_role"
+    | "tactical_role"
+    | "set_pieces"
+    | "fixture_congestion"
+    | "manager_comments"
+    | "price_market"
+    | "other";
+  finding: string;
+  basis: "web_research" | "solver_interpretation" | "inference";
+  impact:
+    | "supports_best_action"
+    | "weakens_best_action"
+    | "supports_wait"
+    | "supports_alternative"
+    | "neutral";
+  freshness: "today" | "this_week" | "older" | "unknown";
+  confidence: "low" | "medium" | "high";
+}
+
 export interface AiReviewModelOutput {
   verdict: AiReviewVerdict;
   alternative_index: number | null;
+  execution_timing: "act_now" | "wait_for_team_news" | "monitor_price_window";
   headline: string;
   summary: string;
   rationale: string[];
@@ -103,6 +187,8 @@ export interface AiReviewModelOutput {
   evidence_summary: string;
   data_gaps: string[];
   confidence: "low" | "medium" | "high";
+  strategic_outlook: AiReviewStrategicOutlook;
+  qualitative_evidence: AiReviewQualitativeEvidence[];
 }
 
 export interface AiReviewSource {
@@ -116,6 +202,7 @@ export interface AiReviewResponse {
   recommendation_generated_at: string;
   target_event: number;
   model: string;
+  reasoning_effort: AiReviewReasoningEffort;
   review: AiReviewModelOutput;
   research: {
     performed: boolean;
@@ -177,6 +264,10 @@ export const AI_REVIEW_OUTPUT_SCHEMA = {
       type: ["integer", "null"],
       description: "Null for confirm_best_action and wait_for_information; otherwise the zero-based index of an existing solver alternative.",
     },
+    execution_timing: {
+      type: "string",
+      enum: ["act_now", "wait_for_team_news", "monitor_price_window"],
+    },
     headline: { type: "string" },
     summary: { type: "string" },
     rationale: {
@@ -193,7 +284,7 @@ export const AI_REVIEW_OUTPUT_SCHEMA = {
     },
     change_triggers: {
       type: "array",
-      minItems: 0,
+      minItems: 1,
       maxItems: 4,
       items: { type: "string" },
     },
@@ -211,10 +302,99 @@ export const AI_REVIEW_OUTPUT_SCHEMA = {
       items: { type: "string" },
     },
     confidence: { type: "string", enum: ["low", "medium", "high"] },
+    strategic_outlook: {
+      type: "object",
+      properties: {
+        horizon_gameweeks: { type: "integer", minimum: 1, maximum: 5 },
+        posture: {
+          type: "string",
+          enum: [
+            "preserve_flexibility",
+            "attack_upside",
+            "repair_minutes",
+            "improve_structure",
+            "insufficient_data",
+          ],
+        },
+        summary: { type: "string" },
+        priorities: {
+          type: "array",
+          minItems: 1,
+          maxItems: 4,
+          items: { type: "string" },
+        },
+        watchpoints: {
+          type: "array",
+          minItems: 1,
+          maxItems: 5,
+          items: {
+            type: "object",
+            properties: {
+              subject: { type: "string" },
+              reason: { type: "string" },
+              trigger: { type: "string" },
+              earliest_gameweek: { type: ["integer", "null"], minimum: 1, maximum: 38 },
+            },
+            required: ["subject", "reason", "trigger", "earliest_gameweek"],
+            additionalProperties: false,
+          },
+        },
+        scope: {
+          type: "string",
+          enum: ["advisory_only_no_unmodelled_transfers_or_chips"],
+        },
+      },
+      required: ["horizon_gameweeks", "posture", "summary", "priorities", "watchpoints", "scope"],
+      additionalProperties: false,
+    },
+    qualitative_evidence: {
+      type: "array",
+      minItems: 1,
+      maxItems: 6,
+      items: {
+        type: "object",
+        properties: {
+          subject: { type: "string" },
+          category: {
+            type: "string",
+            enum: [
+              "availability",
+              "minutes_role",
+              "tactical_role",
+              "set_pieces",
+              "fixture_congestion",
+              "manager_comments",
+              "price_market",
+              "other",
+            ],
+          },
+          finding: { type: "string" },
+          basis: {
+            type: "string",
+            enum: ["web_research", "solver_interpretation", "inference"],
+          },
+          impact: {
+            type: "string",
+            enum: [
+              "supports_best_action",
+              "weakens_best_action",
+              "supports_wait",
+              "supports_alternative",
+              "neutral",
+            ],
+          },
+          freshness: { type: "string", enum: ["today", "this_week", "older", "unknown"] },
+          confidence: { type: "string", enum: ["low", "medium", "high"] },
+        },
+        required: ["subject", "category", "finding", "basis", "impact", "freshness", "confidence"],
+        additionalProperties: false,
+      },
+    },
   },
   required: [
     "verdict",
     "alternative_index",
+    "execution_timing",
     "headline",
     "summary",
     "rationale",
@@ -224,6 +404,8 @@ export const AI_REVIEW_OUTPUT_SCHEMA = {
     "evidence_summary",
     "data_gaps",
     "confidence",
+    "strategic_outlook",
+    "qualitative_evidence",
   ],
   additionalProperties: false,
 } as const;
@@ -725,10 +907,117 @@ function boundedTextArray(
   );
 }
 
-export function parseAiReviewModelOutput(value: unknown, alternativeCount: number): AiReviewModelOutput {
+function validateStrategicOutlook(
+  value: unknown,
+  path: string,
+  expectedHorizon?: number,
+  targetEvent?: number,
+): AiReviewStrategicOutlook {
+  const root = exactRecord(value, path, [
+    "horizon_gameweeks",
+    "posture",
+    "summary",
+    "priorities",
+    "watchpoints",
+    "scope",
+  ]);
+  const horizon = integer(root.horizon_gameweeks, `${path}.horizon_gameweeks`, 1, 5);
+  if (expectedHorizon !== undefined && horizon !== expectedHorizon) {
+    fail(`${path}.horizon_gameweeks`, "must match the solver horizon");
+  }
+  oneOf(root.posture, `${path}.posture`, [
+    "preserve_flexibility",
+    "attack_upside",
+    "repair_minutes",
+    "improve_structure",
+    "insufficient_data",
+  ] as const);
+  boundedText(root.summary, `${path}.summary`, 900);
+  boundedTextArray(root.priorities, `${path}.priorities`, 1, 4, 280);
+  array(root.watchpoints, `${path}.watchpoints`, 1, 5).forEach((watchpoint, index) => {
+    const itemPath = `${path}.watchpoints[${index}]`;
+    const item = exactRecord(watchpoint, itemPath, [
+      "subject",
+      "reason",
+      "trigger",
+      "earliest_gameweek",
+    ]);
+    boundedText(item.subject, `${itemPath}.subject`, 100);
+    boundedText(item.reason, `${itemPath}.reason`, 280);
+    boundedText(item.trigger, `${itemPath}.trigger`, 280);
+    if (item.earliest_gameweek !== null) {
+      const earliest = integer(item.earliest_gameweek, `${itemPath}.earliest_gameweek`, 1, 38);
+      if (
+        targetEvent !== undefined &&
+        (earliest < targetEvent || earliest > targetEvent + horizon - 1)
+      ) {
+        fail(`${itemPath}.earliest_gameweek`, "must be inside the solver horizon");
+      }
+    }
+  });
+  literal(
+    root.scope,
+    `${path}.scope`,
+    "advisory_only_no_unmodelled_transfers_or_chips",
+  );
+  return root as unknown as AiReviewStrategicOutlook;
+}
+
+function validateQualitativeEvidence(
+  value: unknown,
+  path: string,
+): AiReviewQualitativeEvidence[] {
+  return array(value, path, 1, 6).map((evidence, index) => {
+    const itemPath = `${path}[${index}]`;
+    const item = exactRecord(evidence, itemPath, [
+      "subject",
+      "category",
+      "finding",
+      "basis",
+      "impact",
+      "freshness",
+      "confidence",
+    ]);
+    boundedText(item.subject, `${itemPath}.subject`, 100);
+    oneOf(item.category, `${itemPath}.category`, [
+      "availability",
+      "minutes_role",
+      "tactical_role",
+      "set_pieces",
+      "fixture_congestion",
+      "manager_comments",
+      "price_market",
+      "other",
+    ] as const);
+    boundedText(item.finding, `${itemPath}.finding`, 360);
+    oneOf(item.basis, `${itemPath}.basis`, [
+      "web_research",
+      "solver_interpretation",
+      "inference",
+    ] as const);
+    oneOf(item.impact, `${itemPath}.impact`, [
+      "supports_best_action",
+      "weakens_best_action",
+      "supports_wait",
+      "supports_alternative",
+      "neutral",
+    ] as const);
+    oneOf(item.freshness, `${itemPath}.freshness`, ["today", "this_week", "older", "unknown"] as const);
+    oneOf(item.confidence, `${itemPath}.confidence`, ["low", "medium", "high"] as const);
+    return item as unknown as AiReviewQualitativeEvidence;
+  });
+}
+
+export function parseAiReviewModelOutput(
+  value: unknown,
+  alternativeCount: number,
+  expectedHorizon?: number,
+  targetEvent?: number,
+): AiReviewModelOutput {
   const root = exactRecord(value, "review", [
     "verdict",
     "alternative_index",
+    "execution_timing",
     "headline",
     "summary",
     "rationale",
@@ -738,6 +1027,8 @@ export function parseAiReviewModelOutput(value: unknown, alternativeCount: numbe
     "evidence_summary",
     "data_gaps",
     "confidence",
+    "strategic_outlook",
+    "qualitative_evidence",
   ]);
   const verdict = oneOf(root.verdict, "review.verdict", [
     "confirm_best_action",
@@ -753,24 +1044,42 @@ export function parseAiReviewModelOutput(value: unknown, alternativeCount: numbe
   if (verdict !== "prefer_alternative" && alternativeIndex !== null) {
     fail("review.alternative_index", "must be null unless an alternative is preferred");
   }
+  const executionTiming = oneOf(root.execution_timing, "review.execution_timing", [
+    "act_now",
+    "wait_for_team_news",
+    "monitor_price_window",
+  ] as const);
+  if (verdict === "wait_for_information" && executionTiming === "act_now") {
+    fail("review.execution_timing", "cannot be act_now when the verdict is to wait");
+  }
   boundedText(root.headline, "review.headline", 140);
   boundedText(root.summary, "review.summary", 700);
   boundedTextArray(root.rationale, "review.rationale", 2, 4, 280);
   boundedTextArray(root.risks, "review.risks", 0, 4, 280);
-  boundedTextArray(root.change_triggers, "review.change_triggers", 0, 4, 280);
+  boundedTextArray(root.change_triggers, "review.change_triggers", 1, 4, 280);
   boundedTextArray(root.deadline_checklist, "review.deadline_checklist", 2, 5, 240);
-  boundedText(root.evidence_summary, "review.evidence_summary", 800);
+  boundedText(root.evidence_summary, "review.evidence_summary", 900);
   boundedTextArray(root.data_gaps, "review.data_gaps", 0, 4, 280);
   oneOf(root.confidence, "review.confidence", ["low", "medium", "high"] as const);
+  validateStrategicOutlook(
+    root.strategic_outlook,
+    "review.strategic_outlook",
+    expectedHorizon,
+    targetEvent,
+  );
+  validateQualitativeEvidence(root.qualitative_evidence, "review.qualitative_evidence");
   return root as unknown as AiReviewModelOutput;
 }
 
-export function isAllowedAiReviewSourceUrl(value: string): boolean {
+export function isAllowedAiReviewSourceUrlForDomains(
+  value: string,
+  allowedDomains: readonly string[],
+): boolean {
   try {
     const parsed = new URL(value);
-    if (parsed.protocol !== "https:" || parsed.username || parsed.password) return false;
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.port) return false;
     const host = parsed.hostname.toLowerCase();
-    return AI_REVIEW_ALLOWED_SOURCE_DOMAINS.some(
+    return allowedDomains.some(
       (domain) => host === domain || host.endsWith(`.${domain}`),
     );
   } catch {
@@ -778,21 +1087,31 @@ export function isAllowedAiReviewSourceUrl(value: string): boolean {
   }
 }
 
-export function parseAiReviewResponse(value: unknown, alternativeCount = 4): AiReviewResponse {
+export function isAllowedAiReviewSourceUrl(value: string): boolean {
+  return isAllowedAiReviewSourceUrlForDomains(value, AI_REVIEW_ALLOWED_SOURCE_DOMAINS);
+}
+
+export function parseAiReviewResponse(
+  value: unknown,
+  alternativeCount = 4,
+  expectedHorizon?: number,
+): AiReviewResponse {
   const root = exactRecord(value, "response", [
     "schema_version",
     "generated_at",
     "recommendation_generated_at",
     "target_event",
     "model",
+    "reasoning_effort",
     "review",
     "research",
   ]);
   literal(root.schema_version, "response.schema_version", AI_REVIEW_RESPONSE_SCHEMA_VERSION);
   isoUtc(root.generated_at, "response.generated_at");
   isoUtc(root.recommendation_generated_at, "response.recommendation_generated_at");
-  integer(root.target_event, "response.target_event", 1, 38);
+  const targetEvent = integer(root.target_event, "response.target_event", 1, 38);
   boundedText(root.model, "response.model", 80);
+  oneOf(root.reasoning_effort, "response.reasoning_effort", ["high", "xhigh", "max"] as const);
   const research = exactRecord(root.research, "response.research", ["performed", "sources"]);
   const performed = boolean(research.performed, "response.research.performed");
   const sources = array(research.sources, "response.research.sources", 0, 8).map((source, index) => {
@@ -809,7 +1128,12 @@ export function parseAiReviewResponse(value: unknown, alternativeCount = 4): AiR
   if (new Set(sources.map((source) => source.url)).size !== sources.length) {
     fail("response.research.sources", "must not contain duplicate URLs");
   }
-  const review = parseAiReviewModelOutput(root.review, alternativeCount);
+  const review = parseAiReviewModelOutput(
+    root.review,
+    alternativeCount,
+    expectedHorizon,
+    targetEvent,
+  );
   return {
     ...root,
     review,

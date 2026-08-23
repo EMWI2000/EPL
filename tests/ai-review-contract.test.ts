@@ -177,6 +177,7 @@ function reviewFixture(): AiReviewModelOutput {
   return {
     verdict: "confirm_best_action",
     alternative_index: null,
+    execution_timing: "act_now",
     headline: "Rul transferen og behold fleksibiliteten",
     summary: "Ingen af de kontrollerede nyheder ændrer solverens konklusion.",
     rationale: [
@@ -189,6 +190,28 @@ function reviewFixture(): AiReviewModelOutput {
     evidence_summary: "Der blev ikke fundet en bekræftet ændring i spillernes status.",
     data_gaps: ["Fremtidige transfersekvenser er ikke modelleret."],
     confidence: "medium",
+    strategic_outlook: {
+      horizon_gameweeks: 2,
+      posture: "preserve_flexibility",
+      summary: "Rulningen holder flest muligheder åbne gennem GW8.",
+      priorities: ["Bevar fleksibilitet.", "Overvåg start-XI-minutter."],
+      watchpoints: [{
+        subject: "Player 13",
+        reason: "Kaptajnens minutter er afgørende.",
+        trigger: "Genberegn ved holdnyt.",
+        earliest_gameweek: 7,
+      }],
+      scope: "advisory_only_no_unmodelled_transfers_or_chips",
+    },
+    qualitative_evidence: [{
+      subject: "Player 13",
+      category: "minutes_role",
+      finding: "Solveren estimerer en stabil rolle.",
+      basis: "solver_interpretation",
+      impact: "supports_best_action",
+      freshness: "today",
+      confidence: "medium",
+    }],
   };
 }
 
@@ -242,10 +265,10 @@ test("request validation rejects extra fields, mismatched manager and inconsiste
 
 test("model output can only select an existing solver action", () => {
   const best = reviewFixture();
-  assert.strictEqual(parseAiReviewModelOutput(best, 1), best);
+  assert.strictEqual(parseAiReviewModelOutput(best, 1, 2, 7), best);
 
   const alternative = { ...reviewFixture(), verdict: "prefer_alternative", alternative_index: 0 } as const;
-  const parsed = parseAiReviewModelOutput(alternative, 1);
+  const parsed = parseAiReviewModelOutput(alternative, 1, 2, 7);
   assert.equal(parsed.alternative_index, 0);
   assert.equal(actionForAiReview(plannerFixture(), parsed)?.transfers[0]?.in.name, "Player 100");
 
@@ -257,26 +280,47 @@ test("model output can only select an existing solver action", () => {
     () => parseAiReviewModelOutput({ ...best, invented_transfer: "Player X" }, 1),
     /unsupported invented_transfer/,
   );
+
+  assert.throws(
+    () => parseAiReviewModelOutput({
+      ...best,
+      verdict: "wait_for_information",
+      execution_timing: "act_now",
+    }, 1, 2, 7),
+    /execution_timing/,
+  );
+  assert.throws(
+    () => parseAiReviewModelOutput({
+      ...best,
+      strategic_outlook: { ...best.strategic_outlook, horizon_gameweeks: 3 },
+    }, 1, 2, 7),
+    /solver horizon/,
+  );
 });
 
 test("browser response validation accepts only deduplicated allowed HTTPS sources", () => {
   const response = {
-    schema_version: "fpl-ai-review-response-v1",
+    schema_version: "fpl-ai-review-response-v2",
     generated_at: "2026-08-23T12:02:00Z",
     recommendation_generated_at: "2026-08-23T12:01:00Z",
     target_event: 7,
-    model: "gpt-5.6-terra",
+    model: "gpt-5.6-sol",
+    reasoning_effort: "xhigh",
     review: reviewFixture(),
     research: {
       performed: true,
       sources: [{ title: "Premier League", url: "https://www.premierleague.com/news/123" }],
     },
   };
-  assert.deepEqual(parseAiReviewResponse(response, 1), response);
+  assert.deepEqual(parseAiReviewResponse(response, 1, 2), response);
 
   const unsafe = structuredClone(response);
   unsafe.research.sources[0].url = "https://attacker.example/fake-news";
   assert.throws(() => parseAiReviewResponse(unsafe, 1), /allowed HTTPS source/);
+
+  const nonDefaultPort = structuredClone(response);
+  nonDefaultPort.research.sources[0].url = "https://www.premierleague.com:444/news/123";
+  assert.throws(() => parseAiReviewResponse(nonDefaultPort, 1), /allowed HTTPS source/);
 
   const withoutEvidence = structuredClone(response);
   withoutEvidence.research.sources = [];

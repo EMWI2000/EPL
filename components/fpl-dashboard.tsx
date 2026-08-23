@@ -7,6 +7,7 @@ import {
   actionForAiReview,
   buildAiReviewRequest,
   parseAiReviewResponse,
+  type AiReviewQualitativeEvidence,
   type AiReviewResponse,
 } from "@/lib/ai-review-contract";
 import { resolveInitialFplManagerId } from "@/lib/fpl-manager-config";
@@ -621,6 +622,31 @@ function AiReviewList({ title, items }: { title: string; items: string[] }) {
   );
 }
 
+const qualitativeCategoryLabels: Record<AiReviewQualitativeEvidence["category"], string> = {
+  availability: "Tilgængelighed",
+  minutes_role: "Minutter og rolle",
+  tactical_role: "Taktisk rolle",
+  set_pieces: "Dødbolde",
+  fixture_congestion: "Kampprogram",
+  manager_comments: "Managerudtalelse",
+  price_market: "Pris og marked",
+  other: "Øvrigt signal",
+};
+
+const qualitativeBasisLabels: Record<AiReviewQualitativeEvidence["basis"], string> = {
+  web_research: "Webresearch, se samlet kildegrundlag",
+  solver_interpretation: "AI-fortolkning af solverdata",
+  inference: "AI-inferens",
+};
+
+const qualitativeImpactLabels: Record<AiReviewQualitativeEvidence["impact"], string> = {
+  supports_best_action: "Støtter hovedplanen",
+  weakens_best_action: "Svækkelse af hovedplanen",
+  supports_wait: "Støtter at vente",
+  supports_alternative: "Støtter plan B",
+  neutral: "Neutralt",
+};
+
 function AiReviewPanel({
   response,
   planner,
@@ -650,6 +676,44 @@ function AiReviewPanel({
     : selectedAction
       ? plannerActionLabel(selectedAction)
       : "Behold solverens plan";
+  const executionLabel = review?.execution_timing === "act_now"
+    ? "Handling kan udføres nu"
+    : review?.execution_timing === "monitor_price_window"
+      ? "Overvåg prisvinduet før handling"
+      : "Afvent holdnyt og genberegn";
+  const postureLabel = review?.strategic_outlook.posture === "preserve_flexibility"
+    ? "Bevar fleksibilitet"
+    : review?.strategic_outlook.posture === "attack_upside"
+      ? "Angrib upside"
+      : review?.strategic_outlook.posture === "repair_minutes"
+        ? "Reparér minutrisiko"
+        : review?.strategic_outlook.posture === "improve_structure"
+          ? "Forbedr trupstrukturen"
+          : "Utilstrækkeligt grundlag";
+  const horizonEnd = review
+    ? Math.min(38, planner.target_event + review.strategic_outlook.horizon_gameweeks - 1)
+    : planner.target_event;
+  const selectedGameweek = selectedAction?.gameweeks.find(
+    (gameweek) => gameweek.gameweek === planner.target_event,
+  );
+  const selectedPlayers = new Map(
+    planner.confirmed_state.squad.map((player) => [player.id, player.name]),
+  );
+  if (selectedAction) {
+    for (const transfer of selectedAction.transfers) {
+      selectedPlayers.delete(transfer.out_id);
+      selectedPlayers.set(transfer.in_id, transfer.in.name);
+    }
+  }
+  const selectedStarterNames = selectedGameweek?.starting_ids.map(
+    (id) => selectedPlayers.get(id) ?? `Spiller ${id}`,
+  ) ?? [];
+  const selectedBenchNames = selectedAction?.squad_ids
+    .filter((id) => !selectedGameweek?.starting_ids.includes(id))
+    .map((id) => selectedPlayers.get(id) ?? `Spiller ${id}`) ?? [];
+  const selectedCaptainName = selectedGameweek
+    ? selectedPlayers.get(selectedGameweek.captain_id) ?? `Spiller ${selectedGameweek.captain_id}`
+    : null;
 
   return (
     <section
@@ -661,19 +725,19 @@ function AiReviewPanel({
     >
       <div className="ai-review__rail" aria-hidden="true">
         <span>AI</span>
-        <small>2. vurdering</small>
+        <small>Samlet beslutning</small>
       </div>
       <div className="ai-review__body">
         <div className="ai-review__header">
           <div>
-            <p className="eyebrow">Deadlinebrief · GW{planner.target_event}</p>
-            <h2 id="ai-review-heading">Kvalificér næste træk med aktuel kontekst</h2>
-            <p>En uafhængig reviewer udfordrer den beregnede plan med holdnyt, minutrisiko, prisvindue og de allerede løste alternativer.</p>
+            <p className="eyebrow">Beslutningsbrief · GW{planner.target_event}</p>
+            <h2 id="ai-review-heading">Få én samlet handling for næste deadline</h2>
+            <p>GPT-5.6 Sol sammenholder solverens plan med horisontstrategi, holdnyt, taktisk rolle, minutrisiko og prisvindue.</p>
           </div>
           <button className="ai-review__button" type="button" onClick={onReview} disabled={isLoading || !canReview}>
             {isLoading
               ? <><span className="spinner spinner--button" /> Researcher …</>
-              : <><SparkIcon /> {!canReview ? "Opdatér planen først" : response ? "Opdatér brief" : "Kvalificér planen"}</>}
+              : <><SparkIcon /> {!canReview ? "Opdatér planen først" : response ? "Opdatér AI-plan" : "Lav AI-plan"}</>}
           </button>
         </div>
 
@@ -688,7 +752,7 @@ function AiReviewPanel({
           <div className="ai-review__empty">
             <div className="ai-review__empty-mark"><SparkIcon /></div>
             <div>
-              <strong>Få en second opinion før deadline</strong>
+              <strong>Få solver, strategi og aktuel research samlet</strong>
               <p>Reviewet sender kun en begrænset fodboldkontekst til OpenAI. OpenAI modtager ikke GitHub-identitet, manager-ID, sessioner eller nøgler.</p>
             </div>
             <span>{deadline ? `Deadline ${formatDateTime(deadline)}` : "Næste deadline"}</span>
@@ -698,7 +762,7 @@ function AiReviewPanel({
         {isLoading && !response && (
           <div className="ai-review__loading" role="status">
             <span className="spinner spinner--dark" />
-            <p><strong>Kontrollerer planen</strong>Sammenholder solverens resultat med aktuelle, kildebegrænsede nyheder.</p>
+            <p><strong>Bygger den samlede beslutning</strong>Sammenholder solverdata, flerugerskonsekvenser og aktuelle, kildebegrænsede nyheder.</p>
           </div>
         )}
 
@@ -707,10 +771,10 @@ function AiReviewPanel({
             <div className="ai-review__verdict">
               <span>{verdictLabel}</span>
               <div>
-                <p>AI-kvalificeret handling</p>
+                <p>Din anbefalede handling nu</p>
                 <strong>{actionLabel}</strong>
               </div>
-              <small>{review.confidence === "high" ? "Høj" : review.confidence === "medium" ? "Middel" : "Lav"} sikkerhed</small>
+              <small>{executionLabel} · {review.confidence === "high" ? "Høj" : review.confidence === "medium" ? "Middel" : "Lav"} sikkerhed</small>
             </div>
 
             <div className="ai-review__lead">
@@ -718,11 +782,82 @@ function AiReviewPanel({
               <p>{review.summary}</p>
             </div>
 
+            {selectedAction && selectedGameweek && (
+              <div className="ai-review__execution">
+                <div className="ai-review__execution-heading">
+                  <div>
+                    <p className="eyebrow">Præcis GW{planner.target_event}-plan · solverfakta</p>
+                    <h3>{plannerActionLabel(selectedAction)}</h3>
+                  </div>
+                  <span>{selectedGameweek.formation}</span>
+                </div>
+                <div className="ai-review__execution-facts">
+                  <span><strong>Kaptajn</strong>{selectedCaptainName}</span>
+                  <span><strong>Hit</strong>{selectedAction.hit_points === 0 ? "Ingen" : `−${selectedAction.hit_points} point`}</span>
+                  <span><strong>Bank efter</strong>{formatPrice(selectedAction.bank_after_tenths / 10)}</span>
+                  <span><strong>FT næste GW</strong>{selectedAction.free_transfers_next_gameweek}</span>
+                </div>
+                <p><strong>Start-XI</strong>{selectedStarterNames.join(" · ")}</p>
+                <p><strong>Reservepulje</strong>{selectedBenchNames.join(" · ")} <small>rækkefølgen er ikke modelleret i plan B</small></p>
+                {review.verdict === "prefer_alternative" && (
+                  <small className="ai-review__execution-note">Denne opstilling erstatter hovedplanens XI og kaptajn, som fortsat vises længere nede som sammenligningsgrundlag.</small>
+                )}
+              </div>
+            )}
+
             <div className="ai-review__grid">
               <AiReviewList title="Hvorfor nu" items={review.rationale} />
               <AiReviewList title="Risici" items={review.risks} />
               <AiReviewList title="Det ændrer rådet" items={review.change_triggers} />
             </div>
+
+            <div className="ai-review__strategy">
+              <div className="ai-review__strategy-heading">
+                <div>
+                  <p className="eyebrow">{review.strategic_outlook.horizon_gameweeks >= 3 ? "Langsigtet blik" : "Valgt analysehorisont"} · GW{planner.target_event}–GW{horizonEnd}</p>
+                  <h3>{postureLabel}</h3>
+                </div>
+                <span>{review.strategic_outlook.horizon_gameweeks} runder</span>
+              </div>
+              <p>{review.strategic_outlook.summary}</p>
+              <div className="ai-review__strategy-grid">
+                <AiReviewList title="Strategiske prioriteter" items={review.strategic_outlook.priorities} />
+                <AiReviewList
+                  title="Overvåg uge for uge"
+                  items={review.strategic_outlook.watchpoints.map((watchpoint) => {
+                    const gameweek = watchpoint.earliest_gameweek === null
+                      ? "Løbende"
+                      : `Fra GW${watchpoint.earliest_gameweek}`;
+                    return `${gameweek} · ${watchpoint.subject}: ${watchpoint.reason} Trigger: ${watchpoint.trigger}`;
+                  })}
+                />
+              </div>
+            </div>
+
+            {review.qualitative_evidence.length > 0 && (
+              <div className="ai-review__qualitative">
+                <div className="ai-review__qualitative-heading">
+                  <div>
+                    <p className="eyebrow">Kvalitative datapunkter</p>
+                    <h3>Det modellen har lagt oven på tallene</h3>
+                  </div>
+                  <span>{review.qualitative_evidence.length} signaler</span>
+                </div>
+                <div className="ai-review__qualitative-grid">
+                  {review.qualitative_evidence.map((evidence, index) => (
+                    <article key={`${evidence.subject}-${evidence.category}-${index}`}>
+                      <div>
+                        <span>{qualitativeCategoryLabels[evidence.category]}</span>
+                        <small>{evidence.confidence === "high" ? "Høj" : evidence.confidence === "medium" ? "Middel" : "Lav"} sikkerhed</small>
+                      </div>
+                      <strong>{evidence.subject}</strong>
+                      <p>{evidence.finding}</p>
+                      <footer>{qualitativeBasisLabels[evidence.basis]} · {qualitativeImpactLabels[evidence.impact]}</footer>
+                    </article>
+                  ))}
+                </div>
+              </div>
+            )}
 
             <div className="ai-review__deadline">
               <div>
@@ -741,7 +876,7 @@ function AiReviewPanel({
                 <p>{review.evidence_summary}</p>
               </div>
               {response.research.sources.length > 0 ? (
-                <div className="ai-review__sources" aria-label="Kilder til AI-reviewet">
+                <div className="ai-review__sources" aria-label="Researchkilder, citeret eller konsulteret af AI-reviewet">
                   {response.research.sources.map((source, index) => (
                     <a href={source.url} key={source.url} target="_blank" rel="noopener noreferrer">
                       <span>{index + 1}</span>{source.title}<ExternalLinkIcon />
@@ -761,7 +896,7 @@ function AiReviewPanel({
             )}
             <div className="ai-review__meta">
               <span>Research {formatDateTime(response.generated_at)}</span>
-              <span>{response.model} · server-side · ingen automatisk transfer</span>
+              <span>{response.model} · {response.reasoning_effort} reasoning · server-side · ingen automatisk transfer</span>
             </div>
           </div>
         )}
@@ -1306,7 +1441,11 @@ export function FplDashboard({
         const apiError = body as ApiError | null;
         throw new Error(apiError?.error?.message || `Serveren svarede med status ${response.status}.`);
       }
-      const parsed = parseAiReviewResponse(body, recommendation.planner.alternatives.length);
+      const parsed = parseAiReviewResponse(
+        body,
+        recommendation.planner.alternatives.length,
+        recommendation.meta.horizon,
+      );
       if (
         new Date(parsed.recommendation_generated_at).getTime() !== new Date(recommendation.meta.generated_at).getTime() ||
         parsed.target_event !== recommendation.planner.target_event

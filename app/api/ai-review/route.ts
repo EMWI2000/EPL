@@ -8,6 +8,8 @@ import {
   DEFAULT_OPENAI_REVIEW_MODEL,
   OpenAiReviewError,
   configuredOpenAiApiKey,
+  configuredOpenAiReasoningEffort,
+  configuredOpenAiReviewModel,
   requestOpenAiReview,
 } from "@/lib/openai-ai-review";
 import { parsePlannerPayload } from "@/lib/planner-contract";
@@ -15,11 +17,12 @@ import { hasValidPublicOrigin } from "@/lib/public-request-origin";
 import { getCurrentSession } from "@/lib/require-user";
 
 export const runtime = "nodejs";
-export const maxDuration = 60;
+export const maxDuration = 120;
 
 const MAX_REQUEST_BYTES = 65_536;
-const COOLDOWN_MS = 20_000;
+const COOLDOWN_MS = 60_000;
 const recentRequests = new Map<string, number>();
+const inFlightRequests = new Set<string>();
 
 function responseHeaders(extra: Record<string, string> = {}) {
   return {
@@ -41,17 +44,20 @@ function errorResponse(
   );
 }
 
-function consumeCooldown(key: string, now = Date.now()): number {
+function cooldownRemaining(key: string, now = Date.now()): number {
   const previous = recentRequests.get(key) ?? 0;
   const remaining = previous + COOLDOWN_MS - now;
   if (remaining > 0) return remaining;
+  return 0;
+}
+
+function markRequestFinished(key: string, now = Date.now()): void {
   recentRequests.set(key, now);
   if (recentRequests.size > 200) {
     for (const [candidate, timestamp] of recentRequests) {
       if (timestamp + COOLDOWN_MS <= now) recentRequests.delete(candidate);
     }
   }
-  return 0;
 }
 
 export async function POST(request: Request) {
@@ -125,9 +131,18 @@ export async function POST(request: Request) {
     );
   }
 
-  const cooldownRemaining = consumeCooldown(String(session.user.id));
-  if (cooldownRemaining > 0) {
-    const retryAfter = Math.max(1, Math.ceil(cooldownRemaining / 1_000));
+  const requestOwner = String(session.user.id);
+  if (inFlightRequests.has(requestOwner)) {
+    return errorResponse(
+      429,
+      "ai_in_progress",
+      "Et AI-review er allerede i gang. Vent på det aktuelle svar.",
+      { "Retry-After": "15" },
+    );
+  }
+  const remainingCooldown = cooldownRemaining(requestOwner);
+  if (remainingCooldown > 0) {
+    const retryAfter = Math.max(1, Math.ceil(remainingCooldown / 1_000));
     return errorResponse(
       429,
       "ai_cooldown",
@@ -136,9 +151,31 @@ export async function POST(request: Request) {
     );
   }
 
-  const model = process.env.OPENAI_MODEL?.trim() || DEFAULT_OPENAI_REVIEW_MODEL;
+  let model = DEFAULT_OPENAI_REVIEW_MODEL;
+  let reasoningEffort: ReturnType<typeof configuredOpenAiReasoningEffort>;
   try {
-    const result = await requestOpenAiReview(reviewRequest, { apiKey, model });
+    model = configuredOpenAiReviewModel(process.env.OPENAI_MODEL);
+    reasoningEffort = configuredOpenAiReasoningEffort(process.env.OPENAI_REASONING_EFFORT);
+  } catch {
+    return errorResponse(503, "ai_unconfigured", "AI-kvalificeringen er ikke konfigureret korrekt.");
+  }
+
+  inFlightRequests.add(requestOwner);
+  try {
+    const result = await requestOpenAiReview(reviewRequest, {
+      apiKey,
+      model,
+      reasoningEffort,
+    });
+    try {
+      assertAiReviewRequestIsFresh(reviewRequest);
+    } catch {
+      return errorResponse(
+        409,
+        "stale_recommendation",
+        "Deadline eller datagrundlag ændrede sig under AI-reviewet. Synkronisér og beregn igen.",
+      );
+    }
     return Response.json(
       {
         schema_version: AI_REVIEW_RESPONSE_SCHEMA_VERSION,
@@ -146,6 +183,7 @@ export async function POST(request: Request) {
         recommendation_generated_at: reviewRequest.recommendation_generated_at,
         target_event: reviewRequest.planner.target_event,
         model,
+        reasoning_effort: reasoningEffort,
         review: result.review,
         research: result.research,
       },
@@ -168,5 +206,8 @@ export async function POST(request: Request) {
       "ai_unavailable",
       "AI-kvalificeringen kunne ikke færdiggøres. Den beregnede FPL-plan er stadig gyldig.",
     );
+  } finally {
+    inFlightRequests.delete(requestOwner);
+    markRequestFinished(requestOwner);
   }
 }

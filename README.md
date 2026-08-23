@@ -20,7 +20,7 @@ Følgende er implementeret:
 - snapshots med metadata og atomisk skrivning til senere backtests
 - en ugeplanlægger, der indlæser det senest offentliggjorte managerhold og kræver bekræftelse af bank, frie transfers, priser og chipstatus
 - rullende transferanalyse med hold, én eller flere transfers, hits, halv prisgevinst ved salg og højst fem frie transfers efter FPL-reglerne
-- et eksplicit AI-deadlinebrief, der kan bekræfte solverens plan, anbefale at vente eller pege på et allerede beregnet alternativ
+- et eksplicit AI-deadlinebrief med GPT-5.6 Sol, meget høj reasoning, kvalitativ research og et betinget flerugersperspektiv
 - korrekt brug af FPL's `selling_price` for ejede spillere
 - lækagesikre deadline-folds, evalueringsmetrics og GW-parret bootstrap
 - en ML-pipeline med fælles featurekontrakt til træning og drift; modelartefakter er deaktiveret, indtil de er valideret
@@ -40,7 +40,7 @@ Planlæggeren sammenligner at rulle transferen med forskellige transfers til næ
 
 Efter en ugeplan er beregnet, kan brugeren aktivt bestille en second opinion. Next.js sender en stramt afgrænset fodboldkontekst til OpenAI Responses API: bred ranggruppe, bekræftet bank og frie transfers, solverens bedste plan og alternativer, start-XI, kaptajn, projektioner, minutter, usikkerhed og prissignaler. GitHub-identitet, manager-ID, snapshot-checksum, cookies og tokens fjernes, før API-kaldet foretages.
 
-Revieweren skal lave frisk webresearch på tilladte Premier League- og BBC-domæner. Den kan kun bekræfte bedste plan, anbefale at vente på konkret information eller vælge et nummereret solver-alternativ. Kilder vises som klikbare links. Kaldet er manuelt for at styre omkostninger, og en fejl skjuler aldrig den deterministiske anbefaling. `store: false` er aktiveret; OpenAI kan fortsat behandle API-indhold efter kontoens gældende data- og retentionvilkår.
+Revieweren kører som standard med GPT-5.6 Sol og `xhigh` reasoning. Den laver frisk webresearch på tilladte Premier League-, BBC- og relevante officielle klubdomæner og strukturerer holdnyt, taktisk rolle, minutter, dødbolde, kampprogram og prisrisiko som kvalitative signaler. Den kan kun bekræfte bedste plan, anbefale at vente på konkret information eller vælge et nummereret solver-alternativ. Den viser desuden et betinget outlook over den valgte 1-5-GW-horisont, men må ikke opfinde fremtidige transfers eller chips, som solveren ikke har modelleret. Kilder vises som klikbare links. Kaldet er manuelt for at styre omkostninger, og en fejl skjuler aldrig den deterministiske anbefaling. `store: false` er aktiveret; OpenAI kan fortsat behandle API-indhold efter kontoens gældende data- og retentionvilkår.
 
 ## Kør lokalt
 
@@ -85,7 +85,8 @@ Følgende miljøvariabler skal oprettes i Vercel og må aldrig gemmes i GitHub:
 | `FPL_MANAGER_ID` | offentligt FPL entry-ID, som automatisk synkroniseres efter login |
 | `INTERNAL_API_TOKEN` | mindst 32 tilfældige bytes mellem Next.js og Python |
 | `OPENAI_API_KEY` | server-side projektnøgle til det valgfrie AI-deadlinebrief; deploymenten accepterer også aliaset `FANTASY` |
-| `OPENAI_MODEL` | Responses-model; standard er `gpt-5.6-terra` |
+| `OPENAI_MODEL` | Responses-model; eneste tilladte produktionsmodel er `gpt-5.6-sol` |
+| `OPENAI_REASONING_EFFORT` | reasoning-niveau: `high`, `xhigh` (standard) eller `max` |
 | `SESSION_VERSION` | start med `1`; hæv værdien for at logge alle sessioner ud |
 
 GitHub OAuth App skal have produktionsadressen som Homepage URL og
