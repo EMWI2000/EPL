@@ -403,6 +403,7 @@ def test_generate_recommendation_truncates_horizon_at_gameweek_38(monkeypatch):
 
 def test_weekly_recommendation_rolls_when_no_transfer_candidate_exists(monkeypatch):
     pool = _synthetic_pool(horizon=2)
+    pool.loc[pool["id"] == 1, "status"] = "i"
     official = pd.DataFrame({"id": pool["id"]})
     fixtures = pd.DataFrame(
         {
@@ -435,6 +436,18 @@ def test_weekly_recommendation_rolls_when_no_transfer_candidate_exists(monkeypat
         lambda: (bootstrap, official, fixtures, teams),
     )
     monkeypatch.setattr(compute, "_build_forecast_pool", lambda *args: pool.copy())
+    real_sequential_optimizer = compute.optimize_two_deadline_sequence
+    observed_eligible_ids: set[int] = set()
+
+    def capture_sequential_eligibility(*args, **kwargs):
+        observed_eligible_ids.update(kwargs["eligible_transfer_in_ids"])
+        return real_sequential_optimizer(*args, **kwargs)
+
+    monkeypatch.setattr(
+        compute,
+        "optimize_two_deadline_sequence",
+        capture_sequential_eligibility,
+    )
     state = {
         "current_squad_ids": pool["id"].tolist(),
         "bank_tenths": 10,
@@ -466,6 +479,49 @@ def test_weekly_recommendation_rolls_when_no_transfer_candidate_exists(monkeypat
     assert response["planner"]["manager_id"] == 123
     assert response["planner"]["best_action"]["kind"] == "roll"
     assert response["planner"]["best_action"]["free_transfers_next_gameweek"] == 2
+    assert 1 not in observed_eligible_ids
+    assert response["planner"]["confirmed_state"]["squad"][0]["purchase_price_tenths"] == 50
+    assert response["planner"]["confirmed_state"]["squad"][0]["selling_price_tenths"] == 50
+    assert response["planner"]["method"]["next_deadline_transfer_modelled"] is True
+    sequential = response["planner"]["sequential"]
+    assert sequential["first_step_search"] == "explicit_bounded_transfer_plans"
+    assert sequential["future_price_assumption"] == "fixed_current_prices"
+    assert sequential["globally_optimal"] is False
+    assert sequential["best_sequence"]["first_action"] == {
+        "source": "best_action",
+        "alternative_index": None,
+    }
+    first, provisional = sequential["best_sequence"]["steps"]
+    assert first["target_event"] == 7
+    assert first["provisional"] is False
+    assert provisional["target_event"] == 8
+    assert provisional["provisional"] is True
+    assert provisional["bank_before_tenths"] == first["bank_after_tenths"]
+    assert provisional["free_transfers_before"] == first["free_transfers_next_gameweek"]
     assert response["summary"]["bank_tenths"] == 10
     assert len(response["team"]["squad"]) == 15
     json.dumps(response, allow_nan=False)
+
+    request_clock = iter([0.0, 1.0, 49.0])
+    monkeypatch.setattr(compute, "monotonic", lambda: next(request_clock))
+
+    def unexpected_sequential_call(*args, **kwargs):
+        raise AssertionError("optional sequence must be skipped after the safe deadline")
+
+    monkeypatch.setattr(
+        compute,
+        "optimize_two_deadline_sequence",
+        unexpected_sequential_call,
+    )
+    fallback = compute.generate_recommendation(
+        {
+            "horizon": 2,
+            "manager_id": 123,
+            "source_event": 6,
+            "manager_state": state,
+            "use_solio": False,
+        }
+    )
+    assert fallback["planner"]["sequential"] is None
+    assert fallback["planner"]["method"]["next_deadline_transfer_modelled"] is False
+    assert fallback["planner"]["best_action"]["kind"] == "roll"

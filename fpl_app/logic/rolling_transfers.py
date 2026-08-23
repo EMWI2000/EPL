@@ -698,6 +698,7 @@ def optimize_rolling_transfers(
     roll_ft_value_points: float = 1.0,
     plans_per_transfer_count: int = 5,
     bench_weights: Sequence[float] = DEFAULT_BENCH_WEIGHTS,
+    solver_budget_seconds: float = DEFAULT_SOLVER_BUDGET_SECONDS,
     solver: Optional[pulp.LpSolver] = None,
 ) -> RollingTransferResult:
     """Compare rolling with the best legal immediate transfer plans.
@@ -740,6 +741,9 @@ def optimize_rolling_transfers(
     roll_value = float(roll_ft_value_points)
     if not isfinite(roll_value) or roll_value < 0:
         raise RollingTransferError("roll_ft_value_points must be finite and non-negative")
+    budget_seconds = float(solver_budget_seconds)
+    if not isfinite(budget_seconds) or budget_seconds <= 0:
+        raise RollingTransferError("solver_budget_seconds must be finite and positive")
 
     weights = _numeric_weights(
         gw_weights if gw_weights is not None else DEFAULT_GW_WEIGHTS[:horizon],
@@ -751,7 +755,7 @@ def optimize_rolling_transfers(
         current_squad_ids,
         horizon,
     )
-    solver_deadline = monotonic() + DEFAULT_SOLVER_BUDGET_SECONDS
+    solver_deadline = monotonic() + budget_seconds
 
     roll_candidates = _solve_transfer_count(
         frame,

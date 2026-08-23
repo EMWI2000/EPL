@@ -161,6 +161,14 @@ function playerReference(id: number, position = playerPosition(id)) {
   };
 }
 
+function ownedPlayerReference(id: number, position = playerPosition(id)) {
+  return {
+    ...playerReference(id, position),
+    purchase_price_tenths: 50,
+    selling_price_tenths: 50,
+  };
+}
+
 function action(
   kind: "roll" | "transfer" = "roll",
   replacementId = 100,
@@ -232,10 +240,11 @@ function plannerPayload(): Record<string, any> {
       bank_tenths: 10,
       free_transfers: 1,
       no_active_chip_confirmed: true,
-      squad: Array.from({ length: 15 }, (_, index) => playerReference(index + 1)),
+      squad: Array.from({ length: 15 }, (_, index) => ownedPlayerReference(index + 1)),
     },
     best_action: action("roll"),
     alternatives: [action("transfer")],
+    sequential: null,
     method: {
       candidate_count: 45,
       plans_per_transfer_count: 5,
@@ -243,7 +252,90 @@ function plannerPayload(): Record<string, any> {
       maximum_immediate_transfers: 2,
       roll_ft_value_points: 0.8,
       chips_modelled: false,
+      next_deadline_transfer_modelled: false,
       future_transfers_modelled: false,
+    },
+  };
+}
+
+function sequentialPlan(payload: Record<string, any>): Record<string, any> {
+  const secondTransfer = {
+    out_id: 4,
+    in_id: 101,
+    position: "DEF",
+    out_purchase_price_tenths: 50,
+    out_current_price_tenths: 50,
+    out_selling_price_tenths: 50,
+    in_price_tenths: 50,
+    out: playerReference(4, "DEF"),
+    in: playerReference(101, "DEF"),
+  };
+  const secondSquad = [...payload.best_action.squad_ids];
+  secondSquad[secondSquad.indexOf(4)] = 101;
+  const secondStarters = [...payload.best_action.gameweeks[1].starting_ids];
+  secondStarters[secondStarters.indexOf(4)] = 101;
+  const firstWeightedPoints = 72.5;
+  const secondWeightedPoints = 73 * 0.85;
+  return {
+    horizon: 2,
+    gw_weights: [1, 0.85],
+    first_step_candidate_count: 2,
+    first_step_search: "explicit_bounded_transfer_plans",
+    future_price_assumption: "fixed_current_prices",
+    solver_proven_optimal_within_bounds: true,
+    globally_optimal: false,
+    best_sequence: {
+      first_action: {
+        source: "best_action",
+        alternative_index: null,
+      },
+      steps: [
+        {
+          deadline_offset: 1,
+          provisional: false,
+          target_event: 7,
+          kind: "roll",
+          transfer_count: 0,
+          transfers: [],
+          squad_ids: [...payload.best_action.squad_ids],
+          gameweeks: [structuredClone(payload.best_action.gameweeks[0])],
+          bank_before_tenths: 10,
+          bank_after_tenths: 10,
+          free_transfers_before: 1,
+          free_transfers_next_gameweek: 2,
+          hit_points: 0,
+          weighted_projected_points: firstWeightedPoints,
+          weighted_hit_cost_points: 0,
+        },
+        {
+          deadline_offset: 2,
+          provisional: true,
+          target_event: 8,
+          kind: "transfer",
+          transfer_count: 1,
+          transfers: [secondTransfer],
+          squad_ids: secondSquad,
+          gameweeks: [{
+            gameweek: 8,
+            starting_ids: secondStarters,
+            captain_id: 13,
+            formation: "3-4-3",
+            projected_points: 73,
+          }],
+          bank_before_tenths: 10,
+          bank_after_tenths: 10,
+          free_transfers_before: 2,
+          free_transfers_next_gameweek: 2,
+          hit_points: 0,
+          weighted_projected_points: secondWeightedPoints,
+          weighted_hit_cost_points: 0,
+        },
+      ],
+      weighted_projected_points: firstWeightedPoints + secondWeightedPoints,
+      total_hit_points: 0,
+      weighted_hit_cost_points: 0,
+      terminal_banked_ft_value_points: 0.8,
+      decision_value_points: firstWeightedPoints + secondWeightedPoints + 0.8,
     },
   };
 }
@@ -374,6 +466,95 @@ test("validates planner actions, enriched transfers, confirmed state, and method
   assert.equal(isPlannerPayload(fiveFreeTransfers), true);
 });
 
+test("validates an additive bounded two-deadline sequence and reconciles its totals", () => {
+  const payload = plannerPayload();
+  payload.sequential = sequentialPlan(payload);
+  payload.method.next_deadline_transfer_modelled = true;
+
+  const parsed = parsePlannerPayload(payload);
+
+  assert.strictEqual(parsed, payload);
+  assert.equal(parsed.sequential?.best_sequence.first_action.source, "best_action");
+  assert.equal(parsed.sequential?.best_sequence.steps[1].target_event, 8);
+  assert.equal(parsed.sequential?.best_sequence.steps[1].transfers[0].in_id, 101);
+  assert.equal(parsed.method.future_transfers_modelled, false);
+});
+
+test("sequential validation rejects unknown fields, a mismatched first action and broken chaining", () => {
+  const withSecret = plannerPayload();
+  withSecret.sequential = sequentialPlan(withSecret);
+  withSecret.sequential.api_token = "never-accept";
+  withSecret.method.next_deadline_transfer_modelled = true;
+  assert.throws(() => parsePlannerPayload(withSecret), PlannerContractError);
+
+  const firstActionMismatch = plannerPayload();
+  firstActionMismatch.sequential = sequentialPlan(firstActionMismatch);
+  firstActionMismatch.method.next_deadline_transfer_modelled = true;
+  firstActionMismatch.sequential.best_sequence.steps[0].gameweeks[0].projected_points = 73;
+  firstActionMismatch.sequential.best_sequence.steps[0].weighted_projected_points = 73;
+  assert.throws(
+    () => parsePlannerPayload(firstActionMismatch),
+    /must exactly match the selected existing action/,
+  );
+
+  const brokenSecondBank = plannerPayload();
+  brokenSecondBank.sequential = sequentialPlan(brokenSecondBank);
+  brokenSecondBank.method.next_deadline_transfer_modelled = true;
+  brokenSecondBank.sequential.best_sequence.steps[1].bank_before_tenths = 11;
+  brokenSecondBank.sequential.best_sequence.steps[1].bank_after_tenths = 11;
+  assert.throws(() => parsePlannerPayload(brokenSecondBank), /reconcile sequentially/);
+
+  const wrongTailGameweek = plannerPayload();
+  wrongTailGameweek.sequential = sequentialPlan(wrongTailGameweek);
+  wrongTailGameweek.method.next_deadline_transfer_modelled = true;
+  wrongTailGameweek.sequential.best_sequence.steps[1].gameweeks[0].gameweek = 9;
+  assert.throws(() => parsePlannerPayload(wrongTailGameweek), /must be 8/);
+
+  const changedOriginalPurchaseBasis = plannerPayload();
+  changedOriginalPurchaseBasis.sequential = sequentialPlan(changedOriginalPurchaseBasis);
+  changedOriginalPurchaseBasis.method.next_deadline_transfer_modelled = true;
+  const secondMove = changedOriginalPurchaseBasis.sequential.best_sequence.steps[1].transfers[0];
+  secondMove.out_purchase_price_tenths = 49;
+  secondMove.out_selling_price_tenths = 49;
+  changedOriginalPurchaseBasis.sequential.best_sequence.steps[1].bank_after_tenths = 9;
+  assert.throws(() => parsePlannerPayload(changedOriginalPurchaseBasis), /first-step purchase price/);
+
+  const undercountedCandidatePool = plannerPayload();
+  undercountedCandidatePool.sequential = sequentialPlan(undercountedCandidatePool);
+  undercountedCandidatePool.method.next_deadline_transfer_modelled = true;
+  undercountedCandidatePool.method.candidate_count = 16;
+  assert.throws(() => parsePlannerPayload(undercountedCandidatePool), /referenced candidate set/);
+});
+
+test("sequential validation requires reconciled totals and a matching method flag", () => {
+  const wrongTotal = plannerPayload();
+  wrongTotal.sequential = sequentialPlan(wrongTotal);
+  wrongTotal.method.next_deadline_transfer_modelled = true;
+  wrongTotal.sequential.best_sequence.decision_value_points += 1;
+  assert.throws(() => parsePlannerPayload(wrongTotal), /does not reconcile/);
+
+  const missingFlag = plannerPayload();
+  missingFlag.sequential = sequentialPlan(missingFlag);
+  assert.throws(() => parsePlannerPayload(missingFlag), /true exactly when/);
+
+  const falsePositiveFlag = plannerPayload();
+  falsePositiveFlag.method.next_deadline_transfer_modelled = true;
+  assert.throws(() => parsePlannerPayload(falsePositiveFlag), /true exactly when/);
+});
+
+test("a one-gameweek planner must not expose a sequential plan", () => {
+  const payload = plannerPayload();
+  payload.sequential = sequentialPlan(payload);
+  payload.method.next_deadline_transfer_modelled = true;
+  payload.best_action.gameweeks = payload.best_action.gameweeks.slice(0, 1);
+  payload.alternatives[0].gameweeks = payload.alternatives[0].gameweeks.slice(0, 1);
+  assert.throws(() => parsePlannerPayload(payload), /must be null/);
+
+  payload.sequential = null;
+  payload.method.next_deadline_transfer_modelled = false;
+  assert.equal(isPlannerPayload(payload), true);
+});
+
 test("planner validation rejects action and budget contradictions or extra fields", () => {
   const wrongKind = plannerPayload();
   wrongKind.best_action.kind = "transfer";
@@ -382,6 +563,13 @@ test("planner validation rejects action and budget contradictions or extra field
   const wrongBank = plannerPayload();
   wrongBank.alternatives[0].bank_after_tenths = 11;
   assert.equal(isPlannerPayload(wrongBank), false);
+
+  const changedConfirmedPriceBasis = plannerPayload();
+  const changedTransfer = changedConfirmedPriceBasis.alternatives[0].transfers[0];
+  changedTransfer.out_purchase_price_tenths = 49;
+  changedTransfer.out_selling_price_tenths = 49;
+  changedConfirmedPriceBasis.alternatives[0].bank_after_tenths = 9;
+  assert.throws(() => parsePlannerPayload(changedConfirmedPriceBasis), /confirmed purchase and selling prices/);
 
   const wrongSquad = plannerPayload();
   wrongSquad.alternatives[0].squad_ids[0] = 999;

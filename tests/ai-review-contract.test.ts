@@ -35,6 +35,14 @@ function player(id: number, forcedPosition = position(id)) {
   };
 }
 
+function ownedPlayer(id: number) {
+  return {
+    ...player(id),
+    purchase_price_tenths: 50,
+    selling_price_tenths: 50,
+  };
+}
+
 function action(kind: "roll" | "transfer", replacementId = 100) {
   const isTransfer = kind === "transfer";
   const transfers = isTransfer
@@ -92,10 +100,11 @@ function plannerFixture(): PlannerPayload {
       bank_tenths: 10,
       free_transfers: 1,
       no_active_chip_confirmed: true,
-      squad: Array.from({ length: 15 }, (_, index) => player(index + 1)),
+      squad: Array.from({ length: 15 }, (_, index) => ownedPlayer(index + 1)),
     },
     best_action: action("roll"),
     alternatives: [action("transfer")],
+    sequential: null,
     method: {
       candidate_count: 45,
       plans_per_transfer_count: 5,
@@ -103,6 +112,7 @@ function plannerFixture(): PlannerPayload {
       maximum_immediate_transfers: 2,
       roll_ft_value_points: 0.8,
       chips_modelled: false,
+      next_deadline_transfer_modelled: false,
       future_transfers_modelled: false,
     },
   });

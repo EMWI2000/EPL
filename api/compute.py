@@ -13,6 +13,7 @@ import hmac
 import json
 import logging
 import os
+from time import monotonic
 from typing import Any, Mapping
 
 import pandas as pd
@@ -34,9 +35,15 @@ from fpl_app.logic.squad_plan import (
     optimize_squad_plan,
 )
 from fpl_app.logic.rolling_transfers import (
+    DEFAULT_SOLVER_BUDGET_SECONDS as DEFAULT_ROLLING_SOLVER_BUDGET_SECONDS,
     RollingTransferError,
     TransferPlan,
     optimize_rolling_transfers,
+)
+from fpl_app.logic.sequential_transfers import (
+    BoundedSequentialTransferResult,
+    SequentialTransferError,
+    optimize_two_deadline_sequence,
 )
 from fpl_app.logic.projections import overlay_solio_projections
 from fpl_app.services.fpl_price_signals import (
@@ -80,6 +87,10 @@ DEFAULT_OPTIONS = {
     "state_fingerprint": None,
 }
 SOLIO_TIMEOUT_SECONDS = 6.0
+COMPUTE_SOFT_DEADLINE_SECONDS = 50.0
+COMPUTE_TAIL_RESERVE_SECONDS = 5.0
+MIN_SOLVER_BUDGET_SECONDS = 0.5
+SEQUENTIAL_SOLVER_BUDGET_SECONDS = 12.0
 FORECAST_VERSIONS = frozenset({"v2", "legacy"})
 OPTIMIZER_CANDIDATE_LIMITS = {"GKP": 6, "DEF": 15, "MID": 15, "FWD": 9}
 EXPERIMENTAL_NOTICE_DA = (
@@ -857,12 +868,119 @@ def _serialize_transfer_action(
     }
 
 
+def _bounded_first_step_candidates(rolling: Any) -> tuple[TransferPlan, ...]:
+    """Keep the executable best plan, roll and up to three other actions.
+
+    The resulting order is also the browser-visible action order: item zero is
+    ``best_action`` and subsequent items become the numbered alternatives.
+    Keeping roll in the bounded set makes the sequential comparison useful
+    even when four immediate transfer plans score above it.
+    """
+
+    candidates: list[TransferPlan] = []
+    for plan in (rolling.best_action, rolling.roll, *rolling.alternatives):
+        if plan not in candidates:
+            candidates.append(plan)
+        if len(candidates) == 5:
+            break
+    return tuple(candidates)
+
+
+def _serialize_sequential_plan(
+    result: BoundedSequentialTransferResult,
+    *,
+    pool: pd.DataFrame,
+    window: list[int],
+) -> dict[str, Any]:
+    by_id = pool.set_index("id", drop=False)
+    sequence = result.best_sequence
+    first_index = int(sequence.first_step_candidate_index)
+    first_action = {
+        "source": "best_action" if first_index == 0 else "alternative",
+        "alternative_index": None if first_index == 0 else first_index - 1,
+    }
+    steps: list[dict[str, Any]] = []
+    for step in sequence.steps:
+        transfers = [
+            {
+                **move.as_dict(),
+                "out": _planner_player_reference(by_id.loc[int(move.out_id)]),
+                "in": _planner_player_reference(by_id.loc[int(move.in_id)]),
+            }
+            for move in step.transfers
+        ]
+        kind = "roll" if step.transfer_count == 0 else (
+            "hit" if step.hit_points > 0 else "transfer"
+        )
+        steps.append(
+            {
+                "deadline_offset": int(step.deadline_offset),
+                "provisional": bool(step.provisional),
+                "target_event": int(window[step.deadline_offset - 1]),
+                "kind": kind,
+                "transfer_count": int(step.transfer_count),
+                "transfers": transfers,
+                "squad_ids": [int(player_id) for player_id in step.squad_ids],
+                "gameweeks": [
+                    {
+                        **gameweek.as_dict(),
+                        "gameweek": int(window[int(gameweek.gameweek) - 1]),
+                    }
+                    for gameweek in step.gameweeks
+                ],
+                "bank_before_tenths": int(step.bank_before_tenths),
+                "bank_after_tenths": int(step.bank_after_tenths),
+                "free_transfers_before": int(step.free_transfers_before),
+                "free_transfers_next_gameweek": int(
+                    step.free_transfers_next_gameweek
+                ),
+                "hit_points": int(step.hit_points),
+                "weighted_projected_points": _round(
+                    step.weighted_projected_points
+                ),
+                "weighted_hit_cost_points": _round(
+                    step.weighted_hit_cost_points
+                ),
+            }
+        )
+    return {
+        "horizon": int(result.horizon),
+        "gw_weights": [_round(weight) for weight in result.gw_weights],
+        "first_step_candidate_count": int(result.first_step_candidate_count),
+        "first_step_search": result.first_step_search,
+        "future_price_assumption": result.future_price_assumption,
+        "solver_proven_optimal_within_bounds": bool(
+            result.solver_proven_optimal_within_bounds
+        ),
+        "globally_optimal": bool(result.globally_optimal),
+        "best_sequence": {
+            "first_action": first_action,
+            "steps": steps,
+            "weighted_projected_points": _round(
+                sequence.weighted_projected_points
+            ),
+            "total_hit_points": int(sequence.total_hit_points),
+            "weighted_hit_cost_points": _round(
+                sequence.weighted_hit_cost_points
+            ),
+            "terminal_banked_ft_value_points": _round(
+                sequence.terminal_banked_ft_value_points
+            ),
+            "decision_value_points": _round(sequence.decision_value_points),
+        },
+    }
+
+
 def _build_weekly_plan(
     *,
     pool: pd.DataFrame,
     options: Mapping[str, Any],
     window: list[int],
+    request_deadline_monotonic: float | None = None,
 ) -> tuple[SquadPlanResult, pd.DataFrame, int, dict[str, Any]]:
+    deadline = request_deadline_monotonic
+    if deadline is None:
+        deadline = monotonic() + COMPUTE_SOFT_DEADLINE_SECONDS
     try:
         state = parse_manual_current_state(
             options["manager_state"],
@@ -921,6 +1039,14 @@ def _build_weekly_plan(
         owned_mask, "id"
     ].map(lambda value: prices[int(value)].selling_price_tenths)
 
+    immediate_budget = min(
+        DEFAULT_ROLLING_SOLVER_BUDGET_SECONDS,
+        deadline - monotonic() - COMPUTE_TAIL_RESERVE_SECONDS,
+    )
+    if immediate_budget < MIN_SOLVER_BUDGET_SECONDS:
+        raise RecommendationUnavailableError(
+            "The request ran out of safe compute time before transfer planning. Try again."
+        )
     try:
         rolling = optimize_rolling_transfers(
             optimizer_pool,
@@ -929,12 +1055,46 @@ def _build_weekly_plan(
             free_transfers=state.free_transfers,
             horizon=int(options["horizon"]),
             gw_weights=DEFAULT_GW_WEIGHTS[: int(options["horizon"])],
+            solver_budget_seconds=immediate_budget,
         )
     except RollingTransferError as exc:
         message = str(exc)
         if "selling_price" in message:
             message = "Player prices changed after sync; fetch the squad again."
         raise RecommendationUnavailableError(message) from exc
+
+    first_step_candidates = _bounded_first_step_candidates(rolling)
+    displayed_alternatives = first_step_candidates[1:]
+    sequential_result: BoundedSequentialTransferResult | None = None
+    sequential_budget = min(
+        SEQUENTIAL_SOLVER_BUDGET_SECONDS,
+        deadline - monotonic() - COMPUTE_TAIL_RESERVE_SECONDS,
+    )
+    if (
+        int(options["horizon"]) >= 2
+        and sequential_budget >= MIN_SOLVER_BUDGET_SECONDS
+    ):
+        try:
+            sequential_result = optimize_two_deadline_sequence(
+                optimizer_pool,
+                first_step_candidates,
+                horizon=int(options["horizon"]),
+                gw_weights=DEFAULT_GW_WEIGHTS[: int(options["horizon"])],
+                roll_ft_value_points=float(rolling.roll_ft_value_points),
+                eligible_transfer_in_ids={
+                    int(player_id)
+                    for player_id in optimizer_pool.loc[
+                        optimizer_pool["status"].isin(statuses),
+                        "id",
+                    ]
+                },
+                solver_budget_seconds=sequential_budget,
+            )
+        except SequentialTransferError:
+            # The executable immediate result remains valid if the optional
+            # bounded look-ahead cannot prove its optimum inside the serverless
+            # budget. Do not leak manager-specific solver details into logs.
+            LOGGER.warning("Bounded sequential transfer planning was unavailable")
 
     result = _transfer_plan_as_squad_result(
         rolling.best_action,
@@ -957,7 +1117,15 @@ def _build_weekly_plan(
             "free_transfers": int(state.free_transfers),
             "no_active_chip_confirmed": True,
             "squad": [
-                _planner_player_reference(current_by_id.loc[player_id])
+                {
+                    **_planner_player_reference(current_by_id.loc[player_id]),
+                    "purchase_price_tenths": int(
+                        prices[player_id].purchase_price_tenths
+                    ),
+                    "selling_price_tenths": int(
+                        prices[player_id].selling_price_tenths
+                    ),
+                }
                 for player_id in state.current_squad_ids
             ],
         },
@@ -974,8 +1142,17 @@ def _build_weekly_plan(
                 window=window,
                 roll=rolling.roll,
             )
-            for alternative in rolling.alternatives[:4]
+            for alternative in displayed_alternatives
         ],
+        "sequential": (
+            _serialize_sequential_plan(
+                sequential_result,
+                pool=optimizer_pool,
+                window=window,
+            )
+            if sequential_result is not None
+            else None
+        ),
         "method": {
             "candidate_count": int(len(optimizer_pool)),
             "plans_per_transfer_count": 5,
@@ -984,6 +1161,7 @@ def _build_weekly_plan(
             "roll_ft_value_points": _round(rolling.roll_ft_value_points),
             "chips_modelled": False,
             "future_transfers_modelled": False,
+            "next_deadline_transfer_modelled": sequential_result is not None,
         },
     }
     return result, visible_pool, len(optimizer_pool), planner_payload
@@ -1183,6 +1361,7 @@ def _serialize_recommendation(
 def generate_recommendation(payload: Any = None) -> dict[str, Any]:
     """Generate a JSON-serializable initial squad or weekly transfer plan."""
 
+    request_deadline_monotonic = monotonic() + COMPUTE_SOFT_DEADLINE_SECONDS
     options = validate_request_payload(payload)
     bootstrap, official_players, fixture_table, teams = _load_official_data()
     start_event = next_open_gameweek(bootstrap)
@@ -1222,6 +1401,7 @@ def generate_recommendation(payload: Any = None) -> dict[str, Any]:
             pool=pool,
             options=options,
             window=window,
+            request_deadline_monotonic=request_deadline_monotonic,
         )
     else:
         statuses = {"a", "d"} if options["include_doubtful"] else {"a"}

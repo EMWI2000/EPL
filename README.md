@@ -20,6 +20,8 @@ Følgende er implementeret:
 - snapshots med metadata og atomisk skrivning til senere backtests
 - en ugeplanlægger, der indlæser det senest offentliggjorte managerhold og kræver bekræftelse af bank, frie transfers, priser og chipstatus
 - rullende transferanalyse med hold, én eller flere transfers, hits, halv prisgevinst ved salg og højst fem frie transfers efter FPL-reglerne
+- en afgrænset to-deadline-model, der fører trup, bank, frie transfers og hits videre og viser næste skridt som foreløbigt under antagelse om uændrede priser
+- en frivillig beslutningsjournal, der kun gemmer et kompakt, valideret deadline-resumé i brugerens egen browser
 - et eksplicit AI-deadlinebrief med GPT-5.6 Sol, meget høj reasoning, kvalitativ research og et betinget flerugersperspektiv
 - korrekt brug af FPL's `selling_price` for ejede spillere
 - lækagesikre deadline-folds, evalueringsmetrics og GW-parret bootstrap
@@ -34,13 +36,17 @@ Ugeplanlæggeren tager udgangspunkt i managerens senest offentliggjorte hold. FP
 
 Når `FPL_MANAGER_ID` er konfigureret, hentes dette hold automatisk efter login, og anbefalingsruten afviser andre eller manglende manager-ID'er. Den generelle funktion til at bygge en ny trup skjules i den bundne produktionsapp, så alle viste anbefalinger tager udgangspunkt i det konfigurerede managerhold.
 
-Planlæggeren sammenligner at rulle transferen med forskellige transfers til næste deadline. Hver plan vurderes over den valgte prognosehorisont. Den medregner transferhits, bænkens forventede bidrag ved udeblivelser og de særlige salgsprisregler. For transferantal 1-2 kan den vise flere alternativer; for 3-5 beregner den én bedst plan pr. antal. Snapshot-checksummen identificerer den synkroniserede tilstand, men serveren kontrollerer ikke, om managerens hold siden er ændret.
+Planlæggeren sammenligner at rulle transferen med forskellige transfers til næste deadline. Hver plan vurderes over den valgte prognosehorisont. Den medregner transferhits, bænkens forventede bidrag ved udeblivelser og de særlige salgsprisregler. For transferantal 1-2 kan den vise flere alternativer; for 3-5 beregner den én bedst plan pr. antal.
+
+Ved en horisont på mindst to gameweeks beregner den desuden én afgrænset to-deadline-rute. Første skridt vælges blandt de allerede validerede og viste handlinger; næste skridt optimeres med den resulterende trup, bank og FT-status. Det næste skridt er ikke en global flerugersfacitliste: priser holdes faste, kandidatfeltet er afgrænset, og handlingen skal genberegnes ved næste deadline. Hvis ekstramodellen ikke når et bevist resultat inden tidsbudgettet, bevares den almindelige anbefaling uden en fremtidsrute. Snapshot-checksummen identificerer den synkroniserede tilstand, men serveren kontrollerer ikke, om managerens hold siden er ændret.
+
+Efter kontrol kan den viste anbefaling gemmes i en lokal beslutningsjournal. Den indeholder kun deadline, modelversion, bekræftet bank/FT, den valgte solver- eller AI-handling, kompakte transfers samt den valgte plans kaptajn. Manager-ID, GitHub-identitet, tokens, rå AI-output og hele API-svaret gemmes ikke. Journalen sendes ikke tilbage til beregningen eller OpenAI og kan eksporteres eller slettes fra browseren.
 
 ### AI-kvalificering til næste deadline
 
-Efter en ugeplan er beregnet, kan brugeren aktivt bestille en second opinion. Next.js sender en stramt afgrænset fodboldkontekst til OpenAI Responses API: bred ranggruppe, bekræftet bank og frie transfers, solverens bedste plan og alternativer, start-XI, kaptajn, projektioner, minutter, usikkerhed og prissignaler. GitHub-identitet, manager-ID, snapshot-checksum, cookies og tokens fjernes, før API-kaldet foretages.
+Efter en ugeplan er beregnet, kan brugeren aktivt bestille en second opinion. Next.js sender en stramt afgrænset fodboldkontekst til OpenAI Responses API: bred ranggruppe, bekræftet bank og frie transfers, solverens bedste plan og alternativer, den foreløbige næste-deadline-rute når den findes, start-XI, kaptajn, projektioner, minutter, usikkerhed og prissignaler. GitHub-identitet, manager-ID, snapshot-checksum, cookies, beslutningsjournal og tokens fjernes, før API-kaldet foretages.
 
-Revieweren kører som standard med GPT-5.6 Sol og `xhigh` reasoning. Den laver frisk webresearch på tilladte Premier League-, BBC- og relevante officielle klubdomæner og strukturerer holdnyt, taktisk rolle, minutter, dødbolde, kampprogram og prisrisiko som kvalitative signaler. Den kan kun bekræfte bedste plan, anbefale at vente på konkret information eller vælge et nummereret solver-alternativ. Den viser desuden et betinget outlook over den valgte 1-5-GW-horisont, men må ikke opfinde fremtidige transfers eller chips, som solveren ikke har modelleret. Kilder vises som klikbare links. Kaldet er manuelt for at styre omkostninger og kan tage flere minutter ved `xhigh`; en fejl skjuler aldrig den deterministiske anbefaling. `store: false` er aktiveret; OpenAI kan fortsat behandle API-indhold efter kontoens gældende data- og retentionvilkår.
+Revieweren kører som standard med GPT-5.6 Sol og `xhigh` reasoning. Den laver frisk webresearch på tilladte Premier League-, BBC- og relevante officielle klubdomæner og strukturerer holdnyt, taktisk rolle, minutter, dødbolde, kampprogram og prisrisiko som kvalitative signaler. Den kan kun bekræfte bedste plan, anbefale at vente på konkret information eller vælge et nummereret solver-alternativ. Den foreløbige næste-deadline-rute må kun bruges til at vurdere struktur og fleksibilitet, aldrig præsenteres som en handling nu eller en låst fremtidsplan. Komplette transfersekvenser og chips er fortsat ikke modelleret. Kilder vises som klikbare links. Kaldet er manuelt for at styre omkostninger og kan tage flere minutter ved `xhigh`; en fejl skjuler aldrig den deterministiske anbefaling. `store: false` er aktiveret; OpenAI kan fortsat behandle API-indhold efter kontoens gældende data- og retentionvilkår.
 
 ## Kør lokalt
 
@@ -134,7 +140,8 @@ Browser -> GitHub-login -> Next.js BFF
 2. Kør walk-forward-backtest mod legacy og eventuelle lovligt indsamlede benchmarks. Rapportér MAE, RMSE, kalibrering, Brier-score og captain regret.
 3. Kalibrér minut- og tilgængelighedsmodellen. Justér priorstyrke og shortlist ud fra beslutningsregret.
 4. Sæt kun et ML-modelartefakt i drift, hvis det slår de simple baselines på uafhængige gameweeks.
-5. Udvid ugeplanlæggeren med fremtidige transfersekvenser, deadlinehistorik og særskilt analyse af chips. Alle FPL-handlinger forbliver manuelle.
+5. Evaluer to-deadline-modellen mod gemte deadlines, før kandidatfeltet eller horisonten udvides.
+6. Tilføj først komplette transfersekvenser og særskilt analyse af chips, når runtime, datagrundlag og backtests kan bære det. Alle FPL-handlinger forbliver manuelle.
 
 ## Sikkerhed og ansvar
 

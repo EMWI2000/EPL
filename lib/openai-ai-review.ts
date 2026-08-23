@@ -37,7 +37,7 @@ Du skal bruge webresearch til at kontrollere aktuelle holdnyheder, skader, karan
 
 Adskil webresearch, din fortolkning af solverdata og dine egne inferenser i qualitative_evidence. Brug kun basis=web_research, når den udførte research faktisk understøtter fundet, og basis=solver_interpretation for din kvalitative læsning af de leverede tal. Disse betegnelser er ikke en per-påstand-verifikation. Angiv lavere confidence ved indirekte, gammel eller modstridende evidens. Returnér mindst ét kvalitativt datapunkt og ét konkret watchpoint. strategic_outlook skal dække præcis forecast.horizon_gameweeks og forklare, hvad dagens valg betyder for de kommende runder. Watchpoints skal ligge inden for horisonten eller have earliest_gameweek=null.
 
-Chips og fremtidige transfersekvenser er ikke modelleret. Anbefal derfor ikke en chip eller en transfer, som ikke findes i de leverede solverhandlinger. Den langsigtede del må kun være rådgivende og betinget; den må ikke opfinde låste fremtidige transfers. Brug scope=advisory_only_no_unmodelled_transfers_or_chips. Appen udfører aldrig transfers. Giv ingen garanti for udfaldet.
+Chips og komplette fremtidige transfersekvenser er ikke modelleret. Hvis solver.next_deadline_preview findes, er den én afgrænset, foreløbig handling ved næste deadline under antagelse om uændrede priser. Brug den til at vurdere dagens trupstruktur og fleksibilitet, men præsenter den aldrig som en handling, der skal udføres nu, eller som en låst fremtidsplan. Dagens anbefaling må stadig kun være en af de leverede solverhandlinger. Anbefal ingen chip. Brug scope=advisory_only_no_unmodelled_transfers_or_chips. Appen udfører aldrig transfers. Giv ingen garanti for udfaldet.
 
 Sæt alternative_index til null ved confirm_best_action og wait_for_information. Ved prefer_alternative skal den være det 0-baserede alternative_index fra præcis ét eksisterende solver-alternativ. execution_timing må ikke være act_now, hvis verdict er wait_for_information. Hold headline under 140 tegn, summary under 700 tegn, evidence_summary og strategic_outlook.summary under 900 tegn, hvert rationale/risiko/change-trigger/data-gap/prioritet/watchpoint under 280 tegn, hvert qualitative_evidence.finding under 360 tegn og hvert checklist-punkt under 240 tegn.`;
 
@@ -218,12 +218,49 @@ function compactAction(action: AiReviewRequest["planner"]["best_action"], index?
   };
 }
 
+function compactSequentialPlan(plan: NonNullable<AiReviewRequest["planner"]["sequential"]>) {
+  const [current, provisional] = plan.best_sequence.steps;
+  const compactStep = (step: typeof current) => ({
+    target_gameweek: step.target_event,
+    status: step.provisional ? "provisional_recalculate_next_deadline" : "executable_now",
+    kind: step.kind,
+    transfers: step.transfers.map((transfer) => ({
+      out: safeDataText(transfer.out.name, 80),
+      in: safeDataText(transfer.in.name, 80),
+      position: transfer.position,
+      selling_price_m: priceInMillions(transfer.out_selling_price_tenths),
+      buying_price_m: priceInMillions(transfer.in_price_tenths),
+    })),
+    hit_points: step.hit_points,
+    bank_after_m: priceInMillions(step.bank_after_tenths),
+    free_transfers_next_gameweek: step.free_transfers_next_gameweek,
+    weighted_projected_points: step.weighted_projected_points,
+    gameweeks: step.gameweeks.map((gameweek) => ({
+      gameweek: gameweek.gameweek,
+      projected_points: gameweek.projected_points,
+    })),
+  });
+  return {
+    first_action_reference: plan.best_sequence.first_action,
+    current_step: compactStep(current),
+    next_deadline_step: compactStep(provisional),
+    horizon_gameweeks: plan.horizon,
+    sequence_decision_value_points: plan.best_sequence.decision_value_points,
+    terminal_banked_ft_value_points: plan.best_sequence.terminal_banked_ft_value_points,
+    first_step_candidate_count: plan.first_step_candidate_count,
+    search_scope: plan.first_step_search,
+    future_price_assumption: plan.future_price_assumption,
+    optimal_within_bounded_search: plan.solver_proven_optimal_within_bounds,
+    globally_optimal: plan.globally_optimal,
+  };
+}
+
 export function buildOpenAiReviewContext(request: AiReviewRequest) {
   const names = new Map(request.squad_context.map((player) => [player.id, safeDataText(player.name, 80)]));
   const playerName = (id: number) => names.get(id) ?? "Ukendt spiller";
 
   return {
-    context_schema: "fpl-ai-review-context-v2",
+    context_schema: "fpl-ai-review-context-v3",
     timing: {
       recommendation_generated_at: request.recommendation_generated_at,
       state_observed_at: request.state_observed_at,
@@ -249,11 +286,15 @@ export function buildOpenAiReviewContext(request: AiReviewRequest) {
       doubtful_players_included: request.forecast.include_doubtful,
       price_signals_available: request.forecast.price_signals_available,
       chips_modelled: request.planner.method.chips_modelled,
+      next_deadline_transfer_modelled: request.planner.method.next_deadline_transfer_modelled,
       future_transfer_sequences_modelled: request.planner.method.future_transfers_modelled,
     },
     solver: {
       best_action: compactAction(request.planner.best_action),
       alternatives: request.planner.alternatives.map((action, index) => compactAction(action, index)),
+      next_deadline_preview: request.planner.sequential === null
+        ? null
+        : compactSequentialPlan(request.planner.sequential),
     },
     next_gameweek_lineup: {
       formation: request.lineup.formation,
@@ -299,6 +340,9 @@ function reviewSourceDomains(request: AiReviewRequest): string[] {
     ...[request.planner.best_action, ...request.planner.alternatives].flatMap((action) =>
       action.transfers.flatMap((transfer) => [transfer.out.team, transfer.in.team]),
     ),
+    ...(request.planner.sequential?.best_sequence.steps[1].transfers.flatMap(
+      (transfer) => [transfer.out.team, transfer.in.team],
+    ) ?? []),
   ];
   return aiReviewSourceDomainsForTeams(teams);
 }

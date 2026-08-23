@@ -153,6 +153,11 @@ export interface PlannerPlayerReference {
   price_signal: OfficialPriceSignal | null;
 }
 
+export interface PlannerOwnedPlayerReference extends PlannerPlayerReference {
+  purchase_price_tenths: number;
+  selling_price_tenths: number;
+}
+
 export interface EnrichedTransfer {
   out_id: number;
   in_id: number;
@@ -194,6 +199,46 @@ export interface PlannerAction {
   explanation: string;
 }
 
+export interface PlannerSequentialStep {
+  deadline_offset: 1 | 2;
+  provisional: boolean;
+  target_event: number;
+  kind: PlannerActionKind;
+  transfer_count: number;
+  transfers: EnrichedTransfer[];
+  squad_ids: number[];
+  gameweeks: PlannerActionGameweek[];
+  bank_before_tenths: number;
+  bank_after_tenths: number;
+  free_transfers_before: number;
+  free_transfers_next_gameweek: number;
+  hit_points: number;
+  weighted_projected_points: number;
+  weighted_hit_cost_points: number;
+}
+
+export interface PlannerSequentialPlan {
+  horizon: number;
+  gw_weights: number[];
+  first_step_candidate_count: number;
+  first_step_search: "explicit_bounded_transfer_plans";
+  future_price_assumption: "fixed_current_prices";
+  solver_proven_optimal_within_bounds: true;
+  globally_optimal: false;
+  best_sequence: {
+    first_action: {
+      source: "best_action" | "alternative";
+      alternative_index: number | null;
+    };
+    steps: [PlannerSequentialStep, PlannerSequentialStep];
+    weighted_projected_points: number;
+    total_hit_points: number;
+    weighted_hit_cost_points: number;
+    terminal_banked_ft_value_points: number;
+    decision_value_points: number;
+  };
+}
+
 export interface PlannerPayload {
   manager_id: number;
   state_fingerprint: string | null;
@@ -203,10 +248,11 @@ export interface PlannerPayload {
     bank_tenths: number;
     free_transfers: number;
     no_active_chip_confirmed: true;
-    squad: PlannerPlayerReference[];
+    squad: PlannerOwnedPlayerReference[];
   };
   best_action: PlannerAction;
   alternatives: PlannerAction[];
+  sequential: PlannerSequentialPlan | null;
   method: {
     candidate_count: number;
     plans_per_transfer_count: 5;
@@ -214,6 +260,7 @@ export interface PlannerPayload {
     maximum_immediate_transfers: number;
     roll_ft_value_points: number;
     chips_modelled: false;
+    next_deadline_transfer_modelled: boolean;
     future_transfers_modelled: false;
   };
 }
@@ -332,7 +379,7 @@ function oneOf<T extends string>(value: unknown, path: string, choices: readonly
   return value as T;
 }
 
-function literal<T extends string | number | boolean>(value: unknown, path: string, expected: T): T {
+function literal<T extends string | number | boolean | null>(value: unknown, path: string, expected: T): T {
   if (value !== expected) fail(path, `must be ${JSON.stringify(expected)}`);
   return expected;
 }
@@ -739,6 +786,28 @@ function validatePlayerReference(value: unknown, path: string): PlannerPlayerRef
   return row as unknown as PlannerPlayerReference;
 }
 
+function validateOwnedPlayerReference(value: unknown, path: string): PlannerOwnedPlayerReference {
+  const row = exactRecord(value, path, [
+    "id", "name", "team", "position", "price_tenths", "status", "price_signal",
+    "purchase_price_tenths", "selling_price_tenths",
+  ]);
+  const reference = validatePlayerReference({
+    id: row.id,
+    name: row.name,
+    team: row.team,
+    position: row.position,
+    price_tenths: row.price_tenths,
+    status: row.status,
+    price_signal: row.price_signal,
+  }, path);
+  const purchase = integer(row.purchase_price_tenths, `${path}.purchase_price_tenths`, 1, 500);
+  const selling = integer(row.selling_price_tenths, `${path}.selling_price_tenths`, 1, 500);
+  if (selling !== sellingPrice(purchase, reference.price_tenths)) {
+    fail(`${path}.selling_price_tenths`, "does not follow the FPL half-profit rule");
+  }
+  return { ...reference, purchase_price_tenths: purchase, selling_price_tenths: selling };
+}
+
 function validateFormation(gameweek: UnknownRecord, path: string, squad: Map<number, PlannerPlayerReference>): void {
   const starters = uniqueIntegers(gameweek.starting_ids, `${path}.starting_ids`, 11);
   for (const id of starters) if (!squad.has(id)) fail(`${path}.starting_ids`, `contains player ${id} outside action squad`);
@@ -753,7 +822,15 @@ function validateFormation(gameweek: UnknownRecord, path: string, squad: Map<num
   finiteNumber(gameweek.projected_points, `${path}.projected_points`, 0);
 }
 
-function validateAction(value: unknown, path: string, confirmed: Map<number, PlannerPlayerReference>, bank: number, freeTransfers: number, targetEvent: number): PlannerAction {
+function validateAction(
+  value: unknown,
+  path: string,
+  confirmed: Map<number, PlannerPlayerReference>,
+  confirmedPrices: ReadonlyMap<number, { purchase: number; selling: number }>,
+  bank: number,
+  freeTransfers: number,
+  targetEvent: number,
+): PlannerAction {
   const row = exactRecord(value, path, [
     "kind", "transfer_count", "transfers", "squad_ids", "gameweeks", "bank_before_tenths",
     "bank_after_tenths", "free_transfers_before", "free_transfers_next_gameweek", "hit_points",
@@ -790,6 +867,14 @@ function validateAction(value: unknown, path: string, confirmed: Map<number, Pla
     if (out.id !== outId || incoming.id !== inId || out.position !== position || incoming.position !== position) fail(transferPath, "enriched players must match the transfer ids and position");
     if (out.price_tenths !== current || incoming.price_tenths !== inPrice || selling !== sellingPrice(purchase, current)) fail(transferPath, "price fields are inconsistent");
     if (!sameJson(out, confirmed.get(outId))) fail(`${transferPath}.out`, "must match the confirmed player reference");
+    const confirmedPrice = confirmedPrices.get(outId);
+    if (
+      confirmedPrice === undefined ||
+      purchase !== confirmedPrice.purchase ||
+      selling !== confirmedPrice.selling
+    ) {
+      fail(transferPath, "must use the confirmed purchase and selling prices");
+    }
     actionSquad.delete(outId);
     actionSquad.set(inId, incoming);
     bankDelta += selling - inPrice;
@@ -830,10 +915,450 @@ function validateAction(value: unknown, path: string, confirmed: Map<number, Pla
   return row as unknown as PlannerAction;
 }
 
+function resultingSquad(
+  initial: ReadonlyMap<number, PlannerPlayerReference>,
+  transfers: readonly EnrichedTransfer[],
+): Map<number, PlannerPlayerReference> {
+  const result = new Map(initial);
+  for (const transfer of transfers) {
+    result.delete(transfer.out_id);
+    result.set(transfer.in_id, transfer.in);
+  }
+  return result;
+}
+
+function closeEnough(left: number, right: number): boolean {
+  return Math.abs(left - right) <= 0.005;
+}
+
+function reconcileNumber(actual: number, expected: number, path: string): void {
+  if (!closeEnough(actual, expected)) {
+    fail(path, `does not reconcile with the sequential plan (${actual} != ${expected})`);
+  }
+}
+
+type ValidatedSequentialStep = {
+  step: PlannerSequentialStep;
+  squad: Map<number, PlannerPlayerReference>;
+};
+
+function validateSequentialStep(
+  value: unknown,
+  path: string,
+  options: {
+    deadlineOffset: 1 | 2;
+    provisional: boolean;
+    targetEvent: number;
+    gameweekWindow: readonly number[];
+    gameweekWeights: readonly number[];
+    priorSquad: ReadonlyMap<number, PlannerPlayerReference>;
+    bankBefore: number;
+    freeTransfersBefore: number;
+    fixedPurchasePrices?: ReadonlyMap<number, number>;
+  },
+): ValidatedSequentialStep {
+  const row = exactRecord(value, path, [
+    "deadline_offset", "provisional", "target_event", "kind", "transfer_count",
+    "transfers", "squad_ids", "gameweeks", "bank_before_tenths", "bank_after_tenths",
+    "free_transfers_before", "free_transfers_next_gameweek", "hit_points",
+    "weighted_projected_points", "weighted_hit_cost_points",
+  ]);
+  literal(row.deadline_offset, `${path}.deadline_offset`, options.deadlineOffset);
+  literal(row.provisional, `${path}.provisional`, options.provisional);
+  literal(row.target_event, `${path}.target_event`, options.targetEvent);
+
+  const kind = oneOf(row.kind, `${path}.kind`, ["roll", "transfer", "hit"] as const);
+  const transferCount = integer(row.transfer_count, `${path}.transfer_count`, 0, 5);
+  if (transferCount > Math.max(2, options.freeTransfersBefore)) {
+    fail(`${path}.transfer_count`, "exceeds the bounded immediate-transfer search");
+  }
+  const transferValues = array(row.transfers, `${path}.transfers`);
+  if (transferValues.length !== transferCount) {
+    fail(`${path}.transfers`, "length must match transfer_count");
+  }
+
+  const stepSquad = new Map(options.priorSquad);
+  const outIds = new Set<number>();
+  const inIds = new Set<number>();
+  let bankDelta = 0;
+  const transfers = transferValues.map((candidate, index) => {
+    const transferPath = `${path}.transfers[${index}]`;
+    const transfer = exactRecord(candidate, transferPath, [
+      "out_id", "in_id", "position", "out_purchase_price_tenths", "out_current_price_tenths",
+      "out_selling_price_tenths", "in_price_tenths", "out", "in",
+    ]);
+    const outId = integer(transfer.out_id, `${transferPath}.out_id`, 1);
+    const inId = integer(transfer.in_id, `${transferPath}.in_id`, 1);
+    if (
+      outId === inId || outIds.has(outId) || inIds.has(inId) ||
+      !options.priorSquad.has(outId) || options.priorSquad.has(inId)
+    ) {
+      fail(transferPath, "must replace one owned player with one distinct unowned player");
+    }
+    outIds.add(outId);
+    inIds.add(inId);
+    const position = oneOf(transfer.position, `${transferPath}.position`, POSITIONS);
+    const purchase = integer(
+      transfer.out_purchase_price_tenths,
+      `${transferPath}.out_purchase_price_tenths`,
+      1,
+      500,
+    );
+    const current = integer(
+      transfer.out_current_price_tenths,
+      `${transferPath}.out_current_price_tenths`,
+      1,
+      500,
+    );
+    const selling = integer(
+      transfer.out_selling_price_tenths,
+      `${transferPath}.out_selling_price_tenths`,
+      1,
+      500,
+    );
+    const inPrice = integer(transfer.in_price_tenths, `${transferPath}.in_price_tenths`, 1, 500);
+    const outgoing = validatePlayerReference(transfer.out, `${transferPath}.out`);
+    const incoming = validatePlayerReference(transfer.in, `${transferPath}.in`);
+    if (
+      outgoing.id !== outId || incoming.id !== inId || outgoing.position !== position ||
+      incoming.position !== position || outgoing.price_tenths !== current ||
+      incoming.price_tenths !== inPrice
+    ) {
+      fail(transferPath, "enriched players must match the transfer ids, position and fixed prices");
+    }
+    if (!sameJson(outgoing, options.priorSquad.get(outId))) {
+      fail(`${transferPath}.out`, "must match the player in the preceding sequential squad");
+    }
+    if (selling !== sellingPrice(purchase, current)) {
+      fail(`${transferPath}.out_selling_price_tenths`, "does not follow the FPL half-profit rule");
+    }
+    const fixedPurchasePrice = options.fixedPurchasePrices?.get(outId);
+    if (fixedPurchasePrice !== undefined && purchase !== fixedPurchasePrice) {
+      fail(`${transferPath}.out_purchase_price_tenths`, "must keep the first-step purchase price");
+    }
+    stepSquad.delete(outId);
+    stepSquad.set(inId, incoming);
+    bankDelta += selling - inPrice;
+    return transfer as unknown as EnrichedTransfer;
+  });
+
+  const squadIds = uniqueIntegers(row.squad_ids, `${path}.squad_ids`, 15);
+  if (!sameValues(squadIds, [...stepSquad.keys()])) {
+    fail(`${path}.squad_ids`, "must equal the preceding squad after this step's transfers");
+  }
+  validatePositionQuotas([...stepSquad.values()], `${path}.squad_ids`);
+
+  const bankBefore = integer(row.bank_before_tenths, `${path}.bank_before_tenths`, 0, MAX_BANK_TENTHS);
+  const bankAfter = integer(row.bank_after_tenths, `${path}.bank_after_tenths`, 0, MAX_BANK_TENTHS);
+  if (bankBefore !== options.bankBefore || bankAfter !== bankBefore + bankDelta) {
+    fail(`${path}.bank_after_tenths`, "does not reconcile sequentially with bank and transfer prices");
+  }
+  const freeTransfersBefore = integer(
+    row.free_transfers_before,
+    `${path}.free_transfers_before`,
+    1,
+    5,
+  );
+  const freeTransfersNext = integer(
+    row.free_transfers_next_gameweek,
+    `${path}.free_transfers_next_gameweek`,
+    1,
+    5,
+  );
+  const expectedFreeTransfersNext = Math.min(
+    5,
+    Math.max(0, freeTransfersBefore - transferCount) + 1,
+  );
+  if (
+    freeTransfersBefore !== options.freeTransfersBefore ||
+    freeTransfersNext !== expectedFreeTransfersNext
+  ) {
+    fail(`${path}.free_transfers_next_gameweek`, "does not follow the sequential free-transfer rule");
+  }
+  const hitPoints = integer(row.hit_points, `${path}.hit_points`, 0, 16);
+  if (hitPoints !== Math.max(0, transferCount - freeTransfersBefore) * 4) {
+    fail(`${path}.hit_points`, "does not match transfer_count and sequential free transfers");
+  }
+  const expectedKind: PlannerActionKind = transferCount === 0
+    ? "roll"
+    : hitPoints > 0
+      ? "hit"
+      : "transfer";
+  if (kind !== expectedKind) fail(`${path}.kind`, `must be ${expectedKind} for this step`);
+
+  const gameweeks = array(row.gameweeks, `${path}.gameweeks`);
+  if (gameweeks.length !== options.gameweekWindow.length) {
+    fail(`${path}.gameweeks`, "must cover exactly its part of the planner horizon");
+  }
+  gameweeks.forEach((gameweek, index) => {
+    const gameweekPath = `${path}.gameweeks[${index}]`;
+    const parsed = exactRecord(gameweek, gameweekPath, [
+      "gameweek", "starting_ids", "captain_id", "formation", "projected_points",
+    ]);
+    validateFormation(parsed, gameweekPath, stepSquad);
+    literal(parsed.gameweek, `${gameweekPath}.gameweek`, options.gameweekWindow[index]);
+  });
+
+  const weightedProjectedPoints = finiteNumber(
+    row.weighted_projected_points,
+    `${path}.weighted_projected_points`,
+    0,
+  );
+  const expectedWeightedProjectedPoints = gameweeks.reduce<number>(
+    (total, gameweek, index) => total
+      + (gameweek as PlannerActionGameweek).projected_points * options.gameweekWeights[index],
+    0,
+  );
+  reconcileNumber(
+    weightedProjectedPoints,
+    expectedWeightedProjectedPoints,
+    `${path}.weighted_projected_points`,
+  );
+  const weightedHitCostPoints = finiteNumber(
+    row.weighted_hit_cost_points,
+    `${path}.weighted_hit_cost_points`,
+    0,
+  );
+  reconcileNumber(
+    weightedHitCostPoints,
+    hitPoints * options.gameweekWeights[0],
+    `${path}.weighted_hit_cost_points`,
+  );
+
+  return {
+    step: {
+      ...row,
+      transfers,
+    } as unknown as PlannerSequentialStep,
+    squad: stepSquad,
+  };
+}
+
+function validateSequentialPlan(
+  value: unknown,
+  options: {
+    horizon: number;
+    targetEvent: number;
+    confirmedSquad: ReadonlyMap<number, PlannerPlayerReference>;
+    confirmedPurchasePrices: ReadonlyMap<number, number>;
+    bank: number;
+    freeTransfers: number;
+    bestAction: PlannerAction;
+    alternatives: readonly PlannerAction[];
+    rollFtValuePoints: number;
+  },
+): PlannerSequentialPlan {
+  const root = exactRecord(value, "planner.sequential", [
+    "horizon", "gw_weights", "first_step_candidate_count", "first_step_search",
+    "future_price_assumption", "solver_proven_optimal_within_bounds", "globally_optimal",
+    "best_sequence",
+  ]);
+  const horizon = integer(root.horizon, "planner.sequential.horizon", 2, 5);
+  if (horizon !== options.horizon) {
+    fail("planner.sequential.horizon", "must match the immediate planner horizon");
+  }
+  const weights = array(root.gw_weights, "planner.sequential.gw_weights").map((weight, index) =>
+    finiteNumber(weight, `planner.sequential.gw_weights[${index}]`, 0.000_001, 1),
+  );
+  if (weights.length !== horizon) {
+    fail("planner.sequential.gw_weights", "length must match horizon");
+  }
+  if (!closeEnough(weights[0], 1)) {
+    fail("planner.sequential.gw_weights[0]", "must weight the current deadline as 1");
+  }
+  if (weights.some((weight, index) => index > 0 && weight > weights[index - 1])) {
+    fail("planner.sequential.gw_weights", "must be non-increasing across the horizon");
+  }
+  const candidateCount = integer(
+    root.first_step_candidate_count,
+    "planner.sequential.first_step_candidate_count",
+    1,
+    16,
+  );
+  if (candidateCount !== options.alternatives.length + 1) {
+    fail(
+      "planner.sequential.first_step_candidate_count",
+      "must equal the visible best action plus alternatives",
+    );
+  }
+  literal(
+    root.first_step_search,
+    "planner.sequential.first_step_search",
+    "explicit_bounded_transfer_plans",
+  );
+  literal(
+    root.future_price_assumption,
+    "planner.sequential.future_price_assumption",
+    "fixed_current_prices",
+  );
+  literal(
+    root.solver_proven_optimal_within_bounds,
+    "planner.sequential.solver_proven_optimal_within_bounds",
+    true,
+  );
+  literal(root.globally_optimal, "planner.sequential.globally_optimal", false);
+
+  const sequence = exactRecord(root.best_sequence, "planner.sequential.best_sequence", [
+    "first_action", "steps", "weighted_projected_points", "total_hit_points",
+    "weighted_hit_cost_points", "terminal_banked_ft_value_points", "decision_value_points",
+  ]);
+  const firstAction = exactRecord(
+    sequence.first_action,
+    "planner.sequential.best_sequence.first_action",
+    ["source", "alternative_index"],
+  );
+  const source = oneOf(
+    firstAction.source,
+    "planner.sequential.best_sequence.first_action.source",
+    ["best_action", "alternative"] as const,
+  );
+  let alternativeIndex: number | null = null;
+  let selectedAction = options.bestAction;
+  if (source === "best_action") {
+    literal(
+      firstAction.alternative_index,
+      "planner.sequential.best_sequence.first_action.alternative_index",
+      null,
+    );
+  } else {
+    alternativeIndex = integer(
+      firstAction.alternative_index,
+      "planner.sequential.best_sequence.first_action.alternative_index",
+      0,
+      options.alternatives.length - 1,
+    );
+    selectedAction = options.alternatives[alternativeIndex];
+    if (candidateCount < alternativeIndex + 2) {
+      fail(
+        "planner.sequential.first_step_candidate_count",
+        "cannot be smaller than the selected existing action set",
+      );
+    }
+  }
+
+  const stepValues = array(sequence.steps, "planner.sequential.best_sequence.steps");
+  if (stepValues.length !== 2) {
+    fail("planner.sequential.best_sequence.steps", "must contain exactly two deadline steps");
+  }
+  const gameweekWindow = options.bestAction.gameweeks.map((gameweek) => gameweek.gameweek);
+  const fixedPurchasePrices = new Map(options.confirmedPurchasePrices);
+  for (const transfer of selectedAction.transfers) {
+    fixedPurchasePrices.set(transfer.in_id, transfer.in_price_tenths);
+  }
+  const first = validateSequentialStep(
+    stepValues[0],
+    "planner.sequential.best_sequence.steps[0]",
+    {
+      deadlineOffset: 1,
+      provisional: false,
+      targetEvent: options.targetEvent,
+      gameweekWindow: gameweekWindow.slice(0, 1),
+      gameweekWeights: weights.slice(0, 1),
+      priorSquad: options.confirmedSquad,
+      bankBefore: options.bank,
+      freeTransfersBefore: options.freeTransfers,
+    },
+  );
+  const firstStepMatchesSelectedAction = (
+    first.step.kind === selectedAction.kind &&
+    first.step.transfer_count === selectedAction.transfer_count &&
+    sameJson(first.step.transfers, selectedAction.transfers) &&
+    sameJson(first.step.squad_ids, selectedAction.squad_ids) &&
+    first.step.bank_before_tenths === selectedAction.bank_before_tenths &&
+    first.step.bank_after_tenths === selectedAction.bank_after_tenths &&
+    first.step.free_transfers_before === selectedAction.free_transfers_before &&
+    first.step.free_transfers_next_gameweek === selectedAction.free_transfers_next_gameweek &&
+    first.step.hit_points === selectedAction.hit_points &&
+    sameJson(first.step.gameweeks[0], selectedAction.gameweeks[0])
+  );
+  if (!firstStepMatchesSelectedAction) {
+    fail(
+      "planner.sequential.best_sequence.steps[0]",
+      "must exactly match the selected existing action at the first deadline",
+    );
+  }
+
+  const secondTargetEvent = gameweekWindow[1];
+  const second = validateSequentialStep(
+    stepValues[1],
+    "planner.sequential.best_sequence.steps[1]",
+    {
+      deadlineOffset: 2,
+      provisional: true,
+      targetEvent: secondTargetEvent,
+      gameweekWindow: gameweekWindow.slice(1),
+      gameweekWeights: weights.slice(1),
+      priorSquad: first.squad,
+      bankBefore: first.step.bank_after_tenths,
+      freeTransfersBefore: first.step.free_transfers_next_gameweek,
+      fixedPurchasePrices,
+    },
+  );
+
+  const weightedProjectedPoints = finiteNumber(
+    sequence.weighted_projected_points,
+    "planner.sequential.best_sequence.weighted_projected_points",
+    0,
+  );
+  reconcileNumber(
+    weightedProjectedPoints,
+    first.step.weighted_projected_points + second.step.weighted_projected_points,
+    "planner.sequential.best_sequence.weighted_projected_points",
+  );
+  const totalHitPoints = integer(
+    sequence.total_hit_points,
+    "planner.sequential.best_sequence.total_hit_points",
+    0,
+    32,
+  );
+  if (totalHitPoints !== first.step.hit_points + second.step.hit_points) {
+    fail("planner.sequential.best_sequence.total_hit_points", "must equal both steps' hit points");
+  }
+  const weightedHitCostPoints = finiteNumber(
+    sequence.weighted_hit_cost_points,
+    "planner.sequential.best_sequence.weighted_hit_cost_points",
+    0,
+  );
+  reconcileNumber(
+    weightedHitCostPoints,
+    first.step.weighted_hit_cost_points + second.step.weighted_hit_cost_points,
+    "planner.sequential.best_sequence.weighted_hit_cost_points",
+  );
+  const terminalBankedFtValuePoints = finiteNumber(
+    sequence.terminal_banked_ft_value_points,
+    "planner.sequential.best_sequence.terminal_banked_ft_value_points",
+    0,
+  );
+  reconcileNumber(
+    terminalBankedFtValuePoints,
+    Math.max(0, second.step.free_transfers_next_gameweek - 1) * options.rollFtValuePoints,
+    "planner.sequential.best_sequence.terminal_banked_ft_value_points",
+  );
+  const decisionValuePoints = finiteNumber(
+    sequence.decision_value_points,
+    "planner.sequential.best_sequence.decision_value_points",
+  );
+  reconcileNumber(
+    decisionValuePoints,
+    weightedProjectedPoints - weightedHitCostPoints + terminalBankedFtValuePoints,
+    "planner.sequential.best_sequence.decision_value_points",
+  );
+
+  return {
+    ...root,
+    gw_weights: weights,
+    best_sequence: {
+      ...sequence,
+      first_action: { source, alternative_index: alternativeIndex },
+      steps: [first.step, second.step],
+    },
+  } as unknown as PlannerSequentialPlan;
+}
+
 export function parsePlannerPayload(value: unknown): PlannerPayload {
   const root = exactRecord(value, "planner", [
     "manager_id", "state_fingerprint", "source_event", "target_event", "confirmed_state",
-    "best_action", "alternatives", "method",
+    "best_action", "alternatives", "sequential", "method",
   ]);
   integer(root.manager_id, "planner.manager_id", 1);
   if (root.state_fingerprint !== null && (typeof root.state_fingerprint !== "string" || !HEX_64.test(root.state_fingerprint))) fail("planner.state_fingerprint", "must be null or a SHA-256 checksum");
@@ -848,14 +1373,20 @@ export function parsePlannerPayload(value: unknown): PlannerPayload {
   literal(confirmed.no_active_chip_confirmed, "planner.confirmed_state.no_active_chip_confirmed", true);
   const squadValues = array(confirmed.squad, "planner.confirmed_state.squad");
   if (squadValues.length !== 15) fail("planner.confirmed_state.squad", "must contain exactly 15 players");
-  const squad = squadValues.map((player, index) => validatePlayerReference(player, `planner.confirmed_state.squad[${index}]`));
+  const ownedSquad = squadValues.map((player, index) => validateOwnedPlayerReference(player, `planner.confirmed_state.squad[${index}]`));
+  const squad = ownedSquad.map(({ purchase_price_tenths: _purchase, selling_price_tenths: _selling, ...player }) => player);
   if (new Set(squad.map((player) => player.id)).size !== 15) fail("planner.confirmed_state.squad", "player ids must be unique");
   validatePositionQuotas(squad, "planner.confirmed_state.squad");
   const confirmedMap = new Map(squad.map((player) => [player.id, player]));
-  const best = validateAction(root.best_action, "planner.best_action", confirmedMap, bank, freeTransfers, targetEvent);
+  const confirmedPrices = new Map(ownedSquad.map((player) => [player.id, {
+    purchase: player.purchase_price_tenths,
+    selling: player.selling_price_tenths,
+  }]));
+  const confirmedPurchasePrices = new Map(ownedSquad.map((player) => [player.id, player.purchase_price_tenths]));
+  const best = validateAction(root.best_action, "planner.best_action", confirmedMap, confirmedPrices, bank, freeTransfers, targetEvent);
   const alternatives = array(root.alternatives, "planner.alternatives");
   if (alternatives.length > 4) fail("planner.alternatives", "must contain at most four actions");
-  const parsedAlternatives = alternatives.map((action, index) => validateAction(action, `planner.alternatives[${index}]`, confirmedMap, bank, freeTransfers, targetEvent));
+  const parsedAlternatives = alternatives.map((action, index) => validateAction(action, `planner.alternatives[${index}]`, confirmedMap, confirmedPrices, bank, freeTransfers, targetEvent));
   const horizon = best.gameweeks.length;
   const gameweekWindow = best.gameweeks.map((gameweek) => gameweek.gameweek);
   if (parsedAlternatives.some((action) => action.gameweeks.length !== horizon
@@ -865,7 +1396,7 @@ export function parsePlannerPayload(value: unknown): PlannerPayload {
 
   const method = exactRecord(root.method, "planner.method", [
     "candidate_count", "plans_per_transfer_count", "higher_transfer_count_plans", "maximum_immediate_transfers",
-    "roll_ft_value_points", "chips_modelled", "future_transfers_modelled",
+    "roll_ft_value_points", "chips_modelled", "next_deadline_transfer_modelled", "future_transfers_modelled",
   ]);
   const candidateCount = integer(method.candidate_count, "planner.method.candidate_count", 15);
   literal(method.plans_per_transfer_count, "planner.method.plans_per_transfer_count", 5);
@@ -873,10 +1404,41 @@ export function parsePlannerPayload(value: unknown): PlannerPayload {
   const maximumImmediateTransfers = integer(method.maximum_immediate_transfers, "planner.method.maximum_immediate_transfers", 2, 5);
   if (maximumImmediateTransfers !== Math.max(2, freeTransfers)) fail("planner.method.maximum_immediate_transfers", "must cover all available free transfers");
   if ([best, ...parsedAlternatives].some((action) => action.transfer_count > maximumImmediateTransfers)) fail("planner.method.maximum_immediate_transfers", "must cover every returned action");
-  finiteNumber(method.roll_ft_value_points, "planner.method.roll_ft_value_points", 0);
+  const rollFtValuePoints = finiteNumber(method.roll_ft_value_points, "planner.method.roll_ft_value_points", 0);
   literal(method.chips_modelled, "planner.method.chips_modelled", false);
+  const nextDeadlineTransferModelled = boolean(
+    method.next_deadline_transfer_modelled,
+    "planner.method.next_deadline_transfer_modelled",
+  );
   literal(method.future_transfers_modelled, "planner.method.future_transfers_modelled", false);
-  const referencedIds = new Set([...(best.transfers ?? []), ...parsedAlternatives.flatMap((action) => action.transfers)].flatMap((transfer) => [transfer.out_id, transfer.in_id]));
+  if (horizon === 1 && root.sequential !== null) {
+    fail("planner.sequential", "must be null when the planner horizon is one gameweek");
+  }
+  if (nextDeadlineTransferModelled !== (root.sequential !== null)) {
+    fail(
+      "planner.method.next_deadline_transfer_modelled",
+      "must be true exactly when a sequential plan is present",
+    );
+  }
+  let parsedSequential: PlannerSequentialPlan | null = null;
+  if (root.sequential !== null) {
+    parsedSequential = validateSequentialPlan(root.sequential, {
+      horizon,
+      targetEvent,
+      confirmedSquad: confirmedMap,
+      confirmedPurchasePrices,
+      bank,
+      freeTransfers,
+      bestAction: best,
+      alternatives: parsedAlternatives,
+      rollFtValuePoints,
+    });
+  }
+  const referencedIds = new Set([
+    ...(best.transfers ?? []),
+    ...parsedAlternatives.flatMap((action) => action.transfers),
+    ...(parsedSequential?.best_sequence.steps.flatMap((step) => step.transfers) ?? []),
+  ].flatMap((transfer) => [transfer.out_id, transfer.in_id]));
   if (candidateCount < new Set([...confirmedMap.keys(), ...referencedIds]).size) fail("planner.method.candidate_count", "is smaller than the referenced candidate set");
   return root as unknown as PlannerPayload;
 }

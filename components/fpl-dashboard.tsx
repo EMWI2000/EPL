@@ -10,12 +10,23 @@ import {
   type AiReviewQualitativeEvidence,
   type AiReviewResponse,
 } from "@/lib/ai-review-contract";
+import {
+  buildDecisionHistoryEntry,
+  clearDecisionHistory,
+  emptyDecisionHistory,
+  readDecisionHistory,
+  upsertDecisionHistory,
+  writeDecisionHistory,
+  type DecisionHistory,
+  type DecisionHistoryEntry,
+} from "@/lib/decision-history";
 import { resolveInitialFplManagerId } from "@/lib/fpl-manager-config";
 import {
   type ManagerSyncResponse,
   type ManualManagerState,
   type PlannerAction,
   type PlannerPayload,
+  type PlannerSequentialPlan,
   isPlannerPayload,
   parseBankTenths,
   parseFreeTransfers,
@@ -605,6 +616,143 @@ function TransferDecision({ action, horizon }: { action: PlannerAction; horizon:
           <span>{action.hit_points === 0 ? "Intet hit" : `−${action.hit_points} point i hit`}</span>
           <span>{formatPrice(action.bank_after_tenths / 10)} tilbage</span>
           <span>{action.free_transfers_next_gameweek} FT næste runde</span>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function SequentialPlanPanel({
+  plan,
+  planner,
+}: {
+  plan: PlannerSequentialPlan;
+  planner: PlannerPayload;
+}) {
+  const { first_action: firstAction, steps, decision_value_points: decisionValue } = plan.best_sequence;
+  const currentAction = firstAction.source === "best_action"
+    ? planner.best_action
+    : planner.alternatives[firstAction.alternative_index ?? -1];
+  const provisional = steps[1];
+  if (!currentAction) return null;
+  const futureLabel = provisional.kind === "roll"
+    ? "Rul foreløbigt"
+    : provisional.transfers
+      .map((transfer) => `${transfer.out.name} til ${transfer.in.name}`)
+      .join(" + ");
+  return (
+    <section className="sequential-plan" aria-labelledby="sequential-plan-heading">
+      <div className="sequential-plan__header">
+        <div>
+          <p className="eyebrow eyebrow--lime">To deadlines</p>
+          <h2 id="sequential-plan-heading">Den bedste flerugers rute i kandidatfeltet</h2>
+          <p>Første skridt er en valideret handling. Næste skridt er foreløbigt og skal genberegnes efter næste deadline.</p>
+        </div>
+        <div className="sequential-plan__score">
+          <strong>{formatPoints(decisionValue)}</strong>
+          <span>sekvensscore</span>
+        </div>
+      </div>
+      {firstAction.source === "alternative" && (
+        <p className="sequential-plan__signal"><InfoIcon /> Flerugersmodellen foretrækker alternativ {(firstAction.alternative_index ?? 0) + 1} som første skridt frem for den kortsigtede hovedplan.</p>
+      )}
+      <div className="sequential-plan__steps">
+        <article>
+          <span className="sequential-plan__number">Nu</span>
+          <div>
+            <small>GW{steps[0].target_event} · kan udføres</small>
+            <strong>{plannerActionLabel(currentAction)}</strong>
+            <p>{currentAction.hit_points === 0 ? "Intet hit" : `${currentAction.hit_points} point i hit`} · {formatPrice(currentAction.bank_after_tenths / 10)} tilbage · {currentAction.free_transfers_next_gameweek} FT videre</p>
+          </div>
+        </article>
+        <article className="is-provisional">
+          <span className="sequential-plan__number">Næst</span>
+          <div>
+            <small>GW{provisional.target_event} · foreløbig</small>
+            <strong>{futureLabel}</strong>
+            <p>{provisional.hit_points === 0 ? "Intet foreløbigt hit" : `${provisional.hit_points} point i foreløbigt hit`} · {formatPrice(provisional.bank_after_tenths / 10)} tilbage · {provisional.free_transfers_next_gameweek} FT videre</p>
+          </div>
+        </article>
+      </div>
+      <div className="sequential-plan__assumptions">
+        <span><ShieldIcon /> Lovlige squads, bank, FT og hits føres mellem deadlines</span>
+        <span><InfoIcon /> Dagens priser holdes faste; skader, nyheder og prisændringer kræver ny beregning</span>
+        <span><DatabaseIcon /> Første skridt vælges blandt {plan.first_step_candidate_count} validerede handlinger</span>
+      </div>
+    </section>
+  );
+}
+
+function historyActionLabel(entry: DecisionHistoryEntry) {
+  if (entry.selection.kind === "wait") return entry.ai?.headline ?? "Afvent og genberegn";
+  if (!entry.action || entry.action.kind === "roll") return "Rul transferen";
+  return entry.action.transfers
+    .map((transfer) => `${transfer.out_name} til ${transfer.in_name}`)
+    .join(" + ");
+}
+
+function DecisionHistoryPanel({
+  history,
+  canSave,
+  status,
+  onSave,
+  onExport,
+  onClear,
+}: {
+  history: DecisionHistory;
+  canSave: boolean;
+  status: string | null;
+  onSave: () => void;
+  onExport: () => void;
+  onClear: () => void;
+}) {
+  const [showAll, setShowAll] = useState(false);
+  const visibleEntries = showAll ? history.entries : history.entries.slice(0, 4);
+  return (
+    <section className="decision-history" aria-labelledby="decision-history-heading">
+      <div className="decision-history__header">
+        <div>
+          <p className="eyebrow">Uge for uge</p>
+          <h2 id="decision-history-heading">Din beslutningsjournal</h2>
+          <p>Gem den aktuelle anbefaling, inklusive et eventuelt AI-valg. Journalen ligger kun i denne browser og sendes ikke til beregningen eller OpenAI.</p>
+        </div>
+        <button className="secondary-button" type="button" onClick={onSave} disabled={!canSave}>
+          <DatabaseIcon /> Gem anbefalingen
+        </button>
+      </div>
+      {status && <p className="decision-history__status" role="status"><InfoIcon /> {status}</p>}
+      {visibleEntries.length === 0 ? (
+        <div className="decision-history__empty">
+          <strong>Ingen gemte deadlines endnu</strong>
+          <span>Gem først, når du har kontrolleret planen og eventuelt kørt AI-vurderingen.</span>
+        </div>
+      ) : (
+        <div className="decision-history__list">
+          {visibleEntries.map((entry) => (
+            <article key={`${entry.target_event}-${entry.target_deadline}`}>
+              <span>GW{entry.target_event}</span>
+              <div>
+                <strong>{historyActionLabel(entry)}</strong>
+                <small>Deadline {formatDateTime(entry.target_deadline)} · gemt {formatDateTime(entry.saved_at)}</small>
+              </div>
+              <div>
+                <strong>{entry.action ? `${entry.action.hit_points} hitpoint` : "Vent"}</strong>
+                <small>{entry.ai ? `AI: ${entry.ai.confidence}` : "Uden AI-review"}</small>
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+      <div className="decision-history__footer">
+        <span>Højst 38 deadlines. Historikken kan blive slettet af browseren og følger ikke med til andre enheder.</span>
+        <div>
+          {history.entries.length > 4 && (
+            <button type="button" onClick={() => setShowAll((value) => !value)} aria-expanded={showAll}>
+              {showAll ? "Vis seneste" : `Vis alle ${history.entries.length}`}
+            </button>
+          )}
+          <button type="button" onClick={onExport} disabled={history.entries.length === 0}><DownloadIcon /> Eksportér</button>
+          <button type="button" onClick={onClear} disabled={history.entries.length === 0}>Slet historik</button>
         </div>
       </div>
     </section>
@@ -1205,10 +1353,13 @@ export function FplDashboard({
   const [aiReview, setAiReview] = useState<AiReviewResponse | null>(null);
   const [isAiReviewing, setIsAiReviewing] = useState(false);
   const [aiReviewError, setAiReviewError] = useState<string | null>(null);
+  const [decisionHistory, setDecisionHistory] = useState<DecisionHistory>(emptyDecisionHistory);
+  const [decisionHistoryStatus, setDecisionHistoryStatus] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const syncAbortRef = useRef<AbortController | null>(null);
   const aiAbortRef = useRef<AbortController | null>(null);
   const aiRequestKeyRef = useRef<string | null>(null);
+  const recommendationIsStale = Boolean(error && recommendation);
 
   const clearAiReview = useCallback(() => {
     aiAbortRef.current?.abort();
@@ -1329,6 +1480,10 @@ export function FplDashboard({
   }, [initialManagerId, syncManagerById]);
 
   useEffect(() => {
+    setDecisionHistory(readDecisionHistory(window.localStorage));
+  }, []);
+
+  useEffect(() => {
     clearAiReview();
   }, [
     bankInput,
@@ -1378,6 +1533,13 @@ export function FplDashboard({
       settings.includeDoubtful !== appliedSettings.includeDoubtful ||
       settings.forecastVersion !== appliedSettings.forecastVersion ||
       Boolean(recommendation?.planner && !squadConfirmed) ||
+      Boolean(recommendation?.planner && managerSync && (() => {
+        try {
+          return parseManagerId(managerIdInput) !== managerSync.manager.id;
+        } catch {
+          return true;
+        }
+      })()) ||
       (recommendation?.planner?.confirmed_state.bank_tenths !== undefined &&
         (() => {
           try {
@@ -1388,7 +1550,7 @@ export function FplDashboard({
           }
         })())
     );
-  }, [analysisMode, appliedMode, settings, appliedSettings, recommendation, bankInput, freeTransfers, squadConfirmed]);
+  }, [analysisMode, appliedMode, settings, appliedSettings, recommendation, bankInput, freeTransfers, squadConfirmed, managerIdInput, managerSync]);
 
   function runCurrentAnalysis() {
     if (analysisMode === "weekly") {
@@ -1402,8 +1564,16 @@ export function FplDashboard({
 
   async function requestAiQualification() {
     if (!managerSync || !recommendation?.planner) return;
+    if (syncError || isSyncing) {
+      setAiReviewError("Synkronisér holdet igen, før du bestiller et AI-review af planen.");
+      return;
+    }
     if (!squadConfirmed) {
       setAiReviewError("Bekræft først, at truppen, banken, de frie transfers og chipstatus stadig er korrekte.");
+      return;
+    }
+    if (recommendationIsStale) {
+      setAiReviewError("Opdatér planen igen. Det viste resultat stammer fra en beregning, der siden fejlede.");
       return;
     }
     if (hasUnappliedChanges) {
@@ -1484,6 +1654,59 @@ export function FplDashboard({
     URL.revokeObjectURL(url);
   }
 
+  function saveDeadlineDecision() {
+    if (!managerSync || !recommendation?.planner || syncError || isSyncing || recommendationIsStale || hasUnappliedChanges || !squadConfirmed) {
+      setDecisionHistoryStatus("Opdatér og bekræft planen, før du gemmer beslutningen.");
+      return;
+    }
+    try {
+      const entry = buildDecisionHistoryEntry({
+        target_deadline: managerSync.target.deadline_time,
+        state_observed_at: managerSync.snapshot.observed_at,
+        recommendation_generated_at: recommendation.meta.generated_at,
+        forecast: {
+          version: recommendation.meta.forecast_version,
+          horizon: recommendation.meta.horizon,
+          validation_status: recommendation.meta.validation.status,
+        },
+        planner: recommendation.planner,
+        ai_review: aiReview,
+      });
+      const updated = upsertDecisionHistory(decisionHistory, entry);
+      if (!writeDecisionHistory(window.localStorage, updated)) {
+        setDecisionHistoryStatus("Browseren kunne ikke gemme journalen. Eksportér planen som JSON i stedet.");
+        return;
+      }
+      setDecisionHistory(updated);
+      setDecisionHistoryStatus(`Beslutningen til GW${entry.target_event} er gemt lokalt i denne browser.`);
+    } catch {
+      setDecisionHistoryStatus("Beslutningen kunne ikke valideres og blev ikke gemt.");
+    }
+  }
+
+  function exportDecisionHistory() {
+    if (decisionHistory.entries.length === 0) return;
+    const blob = new Blob([JSON.stringify(decisionHistory, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "fpl-beslutningsjournal.json";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function removeDecisionHistory() {
+    if (!window.confirm("Vil du slette hele beslutningsjournalen fra denne browser?")) return;
+    if (!clearDecisionHistory(window.localStorage)) {
+      setDecisionHistoryStatus("Browseren kunne ikke slette journalen.");
+      return;
+    }
+    setDecisionHistory(emptyDecisionHistory());
+    setDecisionHistoryStatus("Beslutningsjournalen er slettet fra denne browser.");
+  }
+
   function selectAnalysisMode(mode: "weekly" | "initial") {
     clearAiReview();
     setAnalysisMode(mode);
@@ -1504,7 +1727,6 @@ export function FplDashboard({
   const activeBench = recommendation && activeLineup
     ? lineupPlayers(recommendation.team.squad, activeLineup, "bench")
     : recommendation?.team.bench ?? [];
-  const recommendationIsStale = Boolean(error && recommendation);
   const hasFreeHitWarning = managerSync?.warnings.some(
     (warning) => warning.code === "free_hit_squad_is_temporary",
   ) ?? false;
@@ -1820,14 +2042,25 @@ export function FplDashboard({
                 {recommendation.planner && (
                   <>
                     <TransferDecision action={recommendation.planner.best_action} horizon={recommendation.meta.horizon} />
+                    {recommendation.planner.sequential && (
+                      <SequentialPlanPanel plan={recommendation.planner.sequential} planner={recommendation.planner} />
+                    )}
                     <AiReviewPanel
                       response={aiReview}
                       planner={recommendation.planner}
                       deadline={managerSync?.target.deadline_time ?? null}
                       isLoading={isAiReviewing}
-                      canReview={squadConfirmed && !hasUnappliedChanges && !isLoading}
+                      canReview={squadConfirmed && !syncError && !isSyncing && !recommendationIsStale && !hasUnappliedChanges && !isLoading}
                       error={aiReviewError}
                       onReview={() => void requestAiQualification()}
+                    />
+                    <DecisionHistoryPanel
+                      history={decisionHistory}
+                      canSave={squadConfirmed && !syncError && !isSyncing && !recommendationIsStale && !hasUnappliedChanges && !isLoading && !isAiReviewing}
+                      status={decisionHistoryStatus}
+                      onSave={saveDeadlineDecision}
+                      onExport={exportDecisionHistory}
+                      onClear={removeDecisionHistory}
                     />
                   </>
                 )}

@@ -540,7 +540,9 @@ function sameValues(left: readonly number[], right: readonly number[]): boolean 
 }
 
 function finalSquadReferences(planner: PlannerPayload): Map<number, PlannerPlayerReference> {
-  const players = new Map(planner.confirmed_state.squad.map((player) => [player.id, player]));
+  const players = new Map<number, PlannerPlayerReference>(
+    planner.confirmed_state.squad.map((player) => [player.id, player]),
+  );
   for (const transfer of planner.best_action.transfers) {
     players.delete(transfer.out_id);
     players.set(transfer.in_id, transfer.in);
