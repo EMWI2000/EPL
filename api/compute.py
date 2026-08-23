@@ -821,7 +821,7 @@ def _serialize_transfer_action(
             for move in transfers
         )
         explanation = (
-            f"Modellen anbefaler at {moves}. Planen er vurderet over "
+            f"Modellen anbefaler følgende: {moves}. Planen er vurderet over "
             f"{len(window)} gameweeks og inkluderer eventuelle hit-omkostninger."
         )
     net_points_vs_roll = (
