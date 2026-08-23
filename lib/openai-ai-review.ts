@@ -1,6 +1,7 @@
 import {
   AI_REVIEW_ALLOWED_SOURCE_DOMAINS,
   AI_REVIEW_OUTPUT_SCHEMA,
+  AiReviewContractError,
   aiReviewSourceDomainsForTeams,
   isAllowedAiReviewSourceUrlForDomains,
   parseAiReviewModelOutput,
@@ -370,8 +371,12 @@ export function parseOpenAiReviewResponseBody(
   let review: AiReviewModelOutput;
   try {
     review = parseAiReviewModelOutput(parsed, alternativeCount, expectedHorizon, targetEvent);
-  } catch {
-    throw new OpenAiReviewError("invalid_response", "OpenAI returned an unsupported review shape.");
+  } catch (error) {
+    const safePath = error instanceof AiReviewContractError ? error.path : "review";
+    throw new OpenAiReviewError(
+      "invalid_response",
+      `OpenAI returned an unsupported review shape at ${safePath}.`,
+    );
   }
   if (sourceMap.size === 0) {
     throw new OpenAiReviewError(

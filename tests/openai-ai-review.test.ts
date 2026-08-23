@@ -297,6 +297,25 @@ test("fails closed on incomplete, refusal, missing research and malformed struct
   );
 });
 
+test("reports only the fixed contract path when semantic output validation fails", () => {
+  const invalid = reviewFixture();
+  invalid.headline = "x".repeat(141);
+
+  assert.throws(
+    () => parseOpenAiReviewResponseBody({
+      status: "completed",
+      output: [
+        {
+          type: "web_search_call",
+          action: { sources: [{ url: "https://www.premierleague.com/news/123" }] },
+        },
+        { type: "message", content: [{ type: "output_text", text: JSON.stringify(invalid) }] },
+      ],
+    }, 1),
+    /unsupported review shape at review\.headline/,
+  );
+});
+
 test("calls only the fixed Responses URL and maps upstream rate limiting", async () => {
   let calledUrl = "";
   let authorization = "";
