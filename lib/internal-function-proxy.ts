@@ -1,4 +1,5 @@
 import { getCurrentSession } from "@/lib/require-user";
+import { hasConfiguredFplManagerMismatch } from "@/lib/fpl-manager-config";
 import { hasValidPublicOrigin } from "@/lib/public-request-origin";
 
 const MAX_REQUEST_BYTES = 16_384;
@@ -20,6 +21,9 @@ type ProxyOptions = {
   endpoint: `/${string}`;
   unauthorizedMessage: string;
   unavailableMessage: string;
+  requestBody?: string;
+  configuredManagerId?: number;
+  requireConfiguredManagerId?: boolean;
 };
 
 export async function proxyInternalJson(
@@ -68,9 +72,28 @@ export async function proxyInternalJson(
     );
   }
 
-  const body = await request.text();
+  const body = options.requestBody ?? await request.text();
   if (Buffer.byteLength(body, "utf8") > MAX_REQUEST_BYTES) {
     return errorResponse(413, "request_too_large", "Forespørgslen er for stor.");
+  }
+  if (options.configuredManagerId !== undefined) {
+    try {
+      if (
+        hasConfiguredFplManagerMismatch(
+          JSON.parse(body) as unknown,
+          options.configuredManagerId,
+          { required: options.requireConfiguredManagerId },
+        )
+      ) {
+        return errorResponse(
+          403,
+          "manager_mismatch",
+          "Forespørgslen matcher ikke det konfigurerede FPL-hold.",
+        );
+      }
+    } catch {
+      // The internal endpoint owns the detailed invalid-JSON response.
+    }
   }
 
   let upstream: Response;

@@ -31,6 +31,8 @@ V2 er standard i webappen. Legacy-baselinen kan vælges til sammenligning. Begge
 
 Ugeplanlæggeren tager udgangspunkt i managerens senest offentliggjorte hold. FPL viser ikke igangværende transfers før næste deadline, så synkroniseringen skal ske, før ugens transfers udføres. Brugeren bekræfter derefter bank, antal frie transfers og aktuelle købs- og salgspriser. Brugeren bekræfter også, at ingen chip er aktiv. Appen foretager aldrig transfers.
 
+Når `FPL_MANAGER_ID` er konfigureret, hentes dette hold automatisk efter login, og anbefalingsruten afviser andre eller manglende manager-ID'er. Den generelle funktion til at bygge en ny trup skjules i den bundne produktionsapp, så alle viste anbefalinger tager udgangspunkt i det konfigurerede managerhold.
+
 Planlæggeren sammenligner at rulle transferen med forskellige transfers til næste deadline. Hver plan vurderes over den valgte prognosehorisont. Den medregner transferhits, bænkens forventede bidrag ved udeblivelser og de særlige salgsprisregler. For transferantal 1-2 kan den vise flere alternativer; for 3-5 beregner den én bedst plan pr. antal. Snapshot-checksummen identificerer den synkroniserede tilstand, men serveren kontrollerer ikke, om managerens hold siden er ændret.
 
 ## Kør lokalt
@@ -73,6 +75,7 @@ Følgende miljøvariabler skal oprettes i Vercel og må aldrig gemmes i GitHub:
 | `GITHUB_CLIENT_ID` | Client ID fra GitHub OAuth App |
 | `GITHUB_CLIENT_SECRET` | Client secret fra GitHub OAuth App |
 | `ALLOWED_GITHUB_ID` | numerisk GitHub-ID, aktuelt `199608244` |
+| `FPL_MANAGER_ID` | offentligt FPL entry-ID, som automatisk synkroniseres efter login |
 | `INTERNAL_API_TOKEN` | mindst 32 tilfældige bytes mellem Next.js og Python |
 | `SESSION_VERSION` | start med `1`; hæv værdien for at logge alle sessioner ud |
 

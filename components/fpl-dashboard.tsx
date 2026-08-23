@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { AccountControl } from "@/components/account-control";
+import { resolveInitialFplManagerId } from "@/lib/fpl-manager-config";
 import {
   type ManagerSyncResponse,
   type ManualManagerState,
@@ -31,6 +32,29 @@ import {
 
 type Horizon = 1 | 2 | 3 | 4 | 5;
 type ForecastVersion = "v2" | "legacy";
+
+function managerIdFromBrowser(configuredManagerId: number | null): number | null {
+  try {
+    const value = window.localStorage.getItem("fpl-manager-id");
+    const managerId = resolveInitialFplManagerId(configuredManagerId, value);
+    if (configuredManagerId !== null) {
+      rememberManagerId(configuredManagerId);
+    } else if (value && managerId === null) {
+      window.localStorage.removeItem("fpl-manager-id");
+    }
+    return managerId;
+  } catch {
+    return configuredManagerId;
+  }
+}
+
+function rememberManagerId(managerId: number) {
+  try {
+    window.localStorage.setItem("fpl-manager-id", String(managerId));
+  } catch {
+    // Browser storage is only a convenience; server configuration is authoritative.
+  }
+}
 
 type Settings = {
   horizon: Horizon;
@@ -845,7 +869,13 @@ function EmptyState({
   );
 }
 
-export function FplDashboard({ userName }: { userName: string }) {
+export function FplDashboard({
+  userName,
+  initialManagerId,
+}: {
+  userName: string;
+  initialManagerId: number | null;
+}) {
   const [analysisMode, setAnalysisMode] = useState<"weekly" | "initial">("weekly");
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [appliedSettings, setAppliedSettings] = useState<Settings | null>(null);
@@ -854,7 +884,9 @@ export function FplDashboard({ userName }: { userName: string }) {
   const [selectedGameweek, setSelectedGameweek] = useState<number | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [managerIdInput, setManagerIdInput] = useState("");
+  const [managerIdInput, setManagerIdInput] = useState(
+    initialManagerId === null ? "" : String(initialManagerId),
+  );
   const [managerSync, setManagerSync] = useState<ManagerSyncResponse | null>(null);
   const [bankInput, setBankInput] = useState("0,0");
   const [freeTransfers, setFreeTransfers] = useState(1);
@@ -922,24 +954,7 @@ export function FplDashboard({ userName }: { userName: string }) {
     }
   }, []);
 
-  useEffect(() => {
-    const savedManagerId = window.localStorage.getItem("fpl-manager-id");
-    if (savedManagerId) setManagerIdInput(savedManagerId);
-    return () => {
-      abortRef.current?.abort();
-      syncAbortRef.current?.abort();
-    };
-  }, []);
-
-  async function syncManagerState() {
-    let managerId: number;
-    try {
-      managerId = parseManagerId(managerIdInput);
-    } catch (parseError) {
-      setSyncError(parseError instanceof Error ? parseError.message : "Indtast et gyldigt FPL-team-ID.");
-      return;
-    }
-
+  const syncManagerById = useCallback(async (managerId: number) => {
     syncAbortRef.current?.abort();
     const controller = new AbortController();
     syncAbortRef.current = controller;
@@ -965,13 +980,37 @@ export function FplDashboard({ userName }: { userName: string }) {
       setSquadConfirmed(false);
       setRecommendation(null);
       setAppliedMode(null);
-      window.localStorage.setItem("fpl-manager-id", String(parsed.manager.id));
+      rememberManagerId(parsed.manager.id);
     } catch (requestError) {
       if (requestError instanceof DOMException && requestError.name === "AbortError") return;
       setSyncError(requestError instanceof Error ? requestError.message : "Holdet kunne ikke hentes.");
     } finally {
       if (syncAbortRef.current === controller) setIsSyncing(false);
     }
+  }, []);
+
+  useEffect(() => {
+    const managerId = managerIdFromBrowser(initialManagerId);
+
+    if (managerId !== null) {
+      setManagerIdInput(String(managerId));
+      void syncManagerById(managerId);
+    }
+    return () => {
+      abortRef.current?.abort();
+      syncAbortRef.current?.abort();
+    };
+  }, [initialManagerId, syncManagerById]);
+
+  async function syncManagerState() {
+    let managerId: number;
+    try {
+      managerId = parseManagerId(managerIdInput);
+    } catch (parseError) {
+      setSyncError(parseError instanceof Error ? parseError.message : "Indtast et gyldigt FPL-team-ID.");
+      return;
+    }
+    await syncManagerById(managerId);
   }
 
   function confirmedPlannerState(): ManualManagerState | null {
@@ -1124,13 +1163,15 @@ export function FplDashboard({ userName }: { userName: string }) {
                 >
                   Mit hold
                 </button>
-                <button
-                  type="button"
-                  aria-pressed={analysisMode === "initial"}
-                  onClick={() => selectAnalysisMode("initial")}
-                >
-                  Byg ny trup
-                </button>
+                {initialManagerId === null && (
+                  <button
+                    type="button"
+                    aria-pressed={analysisMode === "initial"}
+                    onClick={() => selectAnalysisMode("initial")}
+                  >
+                    Byg ny trup
+                  </button>
+                )}
               </div>
 
               {analysisMode === "weekly" && !managerSync && (
@@ -1150,6 +1191,7 @@ export function FplDashboard({ userName }: { userName: string }) {
                         inputMode="numeric"
                         autoComplete="off"
                         value={managerIdInput}
+                        readOnly={initialManagerId !== null}
                         onChange={(event) => {
                           setManagerIdInput(event.target.value);
                           setSyncError(null);
@@ -1167,7 +1209,9 @@ export function FplDashboard({ userName }: { userName: string }) {
                         Hent
                       </button>
                     </div>
-                    <small>Nummeret står i adressen på din offentlige FPL-side.</small>
+                    <small>{initialManagerId === null
+                      ? "Nummeret står i adressen på din offentlige FPL-side."
+                      : "Dit offentlige FPL-hold er knyttet til denne private app og hentes automatisk."}</small>
                   </div>
                   {syncError && <p className="planner-warning" role="alert"><InfoIcon /> {syncError}</p>}
                   <p className="planner-warning"><ShieldIcon /> Vi henter kun offentlige holddata. Vi beder aldrig om din FPL-adgangskode og foretager ingen transfers.</p>
