@@ -28,6 +28,7 @@ MAX_PER_TEAM = SQUAD.max_players_per_club
 POSITION_ORDER = {"GKP": 0, "DEF": 1, "MID": 2, "FWD": 3}
 DEFAULT_GW_WEIGHTS = (1.0, 0.85, 0.70, 0.55, 0.40)
 DEFAULT_BENCH_WEIGHTS = (0.12, 0.08, 0.04, 0.02)
+DEFAULT_SOLVER_TIME_LIMIT_SECONDS = 15.0
 
 
 class SquadPlanError(ValueError):
@@ -190,11 +191,20 @@ def _prepare_players(
 def _solve_or_raise(
     model: pulp.LpProblem,
     solver: pulp.LpSolver,
+    *,
+    time_limit_seconds: float = DEFAULT_SOLVER_TIME_LIMIT_SECONDS,
 ) -> None:
+    original_time_limit = getattr(solver, "timeLimit", None)
+    bounded_time_limit = time_limit_seconds
+    if isinstance(original_time_limit, (int, float)) and original_time_limit > 0:
+        bounded_time_limit = min(float(original_time_limit), time_limit_seconds)
+    solver.timeLimit = bounded_time_limit
     try:
         model.solve(solver)
     except pulp.PulpSolverError as exc:
         raise SquadPlanError(f"the optimisation solver could not run: {exc}") from exc
+    finally:
+        solver.timeLimit = original_time_limit
     if pulp.LpStatus.get(model.status) != "Optimal":
         status = pulp.LpStatus.get(model.status, str(model.status))
         raise SquadPlanInfeasibleError(
@@ -345,6 +355,7 @@ def optimize_squad_plan(
     selected_solver = solver or pulp.PULP_CBC_CMD(
         msg=False,
         threads=1,
+        timeLimit=DEFAULT_SOLVER_TIME_LIMIT_SECONDS,
         # CBC interprets seed 0 as time-of-day entropy.  Fixed non-zero seeds
         # keep both its LP perturbation and branch search reproducible.
         options=["randomSeed 17", "randomCbcSeed 17"],

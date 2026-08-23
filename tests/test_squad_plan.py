@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 
 import pandas as pd
+import pulp
 
 from fpl_app.logic.squad_plan import optimize_squad_plan
 
@@ -172,3 +173,20 @@ def test_result_is_deterministic_when_input_rows_are_shuffled() -> None:
     )
 
     assert first == second
+
+
+def test_cbc_solver_is_capped_at_fifteen_seconds(monkeypatch) -> None:
+    players = _candidate_pool()
+    solver = pulp.PULP_CBC_CMD(msg=False, threads=1, timeLimit=60)
+    observed_limits: list[float] = []
+    actual_solve = solver.actualSolve
+
+    def record_actual_solve(model, **kwargs):
+        observed_limits.append(float(solver.timeLimit))
+        return actual_solve(model, **kwargs)
+
+    monkeypatch.setattr(solver, "actualSolve", record_actual_solve)
+    optimize_squad_plan(players, horizon=1, solver=solver)
+
+    assert observed_limits == [15.0]
+    assert solver.timeLimit == 60

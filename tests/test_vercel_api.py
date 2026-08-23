@@ -9,6 +9,9 @@ import pytest
 from api import compute, health
 
 
+VALID_INTERNAL_TOKEN = "internal-token-with-at-least-32-bytes"
+
+
 def test_health_payload_is_json_serializable():
     payload = health.health_payload()
 
@@ -25,6 +28,7 @@ def test_health_payload_is_json_serializable():
         ({"horizon": 2.5}, "horizon"),
         ({"include_doubtful": 1}, "include_doubtful"),
         ({"use_solio": "yes"}, "use_solio"),
+        ({"use_solio": True}, "disabled"),
         ({"forecast_version": "future"}, "forecast_version"),
         ({"forecast_version": 2}, "forecast_version"),
         ({"unexpected": True}, "unsupported"),
@@ -44,8 +48,12 @@ def test_request_validation_applies_defaults_without_mutating_input():
     assert result == {
         "horizon": 2,
         "include_doubtful": True,
-        "use_solio": True,
+        "use_solio": False,
         "forecast_version": "v2",
+        "manager_state": None,
+        "manager_id": None,
+        "source_event": None,
+        "state_fingerprint": None,
     }
     assert supplied == {"horizon": 2}
 
@@ -98,11 +106,12 @@ def test_next_open_gameweek_fails_closed_without_future_deadline():
 @pytest.mark.parametrize(
     ("provided", "configured", "expected"),
     [
-        ("private-token", "private-token", True),
-        ("wrong-token", "private-token", False),
-        (None, "private-token", False),
-        ("", "private-token", False),
-        ("private-token", "", False),
+        (VALID_INTERNAL_TOKEN, VALID_INTERNAL_TOKEN, True),
+        ("wrong-token", VALID_INTERNAL_TOKEN, False),
+        (None, VALID_INTERNAL_TOKEN, False),
+        ("", VALID_INTERNAL_TOKEN, False),
+        (VALID_INTERNAL_TOKEN, "short", False),
+        (VALID_INTERNAL_TOKEN, "", False),
     ],
 )
 def test_internal_authentication_fails_closed(provided, configured, expected):
@@ -119,8 +128,8 @@ def test_internal_authentication_reads_environment(monkeypatch):
     monkeypatch.delenv(compute.INTERNAL_TOKEN_ENV, raising=False)
     assert compute.is_internal_request_authorized("anything") is False
 
-    monkeypatch.setenv(compute.INTERNAL_TOKEN_ENV, "configured-secret")
-    assert compute.is_internal_request_authorized("configured-secret") is True
+    monkeypatch.setenv(compute.INTERNAL_TOKEN_ENV, VALID_INTERNAL_TOKEN)
+    assert compute.is_internal_request_authorized(VALID_INTERNAL_TOKEN) is True
     assert compute.is_internal_request_authorized("different-secret") is False
 
 
@@ -135,9 +144,9 @@ def test_internal_authentication_uses_constant_time_comparison(monkeypatch):
 
     assert compute.is_internal_request_authorized(
         "provided",
-        configured_token="configured",
+        configured_token=VALID_INTERNAL_TOKEN,
     )
-    assert calls == [(b"provided", b"configured")]
+    assert calls == [(b"provided", VALID_INTERNAL_TOKEN.encode())]
 
 
 def test_solio_overlay_uses_bounded_serverless_timeout(monkeypatch):
@@ -178,9 +187,9 @@ def _bare_handler(monkeypatch, *, provided_token=None, configured_token=None):
 @pytest.mark.parametrize(
     ("provided_token", "configured_token"),
     [
-        (None, "configured-secret"),
-        ("wrong-secret", "configured-secret"),
-        ("configured-secret", None),
+        (None, VALID_INTERNAL_TOKEN),
+        ("wrong-secret", VALID_INTERNAL_TOKEN),
+        (VALID_INTERNAL_TOKEN, None),
     ],
 )
 def test_compute_handler_rejects_before_reading_body(
@@ -209,8 +218,8 @@ def test_compute_handler_rejects_before_reading_body(
 def test_compute_handler_accepts_valid_internal_token(monkeypatch):
     instance, responses = _bare_handler(
         monkeypatch,
-        provided_token="configured-secret",
-        configured_token="configured-secret",
+        provided_token=VALID_INTERNAL_TOKEN,
+        configured_token=VALID_INTERNAL_TOKEN,
     )
     instance._read_payload = lambda: {"horizon": 1}
     monkeypatch.setattr(
@@ -340,16 +349,68 @@ def test_generate_recommendation_returns_frontend_contract(monkeypatch):
     json.dumps(response, allow_nan=False)
 
 
-def test_solio_projection_does_not_publish_internal_expected_minutes(monkeypatch):
-    pool = _synthetic_pool(horizon=1)
+def test_generate_recommendation_truncates_horizon_at_gameweek_38(monkeypatch):
+    pool = _synthetic_pool(horizon=2)
     official = pd.DataFrame({"id": pool["id"]})
     fixtures = pd.DataFrame(
         {
-            "event": [7],
-            "home_team": [1],
-            "away_team": [2],
-            "home_fdr": [3],
-            "away_fdr": [3],
+            "event": [37, 38],
+            "home_team": [1, 2],
+            "away_team": [2, 3],
+            "home_fdr": [3, 3],
+            "away_fdr": [3, 3],
+        }
+    )
+    teams = pd.DataFrame(
+        {
+            "team_id": range(1, 6),
+            "name": [f"Team {index}" for index in range(1, 6)],
+            "short_name": [f"T{index}" for index in range(1, 6)],
+        }
+    )
+    bootstrap = {
+        "events": [
+            {
+                "id": 37,
+                "is_next": True,
+                "deadline_time": "2099-05-16T14:00:00Z",
+            }
+        ]
+    }
+    observed_horizons = []
+    monkeypatch.setattr(
+        compute,
+        "_load_official_data",
+        lambda: (bootstrap, official, fixtures, teams),
+    )
+
+    def forecast_pool(*args):
+        observed_horizons.append(args[3])
+        return pool.copy()
+
+    monkeypatch.setattr(compute, "_build_forecast_pool", forecast_pool)
+
+    response = compute.generate_recommendation({"horizon": 5, "use_solio": False})
+
+    assert observed_horizons == [2]
+    assert response["meta"]["horizon"] == 2
+    assert response["meta"]["gameweek_window"] == [37, 38]
+    assert all(
+        [projection["gameweek"] for projection in player["projections"]] == [37, 38]
+        for player in response["team"]["squad"]
+    )
+
+
+def test_weekly_recommendation_rolls_when_no_transfer_candidate_exists(monkeypatch):
+    pool = _synthetic_pool(horizon=2)
+    official = pd.DataFrame({"id": pool["id"]})
+    fixtures = pd.DataFrame(
+        {
+            "event": [7, 8],
+            "home_team": [1, 2],
+            "away_team": [2, 3],
+            "home_fdr": [3, 3],
+            "away_fdr": [3, 3],
         }
     )
     teams = pd.DataFrame(
@@ -374,38 +435,37 @@ def test_solio_projection_does_not_publish_internal_expected_minutes(monkeypatch
         lambda: (bootstrap, official, fixtures, teams),
     )
     monkeypatch.setattr(compute, "_build_forecast_pool", lambda *args: pool.copy())
-
-    def apply_solio(candidate_pool, *_args, **_kwargs):
-        updated = candidate_pool.copy()
-        updated.loc[updated["id"] == 1, "source_gw1"] = (
-            "solio_points_internal_minutes"
-        )
-        return updated, {
-            "requested": True,
-            "applied": True,
-            "gameweek": 7,
-            "generated_at": None,
-            "matched": 1,
-            "usable": 1,
-            "unmatched": 0,
-            "ambiguous": 0,
-            "warning": None,
-        }
-
-    monkeypatch.setattr(compute, "_apply_solio_overlay", apply_solio)
-
-    response = compute.generate_recommendation(
-        {"horizon": 1, "include_doubtful": False, "use_solio": True}
-    )
-    projections = {
-        player["id"]: player["projections"][0]
-        for player in response["team"]["squad"]
+    state = {
+        "current_squad_ids": pool["id"].tolist(),
+        "bank_tenths": 10,
+        "free_transfers": 1,
+        "player_prices": [
+            {
+                "element_id": int(player_id),
+                "purchase_price_tenths": 50,
+                "selling_price_tenths": 50,
+            }
+            for player_id in pool["id"]
+        ],
+        "chips": {},
+        "no_active_chip_confirmed": True,
+        "effective_event": 7,
     }
 
-    assert projections[1]["expected_minutes"] is None
-    assert any(
-        projection["expected_minutes"] is not None
-        for player_id, projection in projections.items()
-        if player_id != 1
+    response = compute.generate_recommendation(
+        {
+            "horizon": 2,
+            "manager_id": 123,
+            "source_event": 6,
+            "manager_state": state,
+            "use_solio": False,
+        }
     )
+
+    assert response["meta"]["mode"] == "weekly"
+    assert response["planner"]["manager_id"] == 123
+    assert response["planner"]["best_action"]["kind"] == "roll"
+    assert response["planner"]["best_action"]["free_transfers_next_gameweek"] == 2
+    assert response["summary"]["bank_tenths"] == 10
+    assert len(response["team"]["squad"]) == 15
     json.dumps(response, allow_nan=False)

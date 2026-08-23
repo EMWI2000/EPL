@@ -3,6 +3,9 @@
   "functions": {
     "api/compute.py": {
       "maxDuration": 60
+    },
+    "api/manager_state.py": {
+      "maxDuration": 60
     }
   }
 }

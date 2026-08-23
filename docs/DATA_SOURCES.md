@@ -7,7 +7,7 @@ Denne prioritering er lavet til et personligt FPL-beslutningssystem. En kilde er
 | Prioritet | Kilde | Formål | Beslutning nu |
 |---|---|---|---|
 | 1 | [Officiel FPL](https://fantasy.premierleague.com/api/bootstrap-static/) | priser, positioner, status, fixtures, managerdata og facit | brug altid; snapshot før deadline |
-| 2 | [Solio Analytics](https://fpl.solioanalytics.com/) | gratis ekstern GW-projektion, mål/assist/DefCon og holdestimater | integrér som benchmark med attribution |
+| 2 | Brugerleveret projectionseksport | ekstern GW-projektion som benchmark | brug kun en eksport, som licensen tillader; Vercel-appen henter ikke Solio-data automatisk |
 | 3 | [FPL Review](https://fplreview.com/) | betalte projektioner og planlægningsværktøjer | køb én måned som benchmark, hvis eksport og vilkår passer |
 | 4 | [Fantasy Football Scout](https://www.fantasyfootballscout.co.uk/) | medlemstal, forventede opstillinger, pressemøder og kvalitativ kontekst | køb hvis availability/minutes er den største modelsvaghed |
 | 5 | [The Odds API](https://the-odds-api.com/) | konsistente markedssandsynligheder | start på gratis niveau; betal kun efter dokumenteret backtestløft |

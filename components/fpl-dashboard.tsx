@@ -4,6 +4,18 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 
 import { AccountControl } from "@/components/account-control";
 import {
+  type ManagerSyncResponse,
+  type ManualManagerState,
+  type PlannerAction,
+  type PlannerPayload,
+  isPlannerPayload,
+  parseBankTenths,
+  parseFreeTransfers,
+  parseManagerId,
+  parseManagerSyncResponse,
+  serializePlannerRequest,
+} from "@/lib/planner-contract";
+import {
   ArrowRightIcon,
   CheckIcon,
   ChevronIcon,
@@ -23,7 +35,6 @@ type ForecastVersion = "v2" | "legacy";
 type Settings = {
   horizon: Horizon;
   includeDoubtful: boolean;
-  useSolio: boolean;
   forecastVersion: ForecastVersion;
 };
 
@@ -56,6 +67,7 @@ type Player = {
   is_vice_captain: boolean;
   bench_order: number | null;
   weighted_ep: number;
+  price_signal: Record<string, unknown> | null;
   projections: PlayerProjection[];
 };
 
@@ -104,7 +116,14 @@ type RecommendationResponse = {
         shortlist_method: string;
       };
       solio: SolioMetadata;
+      price_signals: {
+        available?: boolean;
+        player_count?: number;
+        price_change_deadlines?: string[];
+        warning?: string | null;
+      };
     };
+    mode: "initial_squad" | "weekly";
   };
   summary: {
     total_cost: number;
@@ -125,6 +144,7 @@ type RecommendationResponse = {
     vice_captain_id: number;
     gameweeks: GameweekLineup[];
   };
+  planner?: PlannerPayload;
   experimental_notice: string;
 };
 
@@ -139,7 +159,6 @@ type ApiError = {
 const DEFAULT_SETTINGS: Settings = {
   horizon: 5,
   includeDoubtful: true,
-  useSolio: true,
   forecastVersion: "v2",
 };
 
@@ -239,6 +258,7 @@ function isPlayer(value: unknown): value is Player {
       typeof value.is_vice_captain === "boolean" &&
       (value.bench_order === null || isFiniteNumber(value.bench_order)) &&
       isFiniteNumber(value.weighted_ep) &&
+      (value.price_signal === null || isRecord(value.price_signal)) &&
       Array.isArray(value.projections) &&
       value.projections.every(isProjection),
   );
@@ -253,13 +273,15 @@ function isRecommendation(value: unknown): value is RecommendationResponse {
     !isRecord(meta.data_sources) ||
     !isRecord(meta.data_sources.fpl) ||
     !isRecord(meta.data_sources.solio) ||
+    !isRecord(meta.data_sources.price_signals) ||
     !isRecord(meta.validation)
   ) {
     return false;
   }
   const { fpl, solio } = meta.data_sources;
   const hasValidShape = Boolean(
-    typeof meta.generated_at === "string" &&
+      typeof meta.generated_at === "string" &&
+      ["initial_squad", "weekly"].includes(String(meta.mode)) &&
       Array.isArray(meta.gameweek_window) &&
       meta.gameweek_window.every(isFiniteNumber) &&
       isFiniteNumber(meta.horizon) &&
@@ -291,6 +313,8 @@ function isRecommendation(value: unknown): value is RecommendationResponse {
       typeof value.experimental_notice === "string",
   );
   if (!hasValidShape) return false;
+  if (value.planner !== undefined && !isPlannerPayload(value.planner)) return false;
+  if (meta.mode === "weekly" && !isPlannerPayload(value.planner)) return false;
 
   const squad = team.squad as Player[];
   const starters = team.starters as Player[];
@@ -501,6 +525,79 @@ function MetricCard({
   );
 }
 
+function signedPoints(value: number) {
+  const prefix = value > 0 ? "+" : "";
+  return `${prefix}${formatPoints(value)}`;
+}
+
+function TransferDecision({ action, horizon }: { action: PlannerAction; horizon: number }) {
+  const title = action.kind === "roll"
+    ? "Rul transferen"
+    : action.transfer_count === 1
+      ? "Lav én transfer"
+      : `Lav ${action.transfer_count} transfers`;
+  return (
+    <section className={classNames("transfer-decision", `transfer-decision--${action.kind}`)} aria-labelledby="decision-heading">
+      <div className="transfer-decision__main">
+        <p className="transfer-decision__eyebrow">Anbefalet træk</p>
+        <h3 id="decision-heading">{title}</h3>
+        {action.transfers.length > 0 && (
+          <div className="transfer-board">
+            {action.transfers.flatMap((transfer) => [
+              <div className="transfer-move" key={`out-${transfer.out_id}`}>
+                <span className="transfer-move__direction transfer-move__direction--out">UD</span>
+                <strong>{transfer.out.name}</strong>
+                <small>{formatPrice(transfer.out_selling_price_tenths / 10)}</small>
+              </div>,
+              <div className="transfer-move" key={`in-${transfer.in_id}`}>
+                <span className="transfer-move__direction transfer-move__direction--in">IND</span>
+                <strong>{transfer.in.name}</strong>
+                <small>{formatPrice(transfer.in_price_tenths / 10)}</small>
+              </div>,
+            ])}
+          </div>
+        )}
+        <p className="transfer-decision__explanation">{action.explanation}</p>
+      </div>
+      <div className="transfer-decision__score">
+        <strong>{action.kind === "roll" ? `FT ${action.free_transfers_next_gameweek}` : `${signedPoints(action.net_points_vs_roll)} EP`}</strong>
+        <span>{action.kind === "roll" ? "næste gameweek" : `nettogevinst mod rul over ${horizon} GW`}</span>
+        <div className="transfer-decision__facts">
+          <span>{action.hit_points === 0 ? "Intet hit" : `−${action.hit_points} point i hit`}</span>
+          <span>{formatPrice(action.bank_after_tenths / 10)} tilbage</span>
+          <span>{action.free_transfers_next_gameweek} FT næste runde</span>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function PlannerAlternatives({ actions }: { actions: PlannerAction[] }) {
+  if (!actions.length) return null;
+  return (
+    <section className="panel alternatives-panel" aria-labelledby="alternatives-heading">
+      <div className="section-heading section-heading--compact">
+        <div>
+          <p className="eyebrow">Plan B</p>
+          <h2 id="alternatives-heading">Nærmeste alternativer</h2>
+        </div>
+        <p>Sammenlignet på samme horisont, budget og regelsæt.</p>
+      </div>
+      <div className="alternatives-list">
+        {actions.map((action, index) => (
+          <article className="alternative-card" key={`${action.kind}-${action.transfers.map((move) => `${move.out_id}-${move.in_id}`).join("-")}-${index}`}>
+            <div className="alternative-card__top">
+              <strong>{action.kind === "roll" ? "Rul transferen" : action.transfers.map((move) => `${move.out.name} → ${move.in.name}`).join(" + ")}</strong>
+              <small>{signedPoints(action.net_points_vs_roll)} EP</small>
+            </div>
+            <p>{action.hit_points ? `${action.hit_points} point i hit · ` : "Intet hit · "}{formatPrice(action.bank_after_tenths / 10)} tilbage</p>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function ForecastTable({ data, gameweek }: { data: RecommendationResponse; gameweek: number }) {
   const gameweeks = data.meta.gameweek_window;
   const selectedLineup = data.team.gameweeks.find((lineup) => lineup.gameweek === gameweek) ?? data.team.gameweeks[0];
@@ -601,7 +698,6 @@ function ForecastTable({ data, gameweek }: { data: RecommendationResponse; gamew
         </table>
       </div>
       <div className="table-legend" aria-label="Forklaring af datakilder">
-        <span><i className="legend-dot legend-dot--solio" /> Solio Analytics</span>
         <span><i className="legend-dot" /> Intern {data.meta.forecast_version === "v2" ? "minutjusteret v2" : "legacy-baseline"}</span>
         <span>xMin = forventede spilleminutter · sikkerhed afspejler datamængde og rollevished</span>
       </div>
@@ -626,10 +722,8 @@ function ProgressBar({ value, max, label }: { value: number; max: number; label:
 }
 
 function DataCoverage({ data }: { data: RecommendationResponse }) {
-  const { fpl, solio } = data.meta.data_sources;
-  const solioSquadPlayers = data.team.squad.filter((player) =>
-    player.projections.some((projection) => sourceKind(projection.source) === "solio"),
-  ).length;
+  const { fpl, price_signals: priceSignals } = data.meta.data_sources;
+  const priceSignalPlayers = data.team.squad.filter((player) => player.price_signal !== null).length;
 
   return (
     <section className="panel coverage-panel" aria-labelledby="coverage-heading">
@@ -655,39 +749,41 @@ function DataCoverage({ data }: { data: RecommendationResponse }) {
         <article className="coverage-card">
           <div className="coverage-card__header">
             <span className="coverage-icon coverage-icon--accent"><DatabaseIcon /></span>
-            <span className={classNames("status-badge", solio.applied ? "status-badge--ok" : "status-badge--warning")}>
-              {solio.applied ? <CheckIcon /> : <InfoIcon />}
-              {solio.applied ? "Anvendt" : solio.requested ? "Ikke anvendt" : "Fravalgt"}
+            <span className={classNames("status-badge", priceSignals.available ? "status-badge--ok" : "status-badge--warning")}>
+              {priceSignals.available ? <CheckIcon /> : <InfoIcon />}
+              {priceSignals.available ? "FPL live" : "Ikke tilgængelig"}
             </span>
           </div>
-          <h3>Solio Analytics</h3>
-          <strong>{solio.matched} <small>entydige matches</small></strong>
-          <ProgressBar value={solio.matched} max={solio.usable} label="Matchede Solio-projektioner" />
-          <p>{solio.usable} brugbare projektioner · {solio.unmatched} uden match.</p>
+          <h3>Officielle prissignaler</h3>
+          <strong>{priceSignalPlayers} <small>/15 i truppen</small></strong>
+          <ProgressBar value={priceSignalPlayers} max={15} label="Spillere med officielle prissignaler" />
+          <p>Aktuel pris, nettotransfers og FPLs egne prisændringsfelter. Sandsynlighedskoder fortolkes ikke.</p>
         </article>
 
         <article className="coverage-card coverage-card--dark">
           <div className="coverage-card__header">
             <span className="coverage-icon coverage-icon--dark"><SparkIcon /></span>
-            <span className="status-badge status-badge--dark">Holdmix</span>
+            <span className="status-badge status-badge--dark">Eksakt solve</span>
           </div>
-          <h3>Projektionskilder i truppen</h3>
-          <strong>{solioSquadPlayers}<small>/15 med Solio-signal</small></strong>
-          <div className="source-split" aria-label={`${solioSquadPlayers} Solio-spillere og ${15 - solioSquadPlayers} interne spillere`}>
-            <span style={{ width: `${(solioSquadPlayers / 15) * 100}%` }} />
+          <h3>{data.planner ? "Transferplaner" : "Trupoptimering"}</h3>
+          <strong>{data.planner ? data.planner.method.candidate_count : fpl.optimizer_candidate_count}<small> kandidater</small></strong>
+          <div className="source-split" aria-label="Optimeringen er gennemført">
+            <span style={{ width: "100%" }} />
           </div>
-          <p>{15 - solioSquadPlayers} spillere bruger alene den interne baseline.</p>
+          <p>{data.planner
+            ? `Rul og op til ${data.planner.method.maximum_immediate_transfers} transfers er sammenlignet med bank, salgspriser og hits.`
+            : "En lovlig 15-mandstrup er løst inden for budget og klubkvoter."}</p>
         </article>
       </div>
-      {solio.warning && (
+      {priceSignals.warning && (
         <div className="inline-notice inline-notice--warning">
           <InfoIcon />
-          <p><strong>Bemærk om Solio</strong>{solio.warning}</p>
+          <p><strong>Prissignaler</strong>{priceSignals.warning}</p>
         </div>
       )}
       <div className="freshness-row">
         <span><span className="live-dot" /> Beregnet {formatDateTime(data.meta.generated_at)}</span>
-        {solio.generated_at && <span>Solio genereret {formatDateTime(solio.generated_at)}</span>}
+        {priceSignals.price_change_deadlines?.[0] && <span>Næste prisvindue {formatDateTime(priceSignals.price_change_deadlines[0])}</span>}
       </div>
     </section>
   );
@@ -721,30 +817,57 @@ function ErrorState({ message, onRetry }: { message: string; onRetry: () => void
   );
 }
 
-function EmptyState({ onStart }: { onStart: () => void }) {
+function EmptyState({
+  onStart,
+  mode,
+  ready,
+}: {
+  onStart: () => void;
+  mode: "weekly" | "initial";
+  ready: boolean;
+}) {
   return (
     <section className="empty-state">
       <span className="empty-state__icon"><SparkIcon /></span>
-      <p className="eyebrow">Klar til analyse</p>
-      <h2>Dit første holdforslag er ét klik væk</h2>
-      <p>Vi henter de seneste FPL-data, vurderer spillerpuljen og finder en lovlig 15-mandstrup.</p>
-      <button className="primary-button" type="button" onClick={onStart}>
-        Beregn mit hold <ArrowRightIcon />
-      </button>
+      <p className="eyebrow">{mode === "weekly" ? "Ugens beslutning" : "Klar til analyse"}</p>
+      <h2>{mode === "weekly" ? "Planlæg dit næste FPL-træk" : "Dit første holdforslag er ét klik væk"}</h2>
+      <p>{mode === "weekly"
+        ? ready
+          ? "Truppen er bekræftet. Sammenlign nu rul og mulige transfers med korrekte salgspriser og pointfradrag."
+          : "Hent dit offentlige hold i venstre side, og bekræft bank samt frie transfers."
+        : "Vi henter de seneste FPL-data, vurderer spillerpuljen og finder en lovlig 15-mandstrup."}</p>
+      {ready && (
+        <button className="primary-button" type="button" onClick={onStart}>
+          {mode === "weekly" ? "Beregn næste træk" : "Beregn mit hold"} <ArrowRightIcon />
+        </button>
+      )}
     </section>
   );
 }
 
 export function FplDashboard({ userName }: { userName: string }) {
+  const [analysisMode, setAnalysisMode] = useState<"weekly" | "initial">("weekly");
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [appliedSettings, setAppliedSettings] = useState<Settings | null>(null);
+  const [appliedMode, setAppliedMode] = useState<"weekly" | "initial" | null>(null);
   const [recommendation, setRecommendation] = useState<RecommendationResponse | null>(null);
   const [selectedGameweek, setSelectedGameweek] = useState<number | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [managerIdInput, setManagerIdInput] = useState("");
+  const [managerSync, setManagerSync] = useState<ManagerSyncResponse | null>(null);
+  const [bankInput, setBankInput] = useState("0,0");
+  const [freeTransfers, setFreeTransfers] = useState(1);
+  const [squadConfirmed, setSquadConfirmed] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const syncAbortRef = useRef<AbortController | null>(null);
 
-  const requestRecommendation = useCallback(async (requestSettings: Settings) => {
+  const requestRecommendation = useCallback(async (
+    requestSettings: Settings,
+    plannerInput?: { sync: ManagerSyncResponse; state: ManualManagerState },
+  ) => {
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
@@ -752,15 +875,26 @@ export function FplDashboard({ userName }: { userName: string }) {
     setError(null);
 
     try {
+      const requestBody = plannerInput
+        ? serializePlannerRequest({
+            manager_id: plannerInput.sync.manager.id,
+            source_event: plannerInput.sync.last_deadline_state.event,
+            state_fingerprint: plannerInput.sync.snapshot.checksum_sha256,
+            manager_state: plannerInput.state,
+            horizon: requestSettings.horizon,
+            include_doubtful: requestSettings.includeDoubtful,
+            forecast_version: requestSettings.forecastVersion,
+          })
+        : {
+            horizon: requestSettings.horizon,
+            include_doubtful: requestSettings.includeDoubtful,
+            use_solio: false,
+            forecast_version: requestSettings.forecastVersion,
+          };
       const response = await fetch("/api/recommend", {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
-        body: JSON.stringify({
-          horizon: requestSettings.horizon,
-          include_doubtful: requestSettings.includeDoubtful,
-          use_solio: requestSettings.useSolio,
-          forecast_version: requestSettings.forecastVersion,
-        }),
+        body: JSON.stringify(requestBody),
         cache: "no-store",
         signal: controller.signal,
       });
@@ -777,6 +911,7 @@ export function FplDashboard({ userName }: { userName: string }) {
       setRecommendation(body);
       setSelectedGameweek(body.team.gameweeks[0]?.gameweek ?? body.meta.gameweek_window[0] ?? null);
       setAppliedSettings(requestSettings);
+      setAppliedMode(plannerInput ? "weekly" : "initial");
     } catch (requestError) {
       if (requestError instanceof DOMException && requestError.name === "AbortError") return;
       setError(requestError instanceof Error ? requestError.message : "Der opstod en ukendt fejl.");
@@ -788,23 +923,107 @@ export function FplDashboard({ userName }: { userName: string }) {
   }, []);
 
   useEffect(() => {
-    void requestRecommendation(DEFAULT_SETTINGS);
-    return () => abortRef.current?.abort();
-  }, [requestRecommendation]);
+    const savedManagerId = window.localStorage.getItem("fpl-manager-id");
+    if (savedManagerId) setManagerIdInput(savedManagerId);
+    return () => {
+      abortRef.current?.abort();
+      syncAbortRef.current?.abort();
+    };
+  }, []);
+
+  async function syncManagerState() {
+    let managerId: number;
+    try {
+      managerId = parseManagerId(managerIdInput);
+    } catch (parseError) {
+      setSyncError(parseError instanceof Error ? parseError.message : "Indtast et gyldigt FPL-team-ID.");
+      return;
+    }
+
+    syncAbortRef.current?.abort();
+    const controller = new AbortController();
+    syncAbortRef.current = controller;
+    setIsSyncing(true);
+    setSyncError(null);
+    try {
+      const response = await fetch("/api/planner/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ manager_id: managerId }),
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      const body: unknown = await response.json().catch(() => null);
+      if (!response.ok) {
+        const apiError = body as ApiError | null;
+        throw new Error(apiError?.error?.message || `Serveren svarede med status ${response.status}.`);
+      }
+      const parsed = parseManagerSyncResponse(body);
+      setManagerSync(parsed);
+      setBankInput((parsed.manual_state_template.state.bank_tenths / 10).toFixed(1).replace(".", ","));
+      setFreeTransfers(parsed.manual_state_template.state.free_transfers);
+      setSquadConfirmed(false);
+      setRecommendation(null);
+      setAppliedMode(null);
+      window.localStorage.setItem("fpl-manager-id", String(parsed.manager.id));
+    } catch (requestError) {
+      if (requestError instanceof DOMException && requestError.name === "AbortError") return;
+      setSyncError(requestError instanceof Error ? requestError.message : "Holdet kunne ikke hentes.");
+    } finally {
+      if (syncAbortRef.current === controller) setIsSyncing(false);
+    }
+  }
+
+  function confirmedPlannerState(): ManualManagerState | null {
+    if (!managerSync || !squadConfirmed) return null;
+    try {
+      return {
+        ...managerSync.manual_state_template.state,
+        current_squad_ids: [...managerSync.manual_state_template.state.current_squad_ids],
+        bank_tenths: parseBankTenths(bankInput),
+        free_transfers: parseFreeTransfers(String(freeTransfers)),
+        player_prices: managerSync.manual_state_template.state.player_prices.map((price) => ({ ...price })),
+        chips: { ...managerSync.manual_state_template.state.chips },
+        no_active_chip_confirmed: true,
+      };
+    } catch (parseError) {
+      setSyncError(parseError instanceof Error ? parseError.message : "Bekræft bank, frie transfers og chipstatus.");
+      return null;
+    }
+  }
 
   const hasUnappliedChanges = useMemo(() => {
     if (!appliedSettings) return false;
     return (
+      analysisMode !== appliedMode ||
       settings.horizon !== appliedSettings.horizon ||
       settings.includeDoubtful !== appliedSettings.includeDoubtful ||
-      settings.useSolio !== appliedSettings.useSolio ||
-      settings.forecastVersion !== appliedSettings.forecastVersion
+      settings.forecastVersion !== appliedSettings.forecastVersion ||
+      (recommendation?.planner?.confirmed_state.bank_tenths !== undefined &&
+        (() => {
+          try {
+            return parseBankTenths(bankInput) !== recommendation.planner?.confirmed_state.bank_tenths ||
+              freeTransfers !== recommendation.planner?.confirmed_state.free_transfers;
+          } catch {
+            return true;
+          }
+        })())
     );
-  }, [settings, appliedSettings]);
+  }, [analysisMode, appliedMode, settings, appliedSettings, recommendation, bankInput, freeTransfers]);
+
+  function runCurrentAnalysis() {
+    if (analysisMode === "weekly") {
+      const state = confirmedPlannerState();
+      if (!managerSync || !state) return;
+      void requestRecommendation(settings, { sync: managerSync, state });
+      return;
+    }
+    void requestRecommendation(settings);
+  }
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    void requestRecommendation(settings);
+    runCurrentAnalysis();
   }
 
   function downloadJson() {
@@ -820,6 +1039,13 @@ export function FplDashboard({ userName }: { userName: string }) {
     URL.revokeObjectURL(url);
   }
 
+  function selectAnalysisMode(mode: "weekly" | "initial") {
+    setAnalysisMode(mode);
+    setRecommendation(null);
+    setError(null);
+    setAppliedMode(null);
+  }
+
   const windowLabel = recommendation?.meta.gameweek_window.length
     ? `GW${recommendation.meta.gameweek_window[0]}–GW${recommendation.meta.gameweek_window.at(-1)}`
     : `${settings.horizon} gameweeks`;
@@ -833,6 +1059,12 @@ export function FplDashboard({ userName }: { userName: string }) {
     ? lineupPlayers(recommendation.team.squad, activeLineup, "bench")
     : recommendation?.team.bench ?? [];
   const recommendationIsStale = Boolean(error && recommendation);
+  const hasFreeHitWarning = managerSync?.warnings.some(
+    (warning) => warning.code === "free_hit_squad_is_temporary",
+  ) ?? false;
+  const plannerCanSubmit = Boolean(
+    managerSync && squadConfirmed && !hasFreeHitWarning && !isSyncing,
+  );
 
   return (
     <>
@@ -856,7 +1088,7 @@ export function FplDashboard({ userName }: { userName: string }) {
             <p className="eyebrow eyebrow--lime"><span /> FPL 2026/27 · Beslutningsmotor</p>
             <h1>Byg et stærkere hold.<br /><em>På et bedre grundlag.</em></h1>
             <p className="hero__lead">
-              Kombinér officielle FPL-data, eksterne projektioner og eksakt optimering i ét gennemsigtigt holdforslag.
+              Synkronisér din trup, bekræft bank og frie transfers, og få ét gennemsigtigt træk før næste deadline.
             </p>
             <div className="hero__trust">
               <span><ShieldIcon /> FPL-regler valideret</span>
@@ -879,10 +1111,142 @@ export function FplDashboard({ userName }: { userName: string }) {
               <div className="settings-panel__heading">
                 <div>
                   <p className="eyebrow">Opsætning</p>
-                  <h2 id="settings-heading">Din analyse</h2>
+                  <h2 id="settings-heading">{analysisMode === "weekly" ? "Næste træk" : "Ny trup"}</h2>
                 </div>
                 <span className="settings-step">01</span>
               </div>
+
+              <div className="planner-mode" aria-label="Vælg analysetype">
+                <button
+                  type="button"
+                  aria-pressed={analysisMode === "weekly"}
+                  onClick={() => selectAnalysisMode("weekly")}
+                >
+                  Mit hold
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={analysisMode === "initial"}
+                  onClick={() => selectAnalysisMode("initial")}
+                >
+                  Byg ny trup
+                </button>
+              </div>
+
+              {analysisMode === "weekly" && !managerSync && (
+                <section className="planner-state" aria-labelledby="sync-heading">
+                  <div className="planner-state__header">
+                    <div>
+                      <p className="eyebrow">Trin 1</p>
+                      <strong id="sync-heading">Hent sidste deadline</strong>
+                    </div>
+                  </div>
+                  <div className="planner-field">
+                    <label htmlFor="manager-id">FPL-team-ID</label>
+                    <div className="planner-sync-row">
+                      <input
+                        id="manager-id"
+                        type="text"
+                        inputMode="numeric"
+                        autoComplete="off"
+                        value={managerIdInput}
+                        onChange={(event) => {
+                          setManagerIdInput(event.target.value);
+                          setSyncError(null);
+                        }}
+                        placeholder="fx 1499152"
+                        aria-invalid={Boolean(syncError)}
+                      />
+                      <button
+                        className="secondary-button"
+                        type="button"
+                        onClick={() => void syncManagerState()}
+                        disabled={isSyncing}
+                      >
+                        {isSyncing ? <span className="spinner" /> : <RefreshIcon />}
+                        Hent
+                      </button>
+                    </div>
+                    <small>Nummeret står i adressen på din offentlige FPL-side.</small>
+                  </div>
+                  {syncError && <p className="planner-warning" role="alert"><InfoIcon /> {syncError}</p>}
+                  <p className="planner-warning"><ShieldIcon /> Vi henter kun offentlige holddata. Vi beder aldrig om din FPL-adgangskode og foretager ingen transfers.</p>
+                </section>
+              )}
+
+              {analysisMode === "weekly" && managerSync && (
+                <section className="planner-state planner-state--synced" aria-labelledby="synced-heading">
+                  <div className="planner-state__header">
+                    <div>
+                      <p className="eyebrow">Trin 2 · GW{managerSync.last_deadline_state.event} hentet</p>
+                      <strong id="synced-heading">{managerSync.manager.team_name}</strong>
+                      <small>Deadline GW{managerSync.target.event}: {formatDateTime(managerSync.target.deadline_time)}</small>
+                    </div>
+                    <button className="download-button" type="button" onClick={() => void syncManagerState()} disabled={isSyncing}>
+                      <RefreshIcon /> Hent igen
+                    </button>
+                  </div>
+
+                  <div className="deadline-strip" aria-label="Status for ugens plan">
+                    <span className="deadline-strip__step is-complete"><strong>1 · Hentet</strong><small>GW{managerSync.last_deadline_state.event}</small></span>
+                    <span className={classNames("deadline-strip__step", squadConfirmed ? "is-complete" : "is-active")}><strong>2 · Bekræft</strong><small>Bank og FT</small></span>
+                    <span className={classNames("deadline-strip__step", squadConfirmed && "is-active")}><strong>3 · Beregn</strong><small>Næste træk</small></span>
+                  </div>
+
+                  <div className="planner-confirm-grid">
+                    <div className="planner-field">
+                      <label htmlFor="bank-now">Bank nu (£m)</label>
+                      <input
+                        id="bank-now"
+                        type="text"
+                        inputMode="decimal"
+                        value={bankInput}
+                        onChange={(event) => {
+                          setBankInput(event.target.value);
+                          setSquadConfirmed(false);
+                          setSyncError(null);
+                        }}
+                      />
+                    </div>
+                    <div className="planner-field">
+                      <span>Frie transfers nu</span>
+                      <div className="ft-selector" aria-label="Antal frie transfers">
+                        {[1, 2, 3, 4, 5].map((value) => (
+                          <button
+                            type="button"
+                            key={value}
+                            aria-pressed={freeTransfers === value}
+                            onClick={() => {
+                              setFreeTransfers(value);
+                              setSquadConfirmed(false);
+                            }}
+                          >
+                            {value}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  {hasFreeHitWarning && (
+                    <p className="planner-warning" role="alert"><InfoIcon /> Sidste offentlige hold var et Free Hit-hold og er midlertidigt. Denne version kan ikke sikkert genskabe den permanente trup endnu.</p>
+                  )}
+                  {!hasFreeHitWarning && (
+                    <label className="planner-confirmation">
+                      <input
+                        type="checkbox"
+                        checked={squadConfirmed}
+                        onChange={(event) => {
+                          setSquadConfirmed(event.target.checked);
+                          setSyncError(null);
+                        }}
+                      />
+                      <span>Jeg bekræfter, at truppen og spillerpriserne er uændrede siden GW{managerSync.last_deadline_state.event}, at bank samt frie transfers er korrekte, og at ingen chip er aktiv til næste deadline.</span>
+                    </label>
+                  )}
+                  {syncError && <p className="planner-warning" role="alert"><InfoIcon /> {syncError}</p>}
+                </section>
+              )}
 
               <fieldset className="control-group">
                 <legend>Horisont</legend>
@@ -932,18 +1296,6 @@ export function FplDashboard({ userName }: { userName: string }) {
               <div className="toggle-list">
                 <label className="toggle-control">
                   <span>
-                    <strong>Solio-projektioner</strong>
-                    <small>Overlay til næste gameweek</small>
-                  </span>
-                  <input
-                    type="checkbox"
-                    checked={settings.useSolio}
-                    onChange={(event) => setSettings((current) => ({ ...current, useSolio: event.target.checked }))}
-                  />
-                  <span className="toggle" aria-hidden="true"><span /></span>
-                </label>
-                <label className="toggle-control">
-                  <span>
                     <strong>Tvivlsomme spillere</strong>
                     <small>Medtag status “doubtful”</small>
                   </span>
@@ -957,13 +1309,19 @@ export function FplDashboard({ userName }: { userName: string }) {
               </div>
 
               <div className="rule-summary">
-                <span><CheckIcon /> £100,0m budget</span>
+                <span><CheckIcon /> {analysisMode === "weekly" ? "Salgspriser valideret" : "£100,0m budget"}</span>
                 <span><CheckIcon /> Maks. 3 pr. klub</span>
                 <span><CheckIcon /> Lovlig 15-mandstrup</span>
               </div>
 
-              <button className="primary-button primary-button--full" type="submit" disabled={isLoading}>
-                {isLoading ? <><span className="spinner spinner--button" /> Beregner …</> : <>{recommendation ? "Opdatér anbefaling" : "Beregn mit hold"}<ArrowRightIcon /></>}
+              <button
+                className="primary-button primary-button--full"
+                type="submit"
+                disabled={isLoading || (analysisMode === "weekly" && !plannerCanSubmit)}
+              >
+                {isLoading
+                  ? <><span className="spinner spinner--button" /> Sammenligner planer …</>
+                  : <>{recommendation ? "Opdatér anbefaling" : analysisMode === "weekly" ? "Bekræft trup og beregn" : "Byg ny trup"}<ArrowRightIcon /></>}
               </button>
               {hasUnappliedChanges && !isLoading && (
                 <p className="changed-hint" role="status"><span /> Indstillingerne er ændret</p>
@@ -978,21 +1336,25 @@ export function FplDashboard({ userName }: { userName: string }) {
 
           <div className="results" id="hold">
             {isLoading && !recommendation && <ResultSkeleton />}
-            {error && !recommendation && <ErrorState message={error} onRetry={() => void requestRecommendation(settings)} />}
-            {!isLoading && !error && !recommendation && <EmptyState onStart={() => void requestRecommendation(settings)} />}
+            {error && !recommendation && <ErrorState message={error} onRetry={runCurrentAnalysis} />}
+            {!isLoading && !error && !recommendation && (
+              <EmptyState onStart={runCurrentAnalysis} mode={analysisMode} ready={analysisMode === "initial" || plannerCanSubmit} />
+            )}
 
             {recommendation && (
               <div className={classNames("result-content", isLoading && "result-content--updating")}>
                 {isLoading && (
                   <div className="updating-banner" role="status"><span className="spinner spinner--dark" /> Opdaterer anbefalingen med dine nye valg …</div>
                 )}
-                {error && <ErrorState message={error} onRetry={() => void requestRecommendation(settings)} />}
+                {error && <ErrorState message={error} onRetry={runCurrentAnalysis} />}
 
                 <section className="result-header" aria-labelledby="team-heading">
                   <div>
-                    <p className="eyebrow">Anbefaling · {windowLabel}</p>
-                    <h2 id="team-heading">Dit optimerede hold</h2>
-                    <p>Start-XI, kaptajn og bænk inden for de officielle trupbegrænsninger.</p>
+                    <p className="eyebrow">{recommendation.planner ? `Deadline-plan · GW${recommendation.planner.target_event}` : "Anbefaling"} · {windowLabel}</p>
+                    <h2 id="team-heading">{recommendation.planner ? "Din plan til næste deadline" : "Dit optimerede hold"}</h2>
+                    <p>{recommendation.planner
+                      ? "Transfer, start-XI, kaptajn og alternativer baseret på din bekræftede trup."
+                      : "Start-XI, kaptajn og bænk inden for de officielle trupbegrænsninger."}</p>
                   </div>
                   <div className="result-actions">
                     <span className={classNames("live-status", recommendationIsStale && "live-status--stale")}>
@@ -1003,6 +1365,10 @@ export function FplDashboard({ userName }: { userName: string }) {
                     </button>
                   </div>
                 </section>
+
+                {recommendation.planner && (
+                  <TransferDecision action={recommendation.planner.best_action} horizon={recommendation.meta.horizon} />
+                )}
 
                 <div className="metrics-grid">
                   <MetricCard label="Vægtet modelscore" value={formatPoints(recommendation.summary.objective_points)} detail="XI + kaptajn + bænk" featured />
@@ -1043,20 +1409,21 @@ export function FplDashboard({ userName }: { userName: string }) {
                   data={recommendation}
                   gameweek={activeLineup?.gameweek ?? recommendation.meta.gameweek_window[0]}
                 />
+                {recommendation.planner && <PlannerAlternatives actions={recommendation.planner.alternatives} />}
                 <div id="data"><DataCoverage data={recommendation} /></div>
 
                 <section className="method-panel" id="metode" aria-labelledby="method-heading">
                   <div className="method-panel__number">03</div>
                   <div className="method-panel__copy">
                     <p className="eyebrow eyebrow--lime">Sådan skal du læse resultatet</p>
-                    <h2 id="method-heading">En beslutningsstøtte—ikke en facitliste</h2>
+                    <h2 id="method-heading">Beslutningsstøtte, ikke en facitliste</h2>
                     <p>{recommendation.experimental_notice}</p>
                     <div className="method-steps">
                       <span><strong>01</strong> Live FPL-data</span>
                       <i aria-hidden="true" />
                       <span><strong>02</strong> EP-projektioner</span>
                       <i aria-hidden="true" />
-                      <span><strong>03</strong> Eksakt optimering</span>
+                      <span><strong>03</strong> Transferoptimering</span>
                     </div>
                   </div>
                 </section>

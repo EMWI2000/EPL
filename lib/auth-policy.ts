@@ -7,8 +7,17 @@ export type GitHubSessionUser = {
 };
 
 // Better Auth requires provider-mapped additional fields to remain input-enabled.
-// Disabling this route keeps authenticated clients from rewriting the access claim.
-export const AUTH_DISABLED_PATHS = ["/update-user"] as const;
+// Keep the provider-owned claim immutable and never expose GitHub OAuth tokens
+// through browser-callable account endpoints that this app does not use.
+export const AUTH_DISABLED_PATHS = [
+  "/update-user",
+  "/get-access-token",
+  "/refresh-token",
+  "/link-social",
+  "/unlink-account",
+  "/list-accounts",
+  "/account-info",
+] as const;
 
 export function isAllowedGitHubIdentity(
   allowedGitHubId: string | undefined,

@@ -4,10 +4,10 @@ from typing import Dict, Any, List, Tuple, Optional
 import pandas as pd
 
 try:  # Package imports used by Vercel and tests.
-    from ..domain.rules import Position, SCORING
+    from ..domain.rules import LAST_GAMEWEEK, Position, SCORING
     from ..services.odds import attack_def_factors
 except ImportError:  # Legacy Streamlit working-directory imports.
-    from domain.rules import Position, SCORING
+    from domain.rules import LAST_GAMEWEEK, Position, SCORING
     from services.odds import attack_def_factors
 
 # FDR fallback-faktorer (bruges hvis ingen odds)
@@ -128,9 +128,9 @@ def gameweek_window(
         return []
 
     first = int(start_event) if start_event is not None else int(scheduled.min())
-    if first <= 0:
-        raise ValueError("start_event skal være en positiv gameweek")
-    return list(range(first, first + int(n)))
+    if not 1 <= first <= LAST_GAMEWEEK:
+        raise ValueError(f"start_event skal være mellem 1 og {LAST_GAMEWEEK}")
+    return list(range(first, min(first + int(n), LAST_GAMEWEEK + 1)))
 
 
 def get_dgw_events(

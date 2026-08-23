@@ -1,4 +1,4 @@
-"""Internal initial-squad function exposed as ``POST /api/compute``.
+"""Internal initial-squad and weekly-planner function at ``POST /api/compute``.
 
 The HTTP layer has no Streamlit dependency.  Official FPL and optional Solio
 data are fetched inside the serverless function, then passed to the existing
@@ -26,12 +26,29 @@ from fpl_app.logic.features import (
 )
 from fpl_app.logic.forecast_v2 import forecast_players_v2
 from fpl_app.logic.squad_plan import (
+    DEFAULT_BENCH_WEIGHTS,
     DEFAULT_GW_WEIGHTS,
+    GameweekPlan,
     SquadPlanError,
+    SquadPlanResult,
     optimize_squad_plan,
 )
+from fpl_app.logic.rolling_transfers import (
+    RollingTransferError,
+    TransferPlan,
+    optimize_rolling_transfers,
+)
 from fpl_app.logic.projections import overlay_solio_projections
+from fpl_app.services.fpl_price_signals import (
+    OfficialPricePayloadError,
+    parse_bootstrap_price_feed,
+)
 from fpl_app.services.fpl_api import bootstrap_static, fixtures as fetch_fixtures
+from fpl_app.services.personal_fpl_state import (
+    ManualCurrentState,
+    ManualStateValidationError,
+    parse_manual_current_state,
+)
 from fpl_app.services.solio import SolioClient, SolioError
 
 
@@ -39,14 +56,28 @@ LOGGER = logging.getLogger(__name__)
 MAX_REQUEST_BYTES = 16_384
 INTERNAL_TOKEN_ENV = "INTERNAL_API_TOKEN"
 INTERNAL_TOKEN_HEADER = "X-Internal-Token"
+MIN_INTERNAL_TOKEN_BYTES = 32
 ALLOWED_REQUEST_FIELDS = frozenset(
-    {"horizon", "include_doubtful", "use_solio", "forecast_version"}
+    {
+        "horizon",
+        "include_doubtful",
+        "use_solio",
+        "forecast_version",
+        "manager_state",
+        "manager_id",
+        "source_event",
+        "state_fingerprint",
+    }
 )
 DEFAULT_OPTIONS = {
     "horizon": 5,
     "include_doubtful": True,
-    "use_solio": True,
+    "use_solio": False,
     "forecast_version": "v2",
+    "manager_state": None,
+    "manager_id": None,
+    "source_event": None,
+    "state_fingerprint": None,
 }
 SOLIO_TIMEOUT_SECONDS = 6.0
 FORECAST_VERSIONS = frozenset({"v2", "legacy"})
@@ -91,7 +122,10 @@ def is_internal_request_authorized(
         if configured_token is None
         else configured_token
     )
-    if not isinstance(expected, str) or not expected:
+    if (
+        not isinstance(expected, str)
+        or len(expected.encode("utf-8")) < MIN_INTERNAL_TOKEN_BYTES
+    ):
         return False
     if not isinstance(provided_token, str) or not provided_token:
         return False
@@ -130,11 +164,62 @@ def validate_request_payload(payload: Any) -> dict[str, Any]:
                 details={"field": field},
             )
 
+    if options["use_solio"]:
+        raise RequestValidationError(
+            "use_solio is disabled because automated extraction is not permitted.",
+            details={"field": "use_solio"},
+        )
+
     forecast_version = options["forecast_version"]
     if not isinstance(forecast_version, str) or forecast_version not in FORECAST_VERSIONS:
         raise RequestValidationError(
             "forecast_version must be either 'v2' or 'legacy'.",
             details={"field": "forecast_version"},
+        )
+
+    manager_state = options["manager_state"]
+    if manager_state is not None and not isinstance(manager_state, Mapping):
+        raise RequestValidationError(
+            "manager_state must be a JSON object or null.",
+            details={"field": "manager_state"},
+        )
+    manager_id = options["manager_id"]
+    if manager_id is not None and (
+        isinstance(manager_id, bool) or not isinstance(manager_id, int) or manager_id < 1
+    ):
+        raise RequestValidationError(
+            "manager_id must be a positive integer or null.",
+            details={"field": "manager_id"},
+        )
+    if manager_state is not None and manager_id is None:
+        raise RequestValidationError(
+            "manager_id is required when manager_state is supplied.",
+            details={"field": "manager_id"},
+        )
+    source_event = options["source_event"]
+    if source_event is not None and (
+        isinstance(source_event, bool)
+        or not isinstance(source_event, int)
+        or not 1 <= source_event <= 38
+    ):
+        raise RequestValidationError(
+            "source_event must be an integer from 1 to 38 or null.",
+            details={"field": "source_event"},
+        )
+    if manager_state is not None and source_event is None:
+        raise RequestValidationError(
+            "source_event is required when manager_state is supplied.",
+            details={"field": "source_event"},
+        )
+    fingerprint = options["state_fingerprint"]
+    if fingerprint is not None and (
+        not isinstance(fingerprint, str)
+        or len(fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in fingerprint.lower())
+    ):
+        raise RequestValidationError(
+            "state_fingerprint must be a 64-character hexadecimal checksum or null.",
+            details={"field": "state_fingerprint"},
         )
 
     return options
@@ -150,6 +235,44 @@ def _load_official_data() -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, p
         columns={"id": "team_id"}
     )
     return bootstrap, players, fixture_table, teams
+
+
+def _attach_official_price_signals(
+    pool: pd.DataFrame,
+    bootstrap: Mapping[str, Any],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Attach allowlisted official price signals without blocking core forecasts."""
+
+    normalized = pool.copy()
+    metadata: dict[str, Any] = {
+        "available": False,
+        "player_count": 0,
+        "price_change_deadlines": [],
+        "warning": None,
+    }
+    try:
+        feed = parse_bootstrap_price_feed(bootstrap)
+    except OfficialPricePayloadError as exc:
+        LOGGER.warning("Official FPL price signals were ignored: %s", exc)
+        normalized["_price_signal"] = [None] * len(normalized)
+        metadata["warning"] = "Official price-change signals were unavailable."
+        return normalized, metadata
+
+    by_id = {
+        player.element_id: player.to_server_dict()
+        for player in feed.players
+    }
+    normalized["_price_signal"] = [
+        by_id.get(int(player_id)) for player_id in normalized["id"]
+    ]
+    metadata.update(
+        {
+            "available": True,
+            "player_count": len(feed.players),
+            "price_change_deadlines": list(feed.price_change_deadlines),
+        }
+    )
+    return normalized, metadata
 
 
 def next_open_gameweek(
@@ -537,6 +660,335 @@ def _round(value: Any, digits: int = 3) -> float:
     return round(float(value), digits)
 
 
+def _transfer_plan_as_squad_result(
+    plan: TransferPlan,
+    pool: pd.DataFrame,
+    *,
+    horizon: int,
+) -> SquadPlanResult:
+    """Adapt the transfer optimiser's chosen squad to the existing lineup DTO."""
+
+    by_id = pool.set_index("id", drop=False)
+    weights = tuple(float(value) for value in DEFAULT_GW_WEIGHTS[:horizon])
+    position_order = {"GKP": 0, "DEF": 1, "MID": 2, "FWD": 3}
+    ordered_squad = tuple(
+        sorted(
+            (int(player_id) for player_id in plan.squad_ids),
+            key=lambda player_id: (
+                position_order[str(by_id.loc[player_id, "pos"])],
+                -sum(
+                    float(by_id.loc[player_id, f"ep_gw{offset}"])
+                    * weights[offset - 1]
+                    for offset in range(1, horizon + 1)
+                ),
+                player_id,
+            ),
+        )
+    )
+
+    gameweeks: list[GameweekPlan] = []
+    weighted_objective = 0.0
+    for offset, transfer_gameweek in enumerate(plan.gameweeks, start=1):
+        ep_column = f"ep_gw{offset}"
+        no_show_column = f"no_show_prob_gw{offset}"
+        starters = tuple(int(player_id) for player_id in transfer_gameweek.starting_ids)
+        captain_id = int(transfer_gameweek.captain_id)
+        vice_id = min(
+            (player_id for player_id in starters if player_id != captain_id),
+            key=lambda player_id: (
+                -float(by_id.loc[player_id, ep_column]),
+                player_id,
+            ),
+        )
+        reserve_ids = set(ordered_squad) - set(starters)
+        outfield_reserves = sorted(
+            (
+                player_id
+                for player_id in reserve_ids
+                if str(by_id.loc[player_id, "pos"]) != "GKP"
+            ),
+            key=lambda player_id: (
+                -float(by_id.loc[player_id, ep_column])
+                * (1.0 - float(by_id.loc[player_id, no_show_column])),
+                player_id,
+            ),
+        )
+        reserve_goalkeepers = sorted(
+            player_id
+            for player_id in reserve_ids
+            if str(by_id.loc[player_id, "pos"]) == "GKP"
+        )
+        if len(outfield_reserves) != 3 or len(reserve_goalkeepers) != 1:
+            raise RecommendationUnavailableError(
+                "The transfer plan produced an invalid reserve composition."
+            )
+        bench_ids = tuple([*outfield_reserves, reserve_goalkeepers[0]])
+        xi_points = sum(float(by_id.loc[player_id, ep_column]) for player_id in starters)
+        captain_bonus = float(by_id.loc[captain_id, ep_column])
+        bench_contribution = 0.0
+        for player_id in bench_ids:
+            independent_availability = 1.0 - float(
+                by_id.loc[player_id, no_show_column]
+            )
+            reserve_weight = (
+                DEFAULT_BENCH_WEIGHTS[3]
+                if str(by_id.loc[player_id, "pos"]) == "GKP"
+                else sum(DEFAULT_BENCH_WEIGHTS[:3]) / 3.0
+            )
+            bench_contribution += (
+                float(by_id.loc[player_id, ep_column])
+                * independent_availability
+                * reserve_weight
+            )
+        objective = xi_points + captain_bonus + bench_contribution
+        weighted_objective += objective * weights[offset - 1]
+        gameweeks.append(
+            GameweekPlan(
+                gameweek=offset,
+                starting_ids=starters,
+                captain_id=captain_id,
+                vice_captain_id=vice_id,
+                bench_ids=bench_ids,
+                formation=str(transfer_gameweek.formation),
+                projected_xi_points=round(xi_points, 3),
+                projected_captain_bonus=round(captain_bonus, 3),
+                projected_bench_contribution=round(bench_contribution, 3),
+                objective_points=round(objective, 3),
+            )
+        )
+
+    total_cost = sum(int(by_id.loc[player_id, "now_cost"]) for player_id in ordered_squad)
+    return SquadPlanResult(
+        squad_ids=ordered_squad,
+        gameweeks=tuple(gameweeks),
+        total_cost_tenths=total_cost,
+        bank_tenths=int(plan.bank_after_tenths),
+        objective_points=round(weighted_objective, 3),
+        horizon=horizon,
+        gw_weights=weights,
+        forecast_columns=tuple(f"ep_gw{offset}" for offset in range(1, horizon + 1)),
+        appearance_columns=tuple(
+            f"appearance_prob_gw{offset}" for offset in range(1, horizon + 1)
+        ),
+        no_show_columns=tuple(
+            f"no_show_prob_gw{offset}" for offset in range(1, horizon + 1)
+        ),
+    )
+
+
+def _planner_player_reference(row: pd.Series) -> dict[str, Any]:
+    raw_signal = row.get("_price_signal")
+    return {
+        "id": int(row["id"]),
+        "name": str(row["name"]),
+        "team": str(row["team"]),
+        "position": str(row["pos"]),
+        "price_tenths": int(row["now_cost"]),
+        "status": str(row["status"]),
+        "price_signal": dict(raw_signal) if isinstance(raw_signal, Mapping) else None,
+    }
+
+
+def _serialize_transfer_action(
+    plan: TransferPlan,
+    *,
+    pool: pd.DataFrame,
+    window: list[int],
+    roll: TransferPlan,
+) -> dict[str, Any]:
+    by_id = pool.set_index("id", drop=False)
+    transfers: list[dict[str, Any]] = []
+    for move in plan.transfers:
+        transfers.append(
+            {
+                **move.as_dict(),
+                "out": _planner_player_reference(by_id.loc[int(move.out_id)]),
+                "in": _planner_player_reference(by_id.loc[int(move.in_id)]),
+            }
+        )
+    kind = "roll" if plan.transfer_count == 0 else (
+        "hit" if plan.hit_points > 0 else "transfer"
+    )
+    if kind == "roll":
+        explanation = (
+            "Ingen af de testede lovlige transfers slår værdien af at gemme "
+            f"transferen. Du går ind i næste runde med "
+            f"{plan.free_transfers_next_gameweek} frie transfers."
+        )
+    else:
+        moves = "; ".join(
+            f"sælg {move['out']['name']} og køb {move['in']['name']}"
+            for move in transfers
+        )
+        explanation = (
+            f"Modellen anbefaler at {moves}. Planen er vurderet over "
+            f"{len(window)} gameweeks og inkluderer eventuelle hit-omkostninger."
+        )
+    net_points_vs_roll = (
+        float(plan.projected_points)
+        - float(plan.hit_points)
+        - float(roll.projected_points)
+    )
+    return {
+        "kind": kind,
+        "transfer_count": int(plan.transfer_count),
+        "transfers": transfers,
+        "squad_ids": [int(player_id) for player_id in plan.squad_ids],
+        "gameweeks": [
+            {
+                **gameweek.as_dict(),
+                "gameweek": int(window[index]),
+            }
+            for index, gameweek in enumerate(plan.gameweeks)
+        ],
+        "bank_before_tenths": int(plan.bank_before_tenths),
+        "bank_after_tenths": int(plan.bank_after_tenths),
+        "free_transfers_before": int(plan.free_transfers_before),
+        "free_transfers_next_gameweek": int(plan.free_transfers_next_gameweek),
+        "hit_points": int(plan.hit_points),
+        "projected_points": _round(plan.projected_points),
+        "banked_ft_value_points": _round(plan.banked_ft_value_points),
+        "decision_value_points": _round(plan.decision_value_points),
+        "net_points_vs_roll": _round(net_points_vs_roll),
+        "decision_value_vs_roll": _round(
+            float(plan.decision_value_points) - float(roll.decision_value_points)
+        ),
+        "explanation": explanation,
+    }
+
+
+def _build_weekly_plan(
+    *,
+    pool: pd.DataFrame,
+    options: Mapping[str, Any],
+    window: list[int],
+) -> tuple[SquadPlanResult, pd.DataFrame, int, dict[str, Any]]:
+    try:
+        state = parse_manual_current_state(
+            options["manager_state"],
+            known_player_ids={int(value) for value in pool["id"]},
+        )
+    except ManualStateValidationError as exc:
+        raise RequestValidationError(
+            str(exc),
+            details={"field": "manager_state"},
+        ) from exc
+    if state.effective_event is not None and state.effective_event != window[0]:
+        raise RequestValidationError(
+            "manager_state is stale; sync the squad again for the next deadline.",
+            details={"field": "manager_state.effective_event"},
+        )
+    if not state.no_active_chip_confirmed:
+        raise RequestValidationError(
+            "Confirm that no chip is active for the target gameweek.",
+            details={"field": "manager_state.no_active_chip_confirmed"},
+        )
+    if int(options["source_event"]) >= int(window[0]):
+        raise RequestValidationError(
+            "source_event must be earlier than the target gameweek.",
+            details={"field": "source_event"},
+        )
+    active_chips = [name for name, status in state.chips if status == "active"]
+    if active_chips:
+        raise RequestValidationError(
+            "Active chips are not modelled in this planner version.",
+            details={"field": "manager_state.chips", "active": active_chips},
+        )
+
+    statuses = {"a", "d"} if options["include_doubtful"] else {"a"}
+    eligible = pool[pool["status"].isin(statuses)].copy()
+    current = pool[pool["id"].isin(state.current_squad_ids)].copy()
+    if len(current) != 15:
+        raise RequestValidationError(
+            "manager_state contains players that are no longer in the official pool.",
+            details={"field": "manager_state.current_squad_ids"},
+        )
+    shortlist = _shortlist_optimizer_pool(eligible, int(options["horizon"]))
+    optimizer_pool = (
+        pd.concat([shortlist, current], ignore_index=True)
+        .drop_duplicates(subset=["id"], keep="first")
+        .sort_values("id", kind="stable")
+        .reset_index(drop=True)
+    )
+    optimizer_pool["purchase_price"] = pd.NA
+    optimizer_pool["selling_price"] = pd.NA
+    prices = {row.element_id: row for row in state.player_prices}
+    owned_mask = optimizer_pool["id"].isin(state.current_squad_ids)
+    optimizer_pool.loc[owned_mask, "purchase_price"] = optimizer_pool.loc[
+        owned_mask, "id"
+    ].map(lambda value: prices[int(value)].purchase_price_tenths)
+    optimizer_pool.loc[owned_mask, "selling_price"] = optimizer_pool.loc[
+        owned_mask, "id"
+    ].map(lambda value: prices[int(value)].selling_price_tenths)
+
+    try:
+        rolling = optimize_rolling_transfers(
+            optimizer_pool,
+            state.current_squad_ids,
+            bank_tenths=state.bank_tenths,
+            free_transfers=state.free_transfers,
+            horizon=int(options["horizon"]),
+            gw_weights=DEFAULT_GW_WEIGHTS[: int(options["horizon"])],
+        )
+    except RollingTransferError as exc:
+        message = str(exc)
+        if "selling_price" in message:
+            message = "Player prices changed after sync; fetch the squad again."
+        raise RecommendationUnavailableError(message) from exc
+
+    result = _transfer_plan_as_squad_result(
+        rolling.best_action,
+        optimizer_pool,
+        horizon=int(options["horizon"]),
+    )
+    visible_pool = (
+        pd.concat([eligible, current], ignore_index=True)
+        .drop_duplicates(subset=["id"], keep="first")
+        .sort_values("id", kind="stable")
+    )
+    current_by_id = pool.set_index("id", drop=False)
+    planner_payload = {
+        "manager_id": int(options["manager_id"]),
+        "state_fingerprint": options.get("state_fingerprint"),
+        "source_event": int(options["source_event"]),
+        "target_event": int(window[0]),
+        "confirmed_state": {
+            "bank_tenths": int(state.bank_tenths),
+            "free_transfers": int(state.free_transfers),
+            "no_active_chip_confirmed": True,
+            "squad": [
+                _planner_player_reference(current_by_id.loc[player_id])
+                for player_id in state.current_squad_ids
+            ],
+        },
+        "best_action": _serialize_transfer_action(
+            rolling.best_action,
+            pool=optimizer_pool,
+            window=window,
+            roll=rolling.roll,
+        ),
+        "alternatives": [
+            _serialize_transfer_action(
+                alternative,
+                pool=optimizer_pool,
+                window=window,
+                roll=rolling.roll,
+            )
+            for alternative in rolling.alternatives[:4]
+        ],
+        "method": {
+            "candidate_count": int(len(optimizer_pool)),
+            "plans_per_transfer_count": 5,
+            "higher_transfer_count_plans": 1,
+            "maximum_immediate_transfers": max(2, int(state.free_transfers)),
+            "roll_ft_value_points": _round(rolling.roll_ft_value_points),
+            "chips_modelled": False,
+            "future_transfers_modelled": False,
+        },
+    }
+    return result, visible_pool, len(optimizer_pool), planner_payload
+
+
 def _serialize_recommendation(
     *,
     result: Any,
@@ -546,6 +998,8 @@ def _serialize_recommendation(
     official_player_count: int,
     optimizer_candidate_count: int,
     solio_metadata: Mapping[str, Any],
+    price_metadata: Mapping[str, Any] | None = None,
+    planner_payload: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     by_id = eligible.set_index("id", drop=False)
     weights = tuple(float(weight) for weight in result.gw_weights)
@@ -613,6 +1067,8 @@ def _serialize_recommendation(
             for offset in range(1, len(window) + 1)
         )
         price_tenths = int(row["now_cost"])
+        raw_price_signal = row.get("_price_signal")
+        price_signal = dict(raw_price_signal) if isinstance(raw_price_signal, Mapping) else None
         return {
             "id": int(player_id),
             "name": str(row["name"]),
@@ -627,6 +1083,7 @@ def _serialize_recommendation(
             "is_vice_captain": int(player_id) == int(first_plan.vice_captain_id),
             "bench_order": bench_order.get(int(player_id)),
             "weighted_ep": _round(weighted_ep),
+            "price_signal": price_signal,
             "projections": projections,
         }
 
@@ -676,7 +1133,7 @@ def _serialize_recommendation(
         ),
     }
 
-    return {
+    response: dict[str, Any] = {
         "meta": {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "gameweek_window": [int(gameweek) for gameweek in window],
@@ -684,6 +1141,7 @@ def _serialize_recommendation(
             "forecast_version": forecast_version,
             "include_doubtful": bool(options["include_doubtful"]),
             "use_solio_requested": bool(options["use_solio"]),
+            "mode": "weekly" if planner_payload is not None else "initial_squad",
             "validation": validation,
             "data_sources": {
                 "fpl": {
@@ -693,6 +1151,7 @@ def _serialize_recommendation(
                     "shortlist_method": "position_price_value_and_per_gw_v1",
                 },
                 "solio": dict(solio_metadata),
+                "price_signals": dict(price_metadata or {}),
             },
         },
         "summary": {
@@ -716,10 +1175,13 @@ def _serialize_recommendation(
         },
         "experimental_notice": EXPERIMENTAL_NOTICE_DA,
     }
+    if planner_payload is not None:
+        response["planner"] = dict(planner_payload)
+    return response
 
 
 def generate_recommendation(payload: Any = None) -> dict[str, Any]:
-    """Generate a JSON-serializable initial-squad recommendation."""
+    """Generate a JSON-serializable initial squad or weekly transfer plan."""
 
     options = validate_request_payload(payload)
     bootstrap, official_players, fixture_table, teams = _load_official_data()
@@ -733,6 +1195,8 @@ def generate_recommendation(payload: Any = None) -> dict[str, Any]:
     )
     if not window:
         raise RecommendationUnavailableError("No scheduled upcoming gameweeks are available.")
+    if len(window) != int(options["horizon"]):
+        options = {**options, "horizon": len(window)}
 
     pool = _build_forecast_pool(
         official_players,
@@ -743,6 +1207,7 @@ def generate_recommendation(payload: Any = None) -> dict[str, Any]:
         options["forecast_version"],
     )
     pool = _ensure_optimizer_contract(pool, options["horizon"])
+    pool, price_metadata = _attach_official_price_signals(pool, bootstrap)
     solio_metadata = _empty_solio_metadata(requested=options["use_solio"])
     if options["use_solio"]:
         pool, solio_metadata = _apply_solio_overlay(
@@ -751,17 +1216,26 @@ def generate_recommendation(payload: Any = None) -> dict[str, Any]:
             first_gameweek=window[0],
         )
 
-    statuses = {"a", "d"} if options["include_doubtful"] else {"a"}
-    eligible = pool[pool["status"].isin(statuses)].copy()
-    optimizer_pool = _shortlist_optimizer_pool(eligible, options["horizon"])
-    try:
-        result = optimize_squad_plan(
-            optimizer_pool,
-            horizon=options["horizon"],
-            gw_weights=DEFAULT_GW_WEIGHTS[: options["horizon"]],
+    planner_payload: Mapping[str, Any] | None = None
+    if options["manager_state"] is not None:
+        result, eligible, optimizer_candidate_count, planner_payload = _build_weekly_plan(
+            pool=pool,
+            options=options,
+            window=window,
         )
-    except SquadPlanError as exc:
-        raise RecommendationUnavailableError(str(exc)) from exc
+    else:
+        statuses = {"a", "d"} if options["include_doubtful"] else {"a"}
+        eligible = pool[pool["status"].isin(statuses)].copy()
+        optimizer_pool = _shortlist_optimizer_pool(eligible, options["horizon"])
+        optimizer_candidate_count = len(optimizer_pool)
+        try:
+            result = optimize_squad_plan(
+                optimizer_pool,
+                horizon=options["horizon"],
+                gw_weights=DEFAULT_GW_WEIGHTS[: options["horizon"]],
+            )
+        except SquadPlanError as exc:
+            raise RecommendationUnavailableError(str(exc)) from exc
 
     return _serialize_recommendation(
         result=result,
@@ -769,8 +1243,10 @@ def generate_recommendation(payload: Any = None) -> dict[str, Any]:
         window=window,
         options=options,
         official_player_count=len(official_players),
-        optimizer_candidate_count=len(optimizer_pool),
+        optimizer_candidate_count=optimizer_candidate_count,
         solio_metadata=solio_metadata,
+        price_metadata=price_metadata,
+        planner_payload=planner_payload,
     )
 
 

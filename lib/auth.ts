@@ -64,11 +64,14 @@ export const auth = betterAuth({
       maxAge: 7 * 24 * 60 * 60,
       strategy: "jwe",
       refreshCache: true,
-      version: process.env.SESSION_VERSION ?? "1",
+      version: authEnvironment("SESSION_VERSION", "1")!,
     },
   },
   account: {
     storeStateStrategy: "cookie",
-    storeAccountCookie: true,
+    // The GitHub token is only needed during the OAuth callback. The app never
+    // calls GitHub on the user's behalf after sign-in, so do not retain token
+    // material in a browser cookie.
+    storeAccountCookie: false,
   },
 });

@@ -7,8 +7,16 @@ import {
   isAllowedGitHubSessionUser,
 } from "../lib/auth-policy.ts";
 
-test("prevents clients from rewriting the provider-owned access claim", () => {
-  assert.deepEqual(AUTH_DISABLED_PATHS, ["/update-user"]);
+test("blocks provider-claim mutation and browser OAuth-token endpoints", () => {
+  assert.deepEqual(AUTH_DISABLED_PATHS, [
+    "/update-user",
+    "/get-access-token",
+    "/refresh-token",
+    "/link-social",
+    "/unlink-account",
+    "/list-accounts",
+    "/account-info",
+  ]);
 });
 
 test("allows the configured immutable GitHub identity", () => {

@@ -47,6 +47,15 @@ def test_gameweek_window_is_global_and_consecutive():
     assert [f["event"] for f in next_n_fixtures_for_team(fixtures, team_id=1, n=3)] == [1, 3]
 
 
+def test_gameweek_window_stops_at_the_end_of_the_season():
+    fixtures = _fixtures(
+        [(37, 1, 2, 2, 3, "2027-05-16T14:00:00Z")]
+    )
+
+    assert gameweek_window(fixtures, n=5, start_event=37) == [37, 38]
+    assert gameweek_window(fixtures, n=5, start_event=38) == [38]
+
+
 def test_expected_points_preserve_blank_gameweek_as_zero():
     fixtures = _fixtures(
         [
