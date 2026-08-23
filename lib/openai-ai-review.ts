@@ -105,6 +105,70 @@ function safeDataText(value: string, maximum: number): string {
     .slice(0, maximum);
 }
 
+function normalizeOptionalText(value: unknown, maximum: number): unknown {
+  return typeof value === "string" ? safeDataText(value, maximum) : value;
+}
+
+function normalizeOptionalTextArray(value: unknown, maximum: number): unknown {
+  return Array.isArray(value)
+    ? value.map((item) => normalizeOptionalText(item, maximum))
+    : value;
+}
+
+function normalizeReviewTextFields(value: unknown): unknown {
+  const root = unknownRecord(value);
+  if (!root) return value;
+
+  const strategic = unknownRecord(root.strategic_outlook);
+  const normalizedStrategic = strategic
+    ? {
+        ...strategic,
+        summary: normalizeOptionalText(strategic.summary, 900),
+        priorities: normalizeOptionalTextArray(strategic.priorities, 280),
+        watchpoints: Array.isArray(strategic.watchpoints)
+          ? strategic.watchpoints.map((watchpoint) => {
+              const item = unknownRecord(watchpoint);
+              return item
+                ? {
+                    ...item,
+                    subject: normalizeOptionalText(item.subject, 100),
+                    reason: normalizeOptionalText(item.reason, 280),
+                    trigger: normalizeOptionalText(item.trigger, 280),
+                  }
+                : watchpoint;
+            })
+          : strategic.watchpoints,
+      }
+    : root.strategic_outlook;
+
+  const normalizedEvidence = Array.isArray(root.qualitative_evidence)
+    ? root.qualitative_evidence.map((evidence) => {
+        const item = unknownRecord(evidence);
+        return item
+          ? {
+              ...item,
+              subject: normalizeOptionalText(item.subject, 100),
+              finding: normalizeOptionalText(item.finding, 360),
+            }
+          : evidence;
+      })
+    : root.qualitative_evidence;
+
+  return {
+    ...root,
+    headline: normalizeOptionalText(root.headline, 140),
+    summary: normalizeOptionalText(root.summary, 700),
+    rationale: normalizeOptionalTextArray(root.rationale, 280),
+    risks: normalizeOptionalTextArray(root.risks, 280),
+    change_triggers: normalizeOptionalTextArray(root.change_triggers, 280),
+    deadline_checklist: normalizeOptionalTextArray(root.deadline_checklist, 240),
+    evidence_summary: normalizeOptionalText(root.evidence_summary, 900),
+    data_gaps: normalizeOptionalTextArray(root.data_gaps, 280),
+    strategic_outlook: normalizedStrategic,
+    qualitative_evidence: normalizedEvidence,
+  };
+}
+
 function priceInMillions(value: number): number {
   return Math.round(value) / 10;
 }
@@ -370,7 +434,12 @@ export function parseOpenAiReviewResponseBody(
 
   let review: AiReviewModelOutput;
   try {
-    review = parseAiReviewModelOutput(parsed, alternativeCount, expectedHorizon, targetEvent);
+    review = parseAiReviewModelOutput(
+      normalizeReviewTextFields(parsed),
+      alternativeCount,
+      expectedHorizon,
+      targetEvent,
+    );
   } catch (error) {
     const safePath = error instanceof AiReviewContractError ? error.path : "review";
     throw new OpenAiReviewError(

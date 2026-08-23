@@ -297,9 +297,29 @@ test("fails closed on incomplete, refusal, missing research and malformed struct
   );
 });
 
+test("normalizes cosmetic model text without weakening structural validation", () => {
+  const verbose = reviewFixture();
+  verbose.rationale[1] = `${"Lang begrundelse ".repeat(30)}\nmed linjeskift`;
+
+  const result = parseOpenAiReviewResponseBody({
+    status: "completed",
+    output: [
+      {
+        type: "web_search_call",
+        action: { sources: [{ url: "https://www.premierleague.com/news/123" }] },
+      },
+      { type: "message", content: [{ type: "output_text", text: JSON.stringify(verbose) }] },
+    ],
+  }, 1);
+
+  assert.equal(result.review.rationale[1].length, 280);
+  assert.equal(result.review.rationale[1].includes("\n"), false);
+});
+
 test("reports only the fixed contract path when semantic output validation fails", () => {
   const invalid = reviewFixture();
-  invalid.headline = "x".repeat(141);
+  invalid.verdict = "wait_for_information";
+  invalid.execution_timing = "act_now";
 
   assert.throws(
     () => parseOpenAiReviewResponseBody({
@@ -312,7 +332,7 @@ test("reports only the fixed contract path when semantic output validation fails
         { type: "message", content: [{ type: "output_text", text: JSON.stringify(invalid) }] },
       ],
     }, 1),
-    /unsupported review shape at review\.headline/,
+    /unsupported review shape at review\.execution_timing/,
   );
 });
 
