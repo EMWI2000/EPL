@@ -193,6 +193,13 @@ test("builds an allowlisted compact entry without identity or secret-shaped fiel
   assert.doesNotMatch(serialized, /manager_id|github_id|internal_token|secret-token/);
 });
 
+test("preserves zero remaining free transfers for the current deadline", () => {
+  const entry = build();
+  entry.confirmed.free_transfers = 0;
+
+  assert.equal(parseDecisionHistoryEntry(entry).confirmed.free_transfers, 0);
+});
+
 test("stores a validated alternative or wait verdict without raw AI output", () => {
   const alternative = build(aiReview("prefer_alternative"));
   assert.deepEqual(alternative.selection, { kind: "alternative", alternative_index: 0 });

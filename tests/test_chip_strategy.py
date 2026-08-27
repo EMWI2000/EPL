@@ -141,6 +141,21 @@ def test_returns_personalized_four_chip_scenarios_and_current_call() -> None:
     assert result.globally_optimal is False
 
 
+def test_accepts_zero_remaining_free_transfers_for_the_current_deadline() -> None:
+    result = evaluate_chip_strategy(
+        _players(),
+        _roadmap(),
+        target_event=2,
+        chip_usage=_usage(),
+        current_squad_ids=tuple(range(1, 16)),
+        bank_tenths=0,
+        free_transfers=0,
+        chip_solver_budget_seconds=2.0,
+    )
+
+    assert len(result.scenarios) == 4
+
+
 def test_used_chip_is_unavailable_only_in_its_used_half() -> None:
     first_half = evaluate_chip_strategy(
         _players(),

@@ -16,6 +16,10 @@ export const DEFAULT_OPENAI_REASONING_EFFORT: AiReviewReasoningEffort = "xhigh";
 export const DEFAULT_OPENAI_REVIEW_TIMEOUT_MS = 285_000;
 export const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 export const MAX_OPENAI_REVIEW_REQUEST_BYTES = 65_536;
+export const MAX_OPENAI_REVIEW_OUTPUT_TOKENS = 32_000;
+
+const MIN_OPENAI_RETRY_TIME_MS = 15_000;
+const OPENAI_RETRY_RESERVE_MS = 90_000;
 
 const ALLOWED_OPENAI_REVIEW_MODELS = new Set([DEFAULT_OPENAI_REVIEW_MODEL]);
 const ALLOWED_OPENAI_REASONING_EFFORTS = new Set<AiReviewReasoningEffort>([
@@ -53,14 +57,38 @@ export type OpenAiReviewErrorKind =
   | "refusal"
   | "invalid_response";
 
+export type OpenAiReviewFallbackReason =
+  | "max_output_tokens"
+  | "timeout"
+  | "upstream";
+
 export class OpenAiReviewError extends Error {
   readonly kind: OpenAiReviewErrorKind;
+  readonly attemptCount: number | null;
+  readonly fallbackReason: OpenAiReviewFallbackReason | null;
 
-  constructor(kind: OpenAiReviewErrorKind, message: string) {
+  constructor(
+    kind: OpenAiReviewErrorKind,
+    message: string,
+    metadata: {
+      attemptCount?: number;
+      fallbackReason?: OpenAiReviewFallbackReason | null;
+    } = {},
+  ) {
     super(message);
     this.name = "OpenAiReviewError";
     this.kind = kind;
+    this.attemptCount = metadata.attemptCount ?? null;
+    this.fallbackReason = metadata.fallbackReason ?? null;
   }
+}
+
+function withAttemptMetadata(
+  error: OpenAiReviewError,
+  attemptCount: number,
+  fallbackReason: OpenAiReviewFallbackReason | null,
+): OpenAiReviewError {
+  return new OpenAiReviewError(error.kind, error.message, { attemptCount, fallbackReason });
 }
 
 export function configuredOpenAiApiKey(
@@ -92,12 +120,18 @@ export function configuredOpenAiReasoningEffort(
 
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
-type OpenAiResponseResult = {
+type ParsedOpenAiResponseResult = {
   review: AiReviewModelOutput;
   research: {
     performed: boolean;
     sources: AiReviewSource[];
   };
+};
+
+type OpenAiResponseResult = ParsedOpenAiResponseResult & {
+  reasoningEffort: AiReviewReasoningEffort;
+  attemptCount: number;
+  fallbackReason: OpenAiReviewFallbackReason | null;
 };
 
 function safeDataText(value: string, maximum: number): string {
@@ -457,6 +491,7 @@ export function buildOpenAiReviewRequestBody(
   request: AiReviewRequest,
   model: string,
   reasoningEffort: AiReviewReasoningEffort = DEFAULT_OPENAI_REASONING_EFFORT,
+  maxOutputTokens: number = MAX_OPENAI_REVIEW_OUTPUT_TOKENS,
 ) {
   configuredOpenAiReviewModel(model);
   configuredOpenAiReasoningEffort(reasoningEffort);
@@ -488,7 +523,7 @@ export function buildOpenAiReviewRequestBody(
     tool_choice: "required",
     max_tool_calls: 4,
     include: ["web_search_call.action.sources"],
-    max_output_tokens: 16_000,
+    max_output_tokens: maxOutputTokens,
     text: {
       verbosity: "medium",
       format: {
@@ -540,7 +575,7 @@ export function parseOpenAiReviewResponseBody(
   expectedHorizon?: number,
   targetEvent?: number,
   allowedSourceDomains: readonly string[] = AI_REVIEW_ALLOWED_SOURCE_DOMAINS,
-): OpenAiResponseResult {
+): ParsedOpenAiResponseResult {
   const root = unknownRecord(value);
   if (!root) throw new OpenAiReviewError("invalid_response", "OpenAI returned invalid JSON.");
   if (root.status !== "completed") {
@@ -550,6 +585,12 @@ export function parseOpenAiReviewResponseBody(
         ? " because max_output_tokens was reached"
         : "";
       throw new OpenAiReviewError("incomplete", `OpenAI did not complete the review${safeReason}.`);
+    }
+    if (root.status === "failed") {
+      const failure = unknownRecord(root.error);
+      if (failure?.code === "server_error") {
+        throw new OpenAiReviewError("upstream", "OpenAI failed to generate the review.");
+      }
     }
     throw new OpenAiReviewError("invalid_response", "OpenAI did not complete the review.");
   }
@@ -660,55 +701,127 @@ export async function requestOpenAiReview(
   const apiKey = options.apiKey.trim();
   if (!apiKey) throw new OpenAiReviewError("configuration", "OPENAI_API_KEY is missing.");
   const fetchImpl = options.fetchImpl ?? fetch;
-  const body = buildOpenAiReviewRequestBody(
-    request,
-    options.model,
-    options.reasoningEffort,
-  );
+  const primaryEffort = options.reasoningEffort ?? DEFAULT_OPENAI_REASONING_EFFORT;
+  const deadline = Date.now() + (options.timeoutMs ?? DEFAULT_OPENAI_REVIEW_TIMEOUT_MS);
+  let retryableError: OpenAiReviewError | null = null;
+  let fallbackReason: OpenAiResponseResult["fallbackReason"] = null;
 
-  let upstream: Response;
-  try {
-    upstream = await fetchImpl(OPENAI_RESPONSES_URL, {
-      method: "POST",
-      headers: {
-        Accept: "application/json",
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-      cache: "no-store",
-      redirect: "error",
-      signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_OPENAI_REVIEW_TIMEOUT_MS),
-    });
-  } catch (error) {
-    const name = error instanceof Error ? error.name : "";
-    if (name === "AbortError" || name === "TimeoutError") {
+  for (const index of [0, 1] as const) {
+    const reasoningEffort = index === 0 || fallbackReason === "upstream"
+      ? primaryEffort
+      : "high";
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0 || (index > 0 && remainingMs < MIN_OPENAI_RETRY_TIME_MS)) {
+      if (retryableError) throw retryableError;
       throw new OpenAiReviewError("timeout", "OpenAI review timed out.");
     }
-    throw new OpenAiReviewError("upstream", "OpenAI could not be reached.");
-  }
+    const retryReserveMs = index === 0 && remainingMs >= MIN_OPENAI_RETRY_TIME_MS * 2
+      ? Math.min(OPENAI_RETRY_RESERVE_MS, Math.floor(remainingMs / 3))
+      : 0;
+    const attemptTimeoutMs = Math.max(1, remainingMs - retryReserveMs);
+    const body = buildOpenAiReviewRequestBody(
+      request,
+      options.model,
+      reasoningEffort,
+      MAX_OPENAI_REVIEW_OUTPUT_TOKENS,
+    );
 
-  if (!upstream.ok) {
-    if (upstream.status === 401 || upstream.status === 403) {
-      throw new OpenAiReviewError("configuration", "OpenAI rejected the server credentials.");
+    let upstream: Response;
+    try {
+      upstream = await fetchImpl(OPENAI_RESPONSES_URL, {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+        cache: "no-store",
+        redirect: "error",
+        signal: AbortSignal.timeout(attemptTimeoutMs),
+      });
+    } catch (error) {
+      const name = error instanceof Error ? error.name : "";
+      const mapped = name === "AbortError" || name === "TimeoutError"
+        ? new OpenAiReviewError("timeout", "OpenAI review timed out.")
+        : new OpenAiReviewError("upstream", "OpenAI could not be reached.");
+      if (index === 0) {
+        fallbackReason = mapped.kind === "timeout" ? "timeout" : "upstream";
+        retryableError = withAttemptMetadata(mapped, 1, fallbackReason);
+        continue;
+      }
+      throw withAttemptMetadata(mapped, 2, fallbackReason);
     }
-    if (upstream.status === 429) {
-      throw new OpenAiReviewError("rate_limited", "OpenAI rate limit reached.");
-    }
-    throw new OpenAiReviewError("upstream", "OpenAI returned an upstream error.");
-  }
 
-  let responseBody: unknown;
-  try {
-    responseBody = await upstream.json() as unknown;
-  } catch {
-    throw new OpenAiReviewError("invalid_response", "OpenAI returned a non-JSON response.");
+    if (!upstream.ok) {
+      if (upstream.status === 401 || upstream.status === 403) {
+        throw withAttemptMetadata(
+          new OpenAiReviewError("configuration", "OpenAI rejected the server credentials."),
+          index + 1,
+          fallbackReason,
+        );
+      }
+      if (upstream.status === 429) {
+        throw withAttemptMetadata(
+          new OpenAiReviewError("rate_limited", "OpenAI rate limit reached."),
+          index + 1,
+          fallbackReason,
+        );
+      }
+      const mapped = new OpenAiReviewError("upstream", "OpenAI returned an upstream error.");
+      if (index === 0 && upstream.status >= 500) {
+        fallbackReason = "upstream";
+        retryableError = withAttemptMetadata(mapped, 1, fallbackReason);
+        continue;
+      }
+      throw withAttemptMetadata(mapped, index + 1, fallbackReason);
+    }
+
+    let responseBody: unknown;
+    try {
+      responseBody = await upstream.json() as unknown;
+    } catch (error) {
+      const name = error instanceof Error ? error.name : "";
+      const mapped = name === "AbortError" || name === "TimeoutError"
+        ? new OpenAiReviewError("timeout", "OpenAI review timed out while reading the response.")
+        : new OpenAiReviewError("invalid_response", "OpenAI returned a non-JSON response.");
+      if (index === 0 && mapped.kind === "timeout") {
+        fallbackReason = "timeout";
+        retryableError = withAttemptMetadata(mapped, 1, fallbackReason);
+        continue;
+      }
+      throw withAttemptMetadata(mapped, index + 1, fallbackReason);
+    }
+    try {
+      return {
+        ...parseOpenAiReviewResponseBody(
+          responseBody,
+          request.planner.alternatives.length,
+          request.planner.strategy?.horizon ?? request.forecast.horizon,
+          request.planner.target_event,
+          reviewSourceDomains(request),
+        ),
+        reasoningEffort,
+        attemptCount: index + 1,
+        fallbackReason,
+      };
+    } catch (error) {
+      if (error instanceof OpenAiReviewError && index === 0) {
+        if (error.kind === "incomplete") {
+          fallbackReason = "max_output_tokens";
+          retryableError = withAttemptMetadata(error, 1, fallbackReason);
+          continue;
+        }
+        if (error.kind === "upstream") {
+          fallbackReason = "upstream";
+          retryableError = withAttemptMetadata(error, 1, fallbackReason);
+          continue;
+        }
+      }
+      throw error instanceof OpenAiReviewError
+        ? withAttemptMetadata(error, index + 1, fallbackReason)
+        : error;
+    }
   }
-  return parseOpenAiReviewResponseBody(
-    responseBody,
-    request.planner.alternatives.length,
-    request.planner.strategy?.horizon ?? request.forecast.horizon,
-    request.planner.target_event,
-    reviewSourceDomains(request),
-  );
+  throw retryableError ?? new OpenAiReviewError("incomplete", "OpenAI did not complete the review.");
 }

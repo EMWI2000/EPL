@@ -20,6 +20,8 @@ VALID_INTERNAL_TOKEN = "manager-sync-token-with-at-least-32-bytes"
 
 
 def _element_type(element_id: int) -> int:
+    if element_id >= 16:
+        return element_id - 15
     if element_id <= 2:
         return 1
     if element_id <= 7:
@@ -88,7 +90,7 @@ def _public_state(*, active_chip: str | None = None) -> PublicLastDeadlineState:
 
 def _bootstrap() -> dict:
     elements = []
-    for element_id in range(1, 16):
+    for element_id in range(1, 20):
         now_cost = 56 if element_id == 1 else (55 if element_id == 2 else 50)
         change_start = 2 if element_id == 1 else (1 if element_id == 2 else 0)
         elements.append(
@@ -222,7 +224,7 @@ def test_manager_sync_enriches_prices_and_returns_confirmation_draft(
         "name": "Gameweek 7",
         "deadline_time": "2026-08-30T17:30:00Z",
     }
-    assert response["schema_version"] == "fpl-manager-state-response-v2"
+    assert response["schema_version"] == "fpl-manager-state-response-v3"
     assert response["last_deadline_state"]["chip_usage"] == [
         {"name": "freehit", "event": 6}
     ]
@@ -243,6 +245,18 @@ def test_manager_sync_enriches_prices_and_returns_confirmation_draft(
     assert picks[0]["official_price_signal"]["price_change_percent"] == 95.5
     assert response["price_signals"]["available"] is True
     assert response["price_signals"]["warning"] is None
+
+    player_catalog = response["player_catalog"]
+    assert len(player_catalog) == 19
+    assert [player["id"] for player in player_catalog] == list(range(1, 20))
+    assert player_catalog[0] == {
+        "id": 1,
+        "display_name": "Player 1",
+        "position": "GKP",
+        "team_id": 1,
+        "team_name": "Club 1",
+        "current_price_tenths": 56,
+    }
 
     # With no public acquisition, purchase price falls back conservatively to
     # current price minus the official season change.  A one-tenth rise yields
@@ -280,6 +294,69 @@ def test_manager_sync_enriches_prices_and_returns_confirmation_draft(
     assert "source_urls" not in encoded
     assert "internal-source.example" not in encoded
     assert "X-Internal-Token" not in encoded
+
+
+def test_catalog_skips_invalid_non_owned_rows_but_keeps_owned_rows_mandatory() -> None:
+    bootstrap = _bootstrap()
+    invalid_unowned = dict(bootstrap["elements"][15])
+    invalid_unowned.update({"id": 20, "web_name": ""})
+    bootstrap["elements"].append(invalid_unowned)
+    players, teams, positions = manager_state._catalogue_indexes(bootstrap)
+
+    catalog = manager_state._public_player_catalog(
+        players,
+        teams,
+        positions,
+        owned_player_ids=range(1, 16),
+    )
+
+    assert 20 not in {player["id"] for player in catalog}
+    assert {player["position"] for player in catalog if player["id"] > 15} == {
+        "GKP",
+        "DEF",
+        "MID",
+        "FWD",
+    }
+
+    bootstrap = _bootstrap()
+    bootstrap["elements"][0]["web_name"] = ""
+    players, teams, positions = manager_state._catalogue_indexes(bootstrap)
+    with pytest.raises(manager_state.UpstreamPayloadError, match="player 1.web_name"):
+        manager_state._public_player_catalog(
+            players,
+            teams,
+            positions,
+            owned_player_ids=range(1, 16),
+        )
+
+    bootstrap = _bootstrap()
+    bootstrap["elements"] = [
+        player for player in bootstrap["elements"] if player["id"] != 1
+    ]
+    players, teams, positions = manager_state._catalogue_indexes(bootstrap)
+    with pytest.raises(manager_state.UpstreamPayloadError, match="missing owned player ids: 1"):
+        manager_state._public_player_catalog(
+            players,
+            teams,
+            positions,
+            owned_player_ids=range(1, 16),
+        )
+
+
+def test_catalog_requires_a_non_owned_candidate_for_every_position() -> None:
+    bootstrap = _bootstrap()
+    bootstrap["elements"] = [
+        player for player in bootstrap["elements"] if player["id"] != 16
+    ]
+    players, teams, positions = manager_state._catalogue_indexes(bootstrap)
+
+    with pytest.raises(manager_state.UpstreamPayloadError, match="non-owned candidate.*GKP"):
+        manager_state._public_player_catalog(
+            players,
+            teams,
+            positions,
+            owned_player_ids=range(1, 16),
+        )
 
 
 def test_acquisition_replay_fails_closed_when_owned_players_latest_move_is_out() -> None:

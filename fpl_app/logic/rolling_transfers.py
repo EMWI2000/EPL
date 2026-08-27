@@ -727,10 +727,10 @@ def optimize_rolling_transfers(
     if (
         not isinstance(free_transfers, int)
         or isinstance(free_transfers, bool)
-        or not 1 <= free_transfers <= TRANSFERS.max_banked_free_transfers
+        or not 0 <= free_transfers <= TRANSFERS.max_banked_free_transfers
     ):
         raise RollingTransferError(
-            f"free_transfers must be an integer from 1 to {TRANSFERS.max_banked_free_transfers}"
+            f"free_transfers must be an integer from 0 to {TRANSFERS.max_banked_free_transfers}"
         )
     if (
         not isinstance(plans_per_transfer_count, int)

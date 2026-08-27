@@ -174,6 +174,13 @@ export async function POST(request: Request) {
         "Deadline eller datagrundlag ændrede sig under AI-reviewet. Synkronisér og beregn igen.",
       );
     }
+    console.info("AI review completed", {
+      model,
+      requested_reasoning_effort: reasoningEffort,
+      effective_reasoning_effort: result.reasoningEffort,
+      attempts: result.attemptCount,
+      fallback_reason: result.fallbackReason,
+    });
     return Response.json(
       {
         schema_version: AI_REVIEW_RESPONSE_SCHEMA_VERSION,
@@ -181,7 +188,7 @@ export async function POST(request: Request) {
         recommendation_generated_at: reviewRequest.recommendation_generated_at,
         target_event: reviewRequest.planner.target_event,
         model,
-        reasoning_effort: reasoningEffort,
+        reasoning_effort: result.reasoningEffort,
         review: result.review,
         research: result.research,
       },
@@ -190,7 +197,12 @@ export async function POST(request: Request) {
   } catch (error) {
     const kind = error instanceof OpenAiReviewError ? error.kind : "upstream";
     const safeDetail = error instanceof OpenAiReviewError ? error.message : "Unexpected upstream failure.";
-    console.error("AI review failed", kind, safeDetail);
+    console.error("AI review failed", {
+      kind,
+      detail: safeDetail,
+      attempts: error instanceof OpenAiReviewError ? error.attemptCount : null,
+      fallback_reason: error instanceof OpenAiReviewError ? error.fallbackReason : null,
+    });
     if (kind === "configuration") {
       return errorResponse(503, "ai_unconfigured", "AI-kvalificeringen er ikke konfigureret korrekt.");
     }

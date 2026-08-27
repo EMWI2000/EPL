@@ -284,6 +284,19 @@ def test_builds_a_legal_deterministic_four_deadline_roadmap() -> None:
     json.dumps(result.as_dict(), allow_nan=False)
 
 
+def test_zero_free_transfers_is_legal_only_for_the_current_deadline() -> None:
+    players = _pool()
+    roll = _first_plan(players, free_transfers=0)
+
+    result = optimize_strategy_roadmap(players, (roll,), horizon=8)
+
+    first, *future = result.best_roadmap.steps
+    assert first.free_transfers_before == 0
+    assert first.free_transfers_next_gameweek == 1
+    assert all(1 <= step.free_transfers_before <= 5 for step in future)
+    assert all(1 <= step.free_transfers_next_gameweek <= 5 for step in future)
+
+
 def test_original_player_keeps_confirmed_half_profit_basis_until_sold() -> None:
     players = _pool()
     players.loc[

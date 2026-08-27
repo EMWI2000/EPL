@@ -642,7 +642,7 @@ def evaluate_chip_strategy(
     if (
         not isinstance(free_transfers, int)
         or isinstance(free_transfers, bool)
-        or not 1 <= free_transfers <= TRANSFERS.max_banked_free_transfers
+        or not 0 <= free_transfers <= TRANSFERS.max_banked_free_transfers
     ):
         raise ChipStrategyError("free_transfers is outside the legal range")
     solver_budget = float(chip_solver_budget_seconds)

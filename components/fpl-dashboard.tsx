@@ -21,11 +21,14 @@ import {
   type DecisionHistoryEntry,
 } from "@/lib/decision-history";
 import { resolveInitialFplManagerId } from "@/lib/fpl-manager-config";
+import { canSubmitWeeklyPlanner } from "@/components/fpl-dashboard-state";
 import {
   type ChipName,
   type ChipStatus,
+  type ManagerSyncPlayerCatalogEntry,
   type ManagerSyncResponse,
   type ManualManagerState,
+  type PlayerPriceState,
   type PlannerAction,
   type PlannerChipScenario,
   type PlannerChipSignal,
@@ -41,6 +44,13 @@ import {
   parseManagerSyncResponse,
   serializePlannerRequest,
 } from "@/lib/planner-contract";
+import {
+  applySquadReplacement,
+  parsePlayerPriceTenths,
+  reconciledSquadMatchesConfirmed,
+  sellingPriceTenths,
+  type ReconciledSquad,
+} from "@/lib/squad-reconciliation";
 import {
   ArrowRightIcon,
   CheckIcon,
@@ -211,6 +221,16 @@ const DEFAULT_SETTINGS: Settings = {
   forecastVersion: "v2",
 };
 
+type SquadSourceChoice = "unchanged" | "changed" | null;
+
+type SquadCorrection = {
+  outgoing: ManagerSyncPlayerCatalogEntry;
+  incoming: ManagerSyncPlayerCatalogEntry;
+  purchase_price_tenths: number;
+  selling_price_tenths: number;
+  before: ReconciledSquad;
+};
+
 const positionNames: Record<Player["position"], string> = {
   GKP: "Målmand",
   DEF: "Forsvar",
@@ -244,6 +264,10 @@ function formatPoints(value: number) {
 
 function formatPrice(value: number) {
   return `£${compactNumber.format(value)}m`;
+}
+
+function formatPriceInput(tenths: number) {
+  return (tenths / 10).toFixed(1).replace(".", ",");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1610,8 +1634,20 @@ export function FplDashboard({
   const [managerSync, setManagerSync] = useState<ManagerSyncResponse | null>(null);
   const [bankInput, setBankInput] = useState("0,0");
   const [freeTransfers, setFreeTransfers] = useState(1);
+  const [squadSourceChoice, setSquadSourceChoice] = useState<SquadSourceChoice>(null);
+  const [currentSquadIds, setCurrentSquadIds] = useState<number[]>([]);
+  const [currentPlayerPrices, setCurrentPlayerPrices] = useState<PlayerPriceState[]>([]);
+  const [purchasePriceDrafts, setPurchasePriceDrafts] = useState<Record<number, string>>({});
+  const [squadCorrections, setSquadCorrections] = useState<SquadCorrection[]>([]);
+  const [selectedOutgoingId, setSelectedOutgoingId] = useState("");
+  const [selectedIncomingId, setSelectedIncomingId] = useState("");
+  const [incomingSearch, setIncomingSearch] = useState("");
+  const [incomingPurchasePrice, setIncomingPurchasePrice] = useState("");
+  const [squadCorrectionError, setSquadCorrectionError] = useState<string | null>(null);
+  const [squadPriceError, setSquadPriceError] = useState<string | null>(null);
   const [squadConfirmed, setSquadConfirmed] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
+  const [syncStateValid, setSyncStateValid] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
   const [aiReview, setAiReview] = useState<AiReviewResponse | null>(null);
   const [isAiReviewing, setIsAiReviewing] = useState(false);
@@ -1619,6 +1655,7 @@ export function FplDashboard({
   const [decisionHistory, setDecisionHistory] = useState<DecisionHistory>(emptyDecisionHistory);
   const [decisionHistoryStatus, setDecisionHistoryStatus] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const recommendationRequestIdRef = useRef(0);
   const syncAbortRef = useRef<AbortController | null>(null);
   const aiAbortRef = useRef<AbortController | null>(null);
   const aiRequestKeyRef = useRef<string | null>(null);
@@ -1633,12 +1670,27 @@ export function FplDashboard({
     setIsAiReviewing(false);
   }, []);
 
+  const invalidateRecommendation = useCallback(() => {
+    recommendationRequestIdRef.current += 1;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    clearAiReview();
+    setRecommendation(null);
+    setAppliedSettings(null);
+    setAppliedMode(null);
+    setSelectedGameweek(null);
+    setError(null);
+    setIsLoading(false);
+  }, [clearAiReview]);
+
   const requestRecommendation = useCallback(async (
     requestSettings: Settings,
     plannerInput?: { sync: ManagerSyncResponse; state: ManualManagerState },
   ) => {
     clearAiReview();
     abortRef.current?.abort();
+    const requestId = recommendationRequestIdRef.current + 1;
+    recommendationRequestIdRef.current = requestId;
     const controller = new AbortController();
     abortRef.current = controller;
     setIsLoading(true);
@@ -1677,6 +1729,7 @@ export function FplDashboard({
       if (!isRecommendation(body)) {
         throw new Error("Serveren returnerede et uventet dataformat.");
       }
+      if (recommendationRequestIdRef.current !== requestId) return;
 
       setRecommendation(body);
       setSelectedGameweek(body.team.gameweeks[0]?.gameweek ?? body.meta.gameweek_window[0] ?? null);
@@ -1684,20 +1737,24 @@ export function FplDashboard({
       setAppliedMode(plannerInput ? "weekly" : "initial");
     } catch (requestError) {
       if (requestError instanceof DOMException && requestError.name === "AbortError") return;
+      if (recommendationRequestIdRef.current !== requestId) return;
       setError(requestError instanceof Error ? requestError.message : "Der opstod en ukendt fejl.");
     } finally {
-      if (abortRef.current === controller) {
+      if (abortRef.current === controller && recommendationRequestIdRef.current === requestId) {
         setIsLoading(false);
+        abortRef.current = null;
       }
     }
   }, [clearAiReview]);
 
   const syncManagerById = useCallback(async (managerId: number) => {
-    clearAiReview();
+    invalidateRecommendation();
     syncAbortRef.current?.abort();
     const controller = new AbortController();
     syncAbortRef.current = controller;
     setIsSyncing(true);
+    setSyncStateValid(false);
+    setSquadConfirmed(false);
     setSyncError(null);
     try {
       const response = await fetch("/api/planner/sync", {
@@ -1713,20 +1770,43 @@ export function FplDashboard({
         throw new Error(apiError?.error?.message || `Serveren svarede med status ${response.status}.`);
       }
       const parsed = parseManagerSyncResponse(body);
+      if (syncAbortRef.current !== controller) return;
       setManagerSync(parsed);
       setBankInput((parsed.manual_state_template.state.bank_tenths / 10).toFixed(1).replace(".", ","));
       setFreeTransfers(parsed.manual_state_template.state.free_transfers);
+      setSquadSourceChoice(null);
+      setCurrentSquadIds([...parsed.manual_state_template.state.current_squad_ids]);
+      setCurrentPlayerPrices(parsed.manual_state_template.state.player_prices.map((price) => ({ ...price })));
+      setPurchasePriceDrafts(Object.fromEntries(
+        parsed.manual_state_template.state.player_prices.map((price) => [
+          price.element_id,
+          formatPriceInput(price.purchase_price_tenths),
+        ]),
+      ));
+      setSquadCorrections([]);
+      setSelectedOutgoingId("");
+      setSelectedIncomingId("");
+      setIncomingSearch("");
+      setIncomingPurchasePrice("");
+      setSquadCorrectionError(null);
+      setSquadPriceError(null);
       setSquadConfirmed(false);
+      setSyncStateValid(true);
       setRecommendation(null);
       setAppliedMode(null);
       rememberManagerId(parsed.manager.id);
     } catch (requestError) {
+      if (syncAbortRef.current !== controller) return;
       if (requestError instanceof DOMException && requestError.name === "AbortError") return;
+      setSyncStateValid(false);
       setSyncError(requestError instanceof Error ? requestError.message : "Holdet kunne ikke hentes.");
     } finally {
-      if (syncAbortRef.current === controller) setIsSyncing(false);
+      if (syncAbortRef.current === controller) {
+        setIsSyncing(false);
+        syncAbortRef.current = null;
+      }
     }
-  }, [clearAiReview]);
+  }, [invalidateRecommendation]);
 
   useEffect(() => {
     const managerId = managerIdFromBrowser(initialManagerId);
@@ -1753,10 +1833,13 @@ export function FplDashboard({
     clearAiReview,
     freeTransfers,
     managerIdInput,
+    currentPlayerPrices,
+    currentSquadIds,
     settings.forecastVersion,
     settings.horizon,
     settings.includeDoubtful,
     squadConfirmed,
+    squadSourceChoice,
   ]);
 
   async function syncManagerState() {
@@ -1770,15 +1853,190 @@ export function FplDashboard({
     await syncManagerById(managerId);
   }
 
+  const catalogById = useMemo(
+    () => new Map(managerSync?.player_catalog.map((player) => [player.id, player]) ?? []),
+    [managerSync],
+  );
+  const currentSquadPlayers = useMemo(
+    () => currentSquadIds
+      .map((id) => catalogById.get(id))
+      .filter((player): player is ManagerSyncPlayerCatalogEntry => player !== undefined),
+    [catalogById, currentSquadIds],
+  );
+  const selectedOutgoingPlayer = catalogById.get(Number(selectedOutgoingId));
+  const incomingCandidates = useMemo(() => {
+    if (!managerSync || !selectedOutgoingPlayer) return [];
+    const normalizedQuery = incomingSearch.trim().toLocaleLowerCase("da-DK");
+    return managerSync.player_catalog
+      .filter((player) =>
+        player.position === selectedOutgoingPlayer.position &&
+        !currentSquadIds.includes(player.id) &&
+        (!normalizedQuery || `${player.display_name} ${player.team_name}`.toLocaleLowerCase("da-DK").includes(normalizedQuery))
+      )
+      .sort((left, right) => left.display_name.localeCompare(right.display_name, "da"));
+  }, [currentSquadIds, incomingSearch, managerSync, selectedOutgoingPlayer]);
+  const priceDraftsAreCommitted = currentPlayerPrices.length === 15 && currentPlayerPrices.every(
+    (price) => purchasePriceDrafts[price.element_id] === formatPriceInput(price.purchase_price_tenths),
+  );
+  const canConfirmSquad = priceDraftsAreCommitted && (
+    squadSourceChoice === "unchanged" ||
+    (squadSourceChoice === "changed" && squadCorrections.length > 0)
+  );
+
+  function resetSquadCorrectionInputs(): void {
+    setSelectedOutgoingId("");
+    setSelectedIncomingId("");
+    setIncomingSearch("");
+    setIncomingPurchasePrice("");
+    setSquadCorrectionError(null);
+  }
+
+  function restorePublicSquad(choice: Exclude<SquadSourceChoice, null>): void {
+    if (!managerSync) return;
+    invalidateRecommendation();
+    setSquadSourceChoice(choice);
+    setCurrentSquadIds([...managerSync.manual_state_template.state.current_squad_ids]);
+    setCurrentPlayerPrices(managerSync.manual_state_template.state.player_prices.map((price) => ({ ...price })));
+    setPurchasePriceDrafts(Object.fromEntries(
+      managerSync.manual_state_template.state.player_prices.map((price) => [
+        price.element_id,
+        formatPriceInput(price.purchase_price_tenths),
+      ]),
+    ));
+    setSquadCorrections([]);
+    setSquadConfirmed(false);
+    setSquadPriceError(null);
+    resetSquadCorrectionInputs();
+  }
+
+  function updateOwnedPurchasePrice(playerId: number, value: string): boolean {
+    try {
+      const player = catalogById.get(playerId);
+      if (!player) throw new Error("Spilleren findes ikke længere i FPL-kataloget.");
+      const purchasePriceTenths = parsePlayerPriceTenths(value);
+      const sellingPrice = sellingPriceTenths(purchasePriceTenths, player.current_price_tenths);
+      const existingPrice = currentPlayerPrices.find((price) => price.element_id === playerId);
+      if (!existingPrice) {
+        throw new Error("Spilleren er ikke i den aktuelle trup.");
+      }
+      if (
+        existingPrice.purchase_price_tenths === purchasePriceTenths &&
+        existingPrice.selling_price_tenths === sellingPrice
+      ) {
+        setPurchasePriceDrafts((current) => ({
+          ...current,
+          [playerId]: formatPriceInput(purchasePriceTenths),
+        }));
+        setSquadPriceError(null);
+        return true;
+      }
+      invalidateRecommendation();
+      setCurrentPlayerPrices((current) => current.map((price) => price.element_id === playerId
+        ? {
+            element_id: playerId,
+            purchase_price_tenths: purchasePriceTenths,
+            selling_price_tenths: sellingPrice,
+          }
+        : price));
+      setSquadCorrections((current) => current.map((correction) => correction.incoming.id === playerId
+        ? {
+            ...correction,
+            purchase_price_tenths: purchasePriceTenths,
+            selling_price_tenths: sellingPrice,
+          }
+        : correction));
+      setPurchasePriceDrafts((current) => ({
+        ...current,
+        [playerId]: formatPriceInput(purchasePriceTenths),
+      }));
+      setSquadConfirmed(false);
+      setSquadPriceError(null);
+      return true;
+    } catch (priceError) {
+      setSquadPriceError(priceError instanceof Error ? priceError.message : "Købsprisen kunne ikke valideres.");
+      return false;
+    }
+  }
+
+  function applyCurrentSquadCorrection(): void {
+    if (!managerSync) return;
+    const outgoingId = Number(selectedOutgoingId);
+    const incomingId = Number(selectedIncomingId);
+    try {
+      const purchasePriceTenths = parsePlayerPriceTenths(incomingPurchasePrice);
+      const outgoing = catalogById.get(outgoingId);
+      const incoming = catalogById.get(incomingId);
+      if (!outgoing || !incoming) throw new Error("Vælg både en spiller ud og en spiller ind.");
+      const before: ReconciledSquad = {
+        current_squad_ids: [...currentSquadIds],
+        player_prices: currentPlayerPrices.map((price) => ({ ...price })),
+      };
+      const next = applySquadReplacement(before, managerSync.player_catalog, {
+        out_id: outgoingId,
+        in_id: incomingId,
+        purchase_price_tenths: purchasePriceTenths,
+      });
+      invalidateRecommendation();
+      setCurrentSquadIds(next.current_squad_ids);
+      setCurrentPlayerPrices(next.player_prices);
+      setPurchasePriceDrafts((current) => {
+        const nextDrafts = { ...current };
+        delete nextDrafts[outgoingId];
+        nextDrafts[incomingId] = formatPriceInput(purchasePriceTenths);
+        return nextDrafts;
+      });
+      setSquadCorrections((current) => [...current, {
+        outgoing,
+        incoming,
+        purchase_price_tenths: purchasePriceTenths,
+        selling_price_tenths: sellingPriceTenths(purchasePriceTenths, incoming.current_price_tenths),
+        before,
+      }]);
+      setSquadConfirmed(false);
+      setSquadPriceError(null);
+      resetSquadCorrectionInputs();
+    } catch (correctionError) {
+      setSquadCorrectionError(
+        correctionError instanceof Error ? correctionError.message : "Trupændringen kunne ikke valideres.",
+      );
+    }
+  }
+
+  function undoLatestSquadCorrection(): void {
+    const latest = squadCorrections.at(-1);
+    if (!latest) return;
+    invalidateRecommendation();
+    const outgoingPrice = latest.before.player_prices.find(
+      (price) => price.element_id === latest.outgoing.id,
+    );
+    setCurrentSquadIds((current) => current.map(
+      (id) => id === latest.incoming.id ? latest.outgoing.id : id,
+    ));
+    if (outgoingPrice) {
+      setCurrentPlayerPrices((current) => current.map((price) => price.element_id === latest.incoming.id
+        ? { ...outgoingPrice }
+        : price));
+      setPurchasePriceDrafts((current) => {
+        const nextDrafts = { ...current };
+        delete nextDrafts[latest.incoming.id];
+        nextDrafts[latest.outgoing.id] = formatPriceInput(outgoingPrice.purchase_price_tenths);
+        return nextDrafts;
+      });
+    }
+    setSquadCorrections((current) => current.slice(0, -1));
+    setSquadConfirmed(false);
+    resetSquadCorrectionInputs();
+  }
+
   function confirmedPlannerState(): ManualManagerState | null {
-    if (!managerSync || !squadConfirmed) return null;
+    if (!managerSync || !squadConfirmed || !canConfirmSquad) return null;
     try {
       return {
         ...managerSync.manual_state_template.state,
-        current_squad_ids: [...managerSync.manual_state_template.state.current_squad_ids],
+        current_squad_ids: [...currentSquadIds],
         bank_tenths: parseBankTenths(bankInput),
         free_transfers: parseFreeTransfers(String(freeTransfers)),
-        player_prices: managerSync.manual_state_template.state.player_prices.map((price) => ({ ...price })),
+        player_prices: currentPlayerPrices.map((price) => ({ ...price })),
         chips: { ...managerSync.manual_state_template.state.chips },
         chip_usage: managerSync.manual_state_template.state.chip_usage.map((usage) => ({ ...usage })),
         no_active_chip_confirmed: true,
@@ -1808,16 +2066,21 @@ export function FplDashboard({
         (() => {
           try {
             return parseBankTenths(bankInput) !== recommendation.planner?.confirmed_state.bank_tenths ||
-              freeTransfers !== recommendation.planner?.confirmed_state.free_transfers;
+              freeTransfers !== recommendation.planner?.confirmed_state.free_transfers ||
+              !reconciledSquadMatchesConfirmed(
+                { current_squad_ids: currentSquadIds, player_prices: currentPlayerPrices },
+                recommendation.planner?.confirmed_state.squad ?? [],
+              );
           } catch {
             return true;
           }
         })())
     );
-  }, [analysisMode, appliedMode, settings, appliedSettings, recommendation, bankInput, freeTransfers, squadConfirmed, managerIdInput, managerSync]);
+  }, [analysisMode, appliedMode, settings, appliedSettings, recommendation, bankInput, freeTransfers, squadConfirmed, managerIdInput, managerSync, currentSquadIds, currentPlayerPrices]);
 
   function runCurrentAnalysis() {
     if (analysisMode === "weekly") {
+      if (!plannerCanSubmit) return;
       const state = confirmedPlannerState();
       if (!managerSync || !state) return;
       void requestRecommendation(settings, { sync: managerSync, state });
@@ -1994,9 +2257,14 @@ export function FplDashboard({
   const hasFreeHitWarning = managerSync?.warnings.some(
     (warning) => warning.code === "free_hit_squad_is_temporary",
   ) ?? false;
-  const plannerCanSubmit = Boolean(
-    managerSync && squadConfirmed && !hasFreeHitWarning && !isSyncing,
-  );
+  const plannerCanSubmit = canSubmitWeeklyPlanner({
+    hasManagerSync: managerSync !== null,
+    squadConfirmed,
+    hasFreeHitWarning,
+    isSyncing,
+    syncStateValid,
+    hasSyncError: syncError !== null,
+  });
 
   return (
     <>
@@ -2086,7 +2354,10 @@ export function FplDashboard({
                         value={managerIdInput}
                         readOnly={initialManagerId !== null}
                         onChange={(event) => {
+                          invalidateRecommendation();
                           setManagerIdInput(event.target.value);
+                          setSyncStateValid(false);
+                          setSquadConfirmed(false);
                           setSyncError(null);
                         }}
                         placeholder="fx 1499152"
@@ -2126,7 +2397,7 @@ export function FplDashboard({
 
                   <div className="deadline-strip" aria-label="Status for ugens plan">
                     <span className="deadline-strip__step is-complete"><strong>1 · Hentet</strong><small>GW{managerSync.last_deadline_state.event}</small></span>
-                    <span className={classNames("deadline-strip__step", squadConfirmed ? "is-complete" : "is-active")}><strong>2 · Bekræft</strong><small>Bank og FT</small></span>
+                    <span className={classNames("deadline-strip__step", squadConfirmed ? "is-complete" : "is-active")}><strong>2 · Bekræft</strong><small>Trup, bank og FT</small></span>
                     <span className={classNames("deadline-strip__step", squadConfirmed && "is-active")}><strong>3 · Beregn</strong><small>Næste træk</small></span>
                   </div>
 
@@ -2139,21 +2410,23 @@ export function FplDashboard({
                         inputMode="decimal"
                         value={bankInput}
                         onChange={(event) => {
+                          invalidateRecommendation();
                           setBankInput(event.target.value);
                           setSquadConfirmed(false);
-                          setSyncError(null);
+                          if (syncStateValid) setSyncError(null);
                         }}
                       />
                     </div>
                     <div className="planner-field">
                       <span>Frie transfers nu</span>
                       <div className="ft-selector" aria-label="Antal frie transfers">
-                        {[1, 2, 3, 4, 5].map((value) => (
+                        {[0, 1, 2, 3, 4, 5].map((value) => (
                           <button
                             type="button"
                             key={value}
                             aria-pressed={freeTransfers === value}
                             onClick={() => {
+                              invalidateRecommendation();
                               setFreeTransfers(value);
                               setSquadConfirmed(false);
                             }}
@@ -2163,6 +2436,210 @@ export function FplDashboard({
                         ))}
                       </div>
                     </div>
+                  </div>
+
+                  <div className="squad-reconciliation" aria-labelledby="squad-reconciliation-heading">
+                    <div className="squad-reconciliation__heading">
+                      <div>
+                        <strong id="squad-reconciliation-heading">Hvilken trup har du lige nu?</strong>
+                        <small>FPL viser kun dit låste GW{managerSync.last_deadline_state.event}-hold offentligt. Transfers til GW{managerSync.target.event} er skjult indtil deadline.</small>
+                      </div>
+                      <span>{currentSquadPlayers.length}/15</span>
+                    </div>
+
+                    <div className="squad-source-choice" aria-label="Transfers siden sidste offentlige hold">
+                      <button
+                        type="button"
+                        aria-pressed={squadSourceChoice === "unchanged"}
+                        onClick={() => {
+                          if (squadSourceChoice !== "unchanged") restorePublicSquad("unchanged");
+                        }}
+                      >
+                        <CheckIcon />
+                        <span><strong>Ingen transfers</strong><small>GW{managerSync.last_deadline_state.event}-truppen er stadig min trup</small></span>
+                      </button>
+                      <button
+                        type="button"
+                        aria-pressed={squadSourceChoice === "changed"}
+                        onClick={() => {
+                          if (squadSourceChoice !== "changed") restorePublicSquad("changed");
+                        }}
+                      >
+                        <RefreshIcon />
+                        <span><strong>Jeg har lavet transfers</strong><small>Ret spiller ud og ind før analysen</small></span>
+                      </button>
+                    </div>
+
+                    <div className="current-squad-snapshot" aria-label="Trup som analysen bruger">
+                      <div className="current-squad-snapshot__heading">
+                        <strong>Trup som analysen bruger</strong>
+                        <small>{squadCorrections.length > 0 ? `${squadCorrections.length} rettelse${squadCorrections.length === 1 ? "" : "r"} registreret` : `Offentligt hold fra GW${managerSync.last_deadline_state.event}`}</small>
+                      </div>
+                      <ul>
+                        {currentSquadPlayers.map((player) => (
+                          <li key={player.id}>
+                            <span>{player.position}</span>
+                            <strong>{player.display_name}</strong>
+                            <small>{player.team_name}</small>
+                          </li>
+                        ))}
+                      </ul>
+                      <details className="squad-price-review">
+                        <summary>Kontrollér købs- og salgspriser</summary>
+                        <p>Vi udleder priserne fra den offentlige transferhistorik. Sammenlign dem med FPL, og ret købsprisen, hvis en værdi afviger.</p>
+                        <ul>
+                          {currentSquadPlayers.map((player) => {
+                            const price = currentPlayerPrices.find((row) => row.element_id === player.id);
+                            if (!price) return null;
+                            return (
+                              <li key={player.id}>
+                                <div><strong>{player.display_name}</strong><small>{player.team_name} · nu {formatPrice(player.current_price_tenths / 10)}</small></div>
+                                <label>
+                                  <span>Købt</span>
+                                  <input
+                                    type="text"
+                                    inputMode="decimal"
+                                    value={purchasePriceDrafts[player.id] ?? formatPriceInput(price.purchase_price_tenths)}
+                                    disabled={squadSourceChoice === null}
+                                    aria-label={`Købspris for ${player.display_name}`}
+                                    onChange={(event) => {
+                                      invalidateRecommendation();
+                                      setPurchasePriceDrafts((current) => ({
+                                        ...current,
+                                        [player.id]: event.target.value,
+                                      }));
+                                      setSquadConfirmed(false);
+                                      setSquadPriceError(null);
+                                    }}
+                                    onBlur={(event) => {
+                                      if (!updateOwnedPurchasePrice(player.id, event.currentTarget.value)) {
+                                        setPurchasePriceDrafts((current) => ({
+                                          ...current,
+                                          [player.id]: formatPriceInput(price.purchase_price_tenths),
+                                        }));
+                                      }
+                                    }}
+                                    onKeyDown={(event) => {
+                                      if (event.key === "Enter") {
+                                        event.preventDefault();
+                                        event.currentTarget.blur();
+                                      }
+                                    }}
+                                  />
+                                </label>
+                                <span><small>Salgspris</small><strong>{formatPrice(price.selling_price_tenths / 10)}</strong></span>
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      </details>
+                      {squadPriceError && <p className="planner-warning" role="alert"><InfoIcon /> {squadPriceError}</p>}
+                    </div>
+
+                    {squadSourceChoice === "changed" && (
+                      <div className="squad-correction-editor">
+                        <div className="squad-correction-editor__heading">
+                          <div>
+                            <strong>Registrér nettoændringen</strong>
+                            <small>Gentag for hver spiller, der er skiftet siden GW{managerSync.last_deadline_state.event}.</small>
+                          </div>
+                          {squadCorrections.length > 0 && (
+                            <button type="button" className="text-button" onClick={undoLatestSquadCorrection}>Fortryd seneste</button>
+                          )}
+                        </div>
+                        <div className="squad-correction-grid">
+                          <label>
+                            <span>Spiller du ikke har</span>
+                            <select
+                              value={selectedOutgoingId}
+                              onChange={(event) => {
+                                setSelectedOutgoingId(event.target.value);
+                                setSelectedIncomingId("");
+                                setIncomingSearch("");
+                                setIncomingPurchasePrice("");
+                                setSquadCorrectionError(null);
+                              }}
+                            >
+                              <option value="">Vælg spiller ud</option>
+                              {currentSquadPlayers.map((player) => (
+                                <option value={player.id} key={player.id}>{player.display_name} · {player.position} · {player.team_name}</option>
+                              ))}
+                            </select>
+                          </label>
+                          <label>
+                            <span>Søg spiller ind</span>
+                            <input
+                              type="search"
+                              value={incomingSearch}
+                              placeholder={selectedOutgoingPlayer ? `Søg ${positionNames[selectedOutgoingPlayer.position].toLowerCase()} …` : "Vælg spiller ud først"}
+                              disabled={!selectedOutgoingPlayer}
+                              onChange={(event) => {
+                                setIncomingSearch(event.target.value);
+                                setSelectedIncomingId("");
+                                setIncomingPurchasePrice("");
+                                setSquadCorrectionError(null);
+                              }}
+                            />
+                          </label>
+                          <label>
+                            <span>Spiller du har nu</span>
+                            <select
+                              value={selectedIncomingId}
+                              disabled={!selectedOutgoingPlayer}
+                              onChange={(event) => {
+                                const value = event.target.value;
+                                setSelectedIncomingId(value);
+                                const player = catalogById.get(Number(value));
+                                setIncomingPurchasePrice(player ? formatPriceInput(player.current_price_tenths) : "");
+                                setSquadCorrectionError(null);
+                              }}
+                            >
+                              <option value="">{incomingCandidates.length > 0 ? "Vælg spiller ind" : "Ingen match"}</option>
+                              {incomingCandidates.map((player) => (
+                                <option value={player.id} key={player.id}>{player.display_name} · {player.team_name} · {formatPrice(player.current_price_tenths / 10)}</option>
+                              ))}
+                            </select>
+                          </label>
+                          <label>
+                            <span>Købspris (£m)</span>
+                            <input
+                              type="text"
+                              inputMode="decimal"
+                              value={incomingPurchasePrice}
+                              placeholder="Fx 5,5"
+                              disabled={!selectedIncomingId}
+                              onChange={(event) => {
+                                setIncomingPurchasePrice(event.target.value);
+                                setSquadCorrectionError(null);
+                              }}
+                            />
+                          </label>
+                        </div>
+                        <p className="squad-correction-editor__hint"><InfoIcon /> Købsprisen udfyldes med spillerens nuværende pris. Ret den, hvis prisen har ændret sig, siden du købte spilleren.</p>
+                        <button
+                          type="button"
+                          className="secondary-button squad-correction-editor__add"
+                          disabled={!selectedOutgoingId || !selectedIncomingId || !incomingPurchasePrice}
+                          onClick={applyCurrentSquadCorrection}
+                        >
+                          <CheckIcon /> Registrér ændring
+                        </button>
+                        {squadCorrectionError && <p className="planner-warning" role="alert"><InfoIcon /> {squadCorrectionError}</p>}
+                        {squadCorrections.length === 0 && (
+                          <p className="planner-warning" role="status"><InfoIcon /> Analysen er låst, indtil mindst én faktisk trupændring er registreret.</p>
+                        )}
+                        {squadCorrections.length > 0 && (
+                          <ol className="squad-correction-log" aria-label="Registrerede trupændringer">
+                            {squadCorrections.map((correction, index) => (
+                              <li key={`${correction.outgoing.id}-${correction.incoming.id}-${index}`}>
+                                <span>{index + 1}</span>
+                                <div><strong>{correction.outgoing.display_name} <ArrowRightIcon /> {correction.incoming.display_name}</strong><small>Købt {formatPrice(correction.purchase_price_tenths / 10)} · salgspris nu {formatPrice(correction.selling_price_tenths / 10)}</small></div>
+                              </li>
+                            ))}
+                          </ol>
+                        )}
+                      </div>
+                    )}
                   </div>
 
                   <div className="planner-chip-inventory" aria-label="Chipbeholdning til næste deadline">
@@ -2196,12 +2673,18 @@ export function FplDashboard({
                       <input
                         type="checkbox"
                         checked={squadConfirmed}
+                        disabled={!canConfirmSquad || !syncStateValid}
                         onChange={(event) => {
+                          invalidateRecommendation();
                           setSquadConfirmed(event.target.checked);
-                          setSyncError(null);
+                          if (syncStateValid) setSyncError(null);
                         }}
                       />
-                      <span>Jeg bekræfter, at truppen og spillerpriserne er uændrede siden GW{managerSync.last_deadline_state.event}, at bank, frie transfers og chipbeholdningen ovenfor er korrekte, og at ingen chip er aktiv til næste deadline.</span>
+                      <span>{squadSourceChoice === null
+                        ? "Vælg først, om du har lavet transfers siden det seneste offentlige hold."
+                        : squadSourceChoice === "changed"
+                          ? "Jeg bekræfter, at de registrerede ændringer giver min aktuelle 15-mandstrup, at de viste købs- og salgspriser, bank, frie transfers og chipbeholdning er korrekte, og at ingen chip er aktiv til næste deadline."
+                          : `Jeg bekræfter, at jeg ikke har lavet transfers siden GW${managerSync.last_deadline_state.event}, at de viste købs- og salgspriser, bank, frie transfers og chipbeholdning er korrekte, og at ingen chip er aktiv til næste deadline.`}</span>
                     </label>
                   )}
                   {syncError && <p className="planner-warning" role="alert"><InfoIcon /> {syncError}</p>}
@@ -2269,7 +2752,7 @@ export function FplDashboard({
               </div>
 
               <div className="rule-summary">
-                <span><CheckIcon /> {analysisMode === "weekly" ? "Salgspriser valideret" : "£100,0m budget"}</span>
+                <span><CheckIcon /> {analysisMode === "weekly" ? squadConfirmed ? "Salgspriser bekræftet" : "Salgspriser vises før beregning" : "£100,0m budget"}</span>
                 <span><CheckIcon /> Maks. 3 pr. klub</span>
                 <span><CheckIcon /> Lovlig 15-mandstrup</span>
               </div>

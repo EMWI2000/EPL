@@ -312,7 +312,7 @@ test("builds a bounded stateless Responses request without account identifiers",
   assert.equal(body.store, false);
   assert.equal(body.tool_choice, "required");
   assert.equal(body.max_tool_calls, 4);
-  assert.equal(body.max_output_tokens, 16_000);
+  assert.equal(body.max_output_tokens, 32_000);
   assert.deepEqual(body.reasoning, { effort: "xhigh", context: "current_turn" });
   assert.equal(body.tools[0].search_context_size, "medium");
   assert.equal(body.tools[0].filters.allowed_domains.includes("arsenal.com"), true);
@@ -700,6 +700,9 @@ test("calls only the fixed Responses URL and maps upstream rate limiting", async
   assert.equal(calledUrl, OPENAI_RESPONSES_URL);
   assert.equal(authorization, "Bearer server-test-key");
   assert.equal(result.review.confidence, "medium");
+  assert.equal(result.reasoningEffort, "xhigh");
+  assert.equal(result.attemptCount, 1);
+  assert.equal(result.fallbackReason, null);
 
   await assert.rejects(
     requestOpenAiReview(requestFixture(), {
@@ -709,4 +712,183 @@ test("calls only the fixed Responses URL and maps upstream rate limiting", async
     }),
     (error: unknown) => error instanceof OpenAiReviewError && error.kind === "rate_limited",
   );
+});
+
+test("retries one max-token incomplete response with bounded high reasoning", async () => {
+  const efforts: unknown[] = [];
+  let calls = 0;
+  const result = await requestOpenAiReview(requestFixture(), {
+    apiKey: "server-test-key",
+    model: "gpt-5.6-sol",
+    reasoningEffort: "xhigh",
+    fetchImpl: async (_input, init) => {
+      calls += 1;
+      const body = JSON.parse(String(init?.body)) as {
+        reasoning: { effort: unknown };
+        max_output_tokens: unknown;
+      };
+      efforts.push(body.reasoning.effort);
+      assert.equal(body.max_output_tokens, 32_000);
+      const responseBody = calls === 1
+        ? { status: "incomplete", incomplete_details: { reason: "max_output_tokens" }, output: [] }
+        : completedResponse();
+      return new Response(JSON.stringify(responseBody), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  });
+
+  assert.equal(calls, 2);
+  assert.deepEqual(efforts, ["xhigh", "high"]);
+  assert.equal(result.reasoningEffort, "high");
+  assert.equal(result.attemptCount, 2);
+  assert.equal(result.fallbackReason, "max_output_tokens");
+  assert.equal(result.review.verdict, "confirm_best_action");
+});
+
+test("retries one transient upstream failure inside the shared timeout", async () => {
+  const efforts: unknown[] = [];
+  let calls = 0;
+  const result = await requestOpenAiReview(requestFixture(), {
+    apiKey: "server-test-key",
+    model: "gpt-5.6-sol",
+    reasoningEffort: "xhigh",
+    fetchImpl: async (_input, init) => {
+      calls += 1;
+      const body = JSON.parse(String(init?.body)) as { reasoning: { effort: unknown } };
+      efforts.push(body.reasoning.effort);
+      if (calls === 1) return new Response(null, { status: 503 });
+      return new Response(JSON.stringify(completedResponse()), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  });
+
+  assert.equal(calls, 2);
+  assert.deepEqual(efforts, ["xhigh", "xhigh"]);
+  assert.equal(result.reasoningEffort, "xhigh");
+  assert.equal(result.attemptCount, 2);
+  assert.equal(result.fallbackReason, "upstream");
+});
+
+test("retries a transient network failure without lowering reasoning", async () => {
+  const efforts: unknown[] = [];
+  let calls = 0;
+  const result = await requestOpenAiReview(requestFixture(), {
+    apiKey: "server-test-key",
+    model: "gpt-5.6-sol",
+    reasoningEffort: "xhigh",
+    fetchImpl: async (_input, init) => {
+      calls += 1;
+      const body = JSON.parse(String(init?.body)) as { reasoning: { effort: unknown } };
+      efforts.push(body.reasoning.effort);
+      if (calls === 1) throw new TypeError("simulated network failure");
+      return new Response(JSON.stringify(completedResponse()), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  });
+
+  assert.equal(calls, 2);
+  assert.deepEqual(efforts, ["xhigh", "xhigh"]);
+  assert.equal(result.reasoningEffort, "xhigh");
+  assert.equal(result.attemptCount, 2);
+  assert.equal(result.fallbackReason, "upstream");
+});
+
+test("retries a Responses server_error without lowering reasoning", async () => {
+  const efforts: unknown[] = [];
+  let calls = 0;
+  const result = await requestOpenAiReview(requestFixture(), {
+    apiKey: "server-test-key",
+    model: "gpt-5.6-sol",
+    reasoningEffort: "xhigh",
+    fetchImpl: async (_input, init) => {
+      calls += 1;
+      const body = JSON.parse(String(init?.body)) as { reasoning: { effort: unknown } };
+      efforts.push(body.reasoning.effort);
+      const responseBody = calls === 1
+        ? {
+          status: "failed",
+          error: { code: "server_error", message: "The model failed to generate a response." },
+          output: [],
+        }
+        : completedResponse();
+      return new Response(JSON.stringify(responseBody), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  });
+
+  assert.equal(calls, 2);
+  assert.deepEqual(efforts, ["xhigh", "xhigh"]);
+  assert.equal(result.reasoningEffort, "xhigh");
+  assert.equal(result.attemptCount, 2);
+  assert.equal(result.fallbackReason, "upstream");
+});
+
+test("retries a response-body timeout with bounded high reasoning", async () => {
+  const efforts: unknown[] = [];
+  let calls = 0;
+  const result = await requestOpenAiReview(requestFixture(), {
+    apiKey: "server-test-key",
+    model: "gpt-5.6-sol",
+    reasoningEffort: "xhigh",
+    fetchImpl: async (_input, init) => {
+      calls += 1;
+      const body = JSON.parse(String(init?.body)) as { reasoning: { effort: unknown } };
+      efforts.push(body.reasoning.effort);
+      if (calls === 1) {
+        const response = new Response("{}", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+        Object.defineProperty(response, "json", {
+          value: async () => {
+            const error = new Error("body timed out");
+            error.name = "AbortError";
+            throw error;
+          },
+        });
+        return response;
+      }
+      return new Response(JSON.stringify(completedResponse()), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  });
+
+  assert.equal(calls, 2);
+  assert.deepEqual(efforts, ["xhigh", "high"]);
+  assert.equal(result.reasoningEffort, "high");
+  assert.equal(result.attemptCount, 2);
+  assert.equal(result.fallbackReason, "timeout");
+});
+
+test("fails closed after one bounded retry when OpenAI remains incomplete", async () => {
+  let calls = 0;
+  await assert.rejects(
+    requestOpenAiReview(requestFixture(), {
+      apiKey: "server-test-key",
+      model: "gpt-5.6-sol",
+      fetchImpl: async () => {
+        calls += 1;
+        return new Response(JSON.stringify({
+          status: "incomplete",
+          incomplete_details: { reason: "max_output_tokens" },
+          output: [],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      },
+    }),
+    (error: unknown) => error instanceof OpenAiReviewError &&
+      error.kind === "incomplete" &&
+      error.attemptCount === 2 &&
+      error.fallbackReason === "max_output_tokens",
+  );
+  assert.equal(calls, 2);
 });

@@ -401,7 +401,12 @@ def test_generate_recommendation_truncates_horizon_at_gameweek_38(monkeypatch):
     )
 
 
-def test_weekly_recommendation_rolls_when_no_transfer_candidate_exists(monkeypatch):
+@pytest.mark.parametrize(("free_transfers", "expected_next"), [(0, 1), (1, 2)])
+def test_weekly_recommendation_rolls_when_no_transfer_candidate_exists(
+    monkeypatch,
+    free_transfers,
+    expected_next,
+):
     pool = _synthetic_pool(horizon=2)
     pool.loc[pool["id"] == 1, "status"] = "i"
     official = pd.DataFrame({"id": pool["id"]})
@@ -457,7 +462,7 @@ def test_weekly_recommendation_rolls_when_no_transfer_candidate_exists(monkeypat
     state = {
         "current_squad_ids": pool["id"].tolist(),
         "bank_tenths": 10,
-        "free_transfers": 1,
+        "free_transfers": free_transfers,
         "player_prices": [
             {
                 "element_id": int(player_id),
@@ -490,7 +495,7 @@ def test_weekly_recommendation_rolls_when_no_transfer_candidate_exists(monkeypat
     assert response["meta"]["mode"] == "weekly"
     assert response["planner"]["manager_id"] == 123
     assert response["planner"]["best_action"]["kind"] == "roll"
-    assert response["planner"]["best_action"]["free_transfers_next_gameweek"] == 2
+    assert response["planner"]["best_action"]["free_transfers_next_gameweek"] == expected_next
     assert 1 not in observed_eligible_ids
     assert response["planner"]["confirmed_state"]["squad"][0]["purchase_price_tenths"] == 50
     assert response["planner"]["confirmed_state"]["squad"][0]["selling_price_tenths"] == 50

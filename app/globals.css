@@ -637,6 +637,400 @@ main {
   gap: 11px;
 }
 
+.squad-reconciliation {
+  display: grid;
+  gap: 11px;
+  padding: 13px;
+  border: 1px solid rgba(21, 61, 53, 0.18);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.squad-reconciliation__heading,
+.current-squad-snapshot__heading,
+.squad-correction-editor__heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.squad-reconciliation__heading > div,
+.squad-correction-editor__heading > div {
+  display: grid;
+  gap: 3px;
+}
+
+.squad-reconciliation__heading strong,
+.current-squad-snapshot__heading strong,
+.squad-correction-editor__heading strong {
+  color: var(--forest-deep);
+  font-size: 12px;
+}
+
+.squad-reconciliation__heading small,
+.current-squad-snapshot__heading small,
+.squad-correction-editor__heading small {
+  color: var(--ink-soft);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.squad-reconciliation__heading > span {
+  flex: 0 0 auto;
+  padding: 4px 7px;
+  border-radius: 999px;
+  background: var(--forest);
+  color: white;
+  font-size: 9px;
+  font-weight: 850;
+  font-variant-numeric: tabular-nums;
+}
+
+.squad-source-choice {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.squad-source-choice button {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 7px;
+  min-height: 64px;
+  cursor: pointer;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  padding: 9px;
+  background: white;
+  color: var(--ink-soft);
+  text-align: left;
+}
+
+.squad-source-choice button > svg {
+  width: 14px;
+  height: 14px;
+}
+
+.squad-source-choice button > span {
+  display: grid;
+  gap: 3px;
+}
+
+.squad-source-choice button strong {
+  color: var(--ink);
+  font-size: 10px;
+}
+
+.squad-source-choice button small {
+  color: var(--ink-soft);
+  font-size: 8px;
+  line-height: 1.35;
+}
+
+.squad-source-choice button[aria-pressed="true"] {
+  border-color: var(--forest);
+  box-shadow: inset 0 -3px 0 var(--deadline);
+  background: var(--mint);
+  color: var(--forest);
+}
+
+.current-squad-snapshot {
+  display: grid;
+  gap: 8px;
+  padding-top: 2px;
+}
+
+.current-squad-snapshot__heading {
+  align-items: baseline;
+}
+
+.current-squad-snapshot > ul {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.current-squad-snapshot > ul > li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 1px 6px;
+  min-width: 0;
+  padding: 5px 6px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+}
+
+.current-squad-snapshot > ul > li > span {
+  grid-row: 1 / 3;
+  align-self: center;
+  color: var(--forest-mid);
+  font-size: 7px;
+  font-weight: 900;
+}
+
+.current-squad-snapshot > ul > li strong,
+.current-squad-snapshot > ul > li small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.current-squad-snapshot > ul > li strong {
+  color: var(--ink);
+  font-size: 9px;
+}
+
+.current-squad-snapshot > ul > li small {
+  color: var(--ink-soft);
+  font-size: 7px;
+}
+
+.squad-price-review {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #f8faf7;
+}
+
+.squad-price-review summary {
+  cursor: pointer;
+  padding: 8px 9px;
+  color: var(--forest-mid);
+  font-size: 9px;
+  font-weight: 850;
+}
+
+.squad-price-review[open] summary {
+  border-bottom: 1px solid var(--line);
+  background: white;
+}
+
+.squad-price-review > p {
+  margin: 0;
+  padding: 8px 9px 4px;
+  color: var(--ink-soft);
+  font-size: 8px;
+  line-height: 1.45;
+}
+
+.squad-price-review ul {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 6px;
+  list-style: none;
+}
+
+.squad-price-review li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 60px 62px;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 6px;
+  border-radius: 7px;
+  background: white;
+}
+
+.squad-price-review li > div,
+.squad-price-review li > span,
+.squad-price-review label {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.squad-price-review li > div strong,
+.squad-price-review li > div small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.squad-price-review strong {
+  color: var(--ink);
+  font-size: 9px;
+}
+
+.squad-price-review small,
+.squad-price-review label > span {
+  color: var(--ink-soft);
+  font-size: 7px;
+}
+
+.squad-price-review input {
+  width: 100%;
+  min-width: 0;
+  min-height: 29px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  padding: 0 6px;
+  background: white;
+  color: var(--ink);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+.squad-price-review input:focus {
+  outline: 2px solid var(--deadline);
+  outline-offset: 1px;
+}
+
+.squad-price-review input:disabled {
+  background: #f0f3ef;
+  color: #89938f;
+}
+
+.squad-correction-editor {
+  display: grid;
+  gap: 9px;
+  padding: 11px;
+  border: 1px solid #a9cdb8;
+  border-radius: 11px;
+  background: #f7fbf8;
+}
+
+.squad-correction-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.squad-correction-grid label {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.squad-correction-grid label > span {
+  color: var(--ink);
+  font-size: 9px;
+  font-weight: 800;
+}
+
+.squad-correction-grid input,
+.squad-correction-grid select {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: 0 9px;
+  background: white;
+  color: var(--ink);
+  font: inherit;
+  font-size: 10px;
+}
+
+.squad-correction-grid input:focus,
+.squad-correction-grid select:focus,
+.squad-source-choice button:focus-visible {
+  outline: 2px solid var(--deadline);
+  outline-offset: 2px;
+}
+
+.squad-correction-grid input:disabled,
+.squad-correction-grid select:disabled {
+  cursor: not-allowed;
+  background: #f0f3ef;
+  color: #89938f;
+}
+
+.squad-correction-editor__hint {
+  display: flex;
+  gap: 6px;
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 8px;
+  line-height: 1.45;
+}
+
+.squad-correction-editor__hint svg {
+  width: 12px;
+  flex: 0 0 auto;
+}
+
+.squad-correction-editor__add {
+  justify-self: start;
+  min-height: 36px;
+  padding: 0 11px;
+  font-size: 9px;
+}
+
+.text-button {
+  flex: 0 0 auto;
+  cursor: pointer;
+  border: 0;
+  padding: 2px 0;
+  background: transparent;
+  color: var(--forest-mid);
+  font-size: 8px;
+  font-weight: 850;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.squad-correction-log {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.squad-correction-log li {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  padding: 6px;
+  border-radius: 8px;
+  background: white;
+}
+
+.squad-correction-log li > span {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--forest);
+  color: white;
+  font-size: 8px;
+  font-weight: 900;
+}
+
+.squad-correction-log li > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.squad-correction-log strong {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--ink);
+  font-size: 9px;
+}
+
+.squad-correction-log strong svg {
+  width: 10px;
+  height: 10px;
+  flex: 0 0 auto;
+}
+
+.squad-correction-log small {
+  color: var(--ink-soft);
+  font-size: 8px;
+}
+
 .planner-chip-inventory {
   display: grid;
   gap: 9px;
@@ -721,7 +1115,7 @@ main {
 
 .ft-selector {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(6, 1fr);
   gap: 4px;
 }
 
@@ -4395,8 +4789,56 @@ tbody tr:hover {
   }
 
   .planner-confirm-grid,
+  .squad-correction-grid,
   .alternatives-list {
     grid-template-columns: 1fr;
+  }
+
+  .squad-source-choice {
+    grid-template-columns: 1fr;
+  }
+
+  .squad-source-choice button {
+    min-height: 60px;
+  }
+
+  .current-squad-snapshot > ul {
+    grid-template-columns: 1fr;
+  }
+
+  .squad-source-choice button strong,
+  .current-squad-snapshot > ul > li strong,
+  .squad-price-review strong,
+  .squad-correction-editor__heading strong {
+    font-size: 11px;
+  }
+
+  .squad-source-choice button small,
+  .current-squad-snapshot > ul > li small,
+  .squad-price-review small,
+  .squad-price-review label > span,
+  .squad-correction-editor__heading small,
+  .squad-correction-editor__hint,
+  .squad-correction-log small {
+    font-size: 10px;
+  }
+
+  .squad-correction-grid label > span,
+  .squad-price-review summary,
+  .squad-correction-log strong {
+    font-size: 11px;
+  }
+
+  .squad-correction-grid input,
+  .squad-correction-grid select,
+  .squad-price-review input {
+    min-height: 44px;
+    font-size: 16px;
+  }
+
+  .squad-correction-editor__add {
+    min-height: 44px;
+    font-size: 11px;
   }
 
   .deadline-strip__step {

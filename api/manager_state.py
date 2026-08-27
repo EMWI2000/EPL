@@ -16,7 +16,7 @@ import hmac
 import json
 import logging
 import os
-from typing import Any, Mapping
+from typing import Any, Collection, Mapping
 
 import requests
 
@@ -46,7 +46,7 @@ MAX_REQUEST_BYTES = 16_384
 INTERNAL_TOKEN_ENV = "INTERNAL_API_TOKEN"
 INTERNAL_TOKEN_HEADER = "X-Internal-Token"
 MIN_INTERNAL_TOKEN_BYTES = 32
-RESPONSE_SCHEMA_VERSION = "fpl-manager-state-response-v2"
+RESPONSE_SCHEMA_VERSION = "fpl-manager-state-response-v3"
 ALLOWED_REQUEST_FIELDS = frozenset({"manager_id"})
 
 
@@ -279,6 +279,89 @@ def _catalogue_indexes(
             f"bootstrap.element_types[{index}].singular_name_short",
         )
     return players, teams, positions
+
+
+def _public_player_catalog(
+    players: Mapping[int, Mapping[str, Any]],
+    teams: Mapping[int, Mapping[str, Any]],
+    positions: Mapping[int, str],
+    *,
+    owned_player_ids: Collection[int],
+) -> list[dict[str, Any]]:
+    """Serialize a usable reconciliation catalogue without trusting every row.
+
+    FPL occasionally carries stale or partially populated non-owned elements in
+    ``bootstrap-static``.  Such a row must not make a manager's entire sync
+    unavailable.  The 15 owned rows remain mandatory, and the result must also
+    retain at least one valid replacement candidate for every FPL position.
+    """
+
+    supported_positions = ("GKP", "DEF", "MID", "FWD")
+    owned_ids = frozenset(owned_player_ids)
+    result: list[dict[str, Any]] = []
+    for element_id in sorted(players):
+        player = players[element_id]
+        try:
+            team_id = _strict_integer(
+                player.get("team"), f"player {element_id}.team", minimum=1
+            )
+            element_type = _strict_integer(
+                player.get("element_type"),
+                f"player {element_id}.element_type",
+                minimum=1,
+            )
+            team = teams.get(team_id)
+            position = positions.get(element_type)
+            if team is None or position not in supported_positions:
+                raise UpstreamPayloadError(
+                    f"official catalogue references unknown metadata for player {element_id}"
+                )
+            entry = {
+                "id": element_id,
+                "display_name": _required_text(
+                    player.get("web_name"), f"player {element_id}.web_name"
+                ),
+                "position": position,
+                "team_id": team_id,
+                "team_name": team["name"],
+                "current_price_tenths": _strict_integer(
+                    player.get("now_cost"),
+                    f"player {element_id}.now_cost",
+                    minimum=1,
+                    maximum=500,
+                ),
+            }
+        except UpstreamPayloadError:
+            if element_id in owned_ids:
+                raise
+            LOGGER.warning(
+                "Skipping malformed non-owned FPL catalogue player %s", element_id
+            )
+            continue
+        result.append(entry)
+
+    catalog_ids = {entry["id"] for entry in result}
+    missing_owned = sorted(owned_ids - catalog_ids)
+    if missing_owned:
+        raise UpstreamPayloadError(
+            "official catalogue is missing owned player ids: "
+            + ", ".join(str(value) for value in missing_owned)
+        )
+
+    missing_candidate_positions = [
+        position
+        for position in supported_positions
+        if not any(
+            entry["position"] == position and entry["id"] not in owned_ids
+            for entry in result
+        )
+    ]
+    if missing_candidate_positions:
+        raise UpstreamPayloadError(
+            "official catalogue lacks a valid non-owned candidate for: "
+            + ", ".join(missing_candidate_positions)
+        )
+    return result
 
 
 def _core_player_prices(
@@ -614,6 +697,12 @@ def generate_manager_state(
     target = _target_upcoming_event(bootstrap, now=observed_at)
     price_signals, price_signal_metadata = _official_price_signal_overlay(bootstrap)
     players, teams, positions = _catalogue_indexes(bootstrap)
+    player_catalog = _public_player_catalog(
+        players,
+        teams,
+        positions,
+        owned_player_ids=public_state.squad_ids,
+    )
     core_prices = _core_player_prices(public_state, players)
     price_estimates = _estimated_player_prices(public_state, core_prices)
     picks = _enriched_picks(
@@ -651,6 +740,7 @@ def generate_manager_state(
             "picks": picks,
         },
         "price_signals": price_signal_metadata,
+        "player_catalog": player_catalog,
         "manual_state_template": _manual_state_template(
             public_state,
             target_event=target["event"],

@@ -319,7 +319,6 @@ def _prepare_inputs(
     shared_ft = _strict_non_negative_integer(
         candidates[0].free_transfers_before,
         "free_transfers_before",
-        minimum=1,
     )
     if shared_ft > TRANSFERS.max_banked_free_transfers:
         raise StrategyPlannerError("free_transfers_before is outside the legal range")

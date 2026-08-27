@@ -75,8 +75,26 @@ function syncResponse(): Record<string, any> {
     purchase_price_tenths: pick.estimated_purchase_price_tenths,
     selling_price_tenths: pick.estimated_selling_price_tenths,
   }));
+  const playerCatalog = [
+    ...picks.map((pick) => ({
+      id: pick.element_id,
+      display_name: pick.name,
+      position: pick.position,
+      team_id: pick.club_id,
+      team_name: pick.club_name,
+      current_price_tenths: pick.current_price_tenths,
+    })),
+    ...(["GKP", "DEF", "MID", "FWD"] as const).map((position, index) => ({
+      id: 16 + index,
+      display_name: `Candidate ${position}`,
+      position,
+      team_id: 6 + index,
+      team_name: `Candidate Club ${index + 1}`,
+      current_price_tenths: 45 + index,
+    })),
+  ];
   return {
-    schema_version: "fpl-manager-state-response-v2",
+    schema_version: "fpl-manager-state-response-v3",
     generated_at: "2026-08-23T12:00:00Z",
     manager: {
       id: 123,
@@ -113,6 +131,7 @@ function syncResponse(): Record<string, any> {
       ],
       warning: null,
     },
+    player_catalog: playerCatalog,
     manual_state_template: {
       state: {
         current_squad_ids: picks.map((pick) => pick.element_id),
@@ -545,6 +564,36 @@ test("sync validation fails closed for unknown, contradictory, or credential-sha
   wrongSignal.last_deadline_state.picks[0].official_price_signal.element_id = 999;
   assert.equal(isManagerSyncResponse(wrongSignal), false);
 
+  const duplicateCatalogPlayer = syncResponse();
+  duplicateCatalogPlayer.player_catalog[1].id = duplicateCatalogPlayer.player_catalog[0].id;
+  assert.throws(
+    () => parseManagerSyncResponse(duplicateCatalogPlayer),
+    /player ids must be unique/,
+  );
+
+  const contradictoryCatalogPlayer = syncResponse();
+  contradictoryCatalogPlayer.player_catalog[0].display_name = "Wrong player";
+  assert.throws(
+    () => parseManagerSyncResponse(contradictoryCatalogPlayer),
+    /must match public pick 1/,
+  );
+
+  const squadOnlyCatalog = syncResponse();
+  squadOnlyCatalog.player_catalog = squadOnlyCatalog.player_catalog.slice(0, 15);
+  assert.throws(
+    () => parseManagerSyncResponse(squadOnlyCatalog),
+    /non-owned GKP candidate/,
+  );
+
+  const missingDefenderCandidate = syncResponse();
+  missingDefenderCandidate.player_catalog = missingDefenderCandidate.player_catalog.filter(
+    (player: Record<string, unknown>) => player.id !== 17,
+  );
+  assert.throws(
+    () => parseManagerSyncResponse(missingDefenderCandidate),
+    /non-owned DEF candidate/,
+  );
+
   const wrongDraft = syncResponse();
   wrongDraft.manual_state_template.state.player_prices[0].selling_price_tenths = 49;
   assert.throws(
@@ -614,6 +663,7 @@ test("parses manager id, bank in tenths, and free transfers without coercion", (
   assert.equal(parseBankTenths("1.2"), 12);
   assert.equal(parseBankTenths("£0.1m"), 1);
   assert.equal(parseBankTenths("10"), 100);
+  assert.equal(parseFreeTransfers("0"), 0);
   assert.equal(parseFreeTransfers(" 5 "), 5);
 
   for (const value of ["", "0", "1.2", "+7", "01"]) {
@@ -623,7 +673,7 @@ test("parses manager id, bank in tenths, and free transfers without coercion", (
     assert.throws(() => parseBankTenths(value), PlannerContractError);
   }
   assert.throws(() => parseBankTenths("100.1"), PlannerContractError);
-  for (const value of ["0", "6", "1.0", "two"]) {
+  for (const value of ["-1", "6", "1.0", "two"]) {
     assert.throws(() => parseFreeTransfers(value), PlannerContractError);
   }
 });
@@ -637,7 +687,7 @@ test("serializes only the allowlisted compute request and always disables Solio"
     manager_state: {
       ...sync.manual_state_template.state,
       bank_tenths: 12,
-      free_transfers: 3,
+      free_transfers: 0,
       no_active_chip_confirmed: true,
     },
     horizon: 4,
@@ -659,6 +709,7 @@ test("serializes only the allowlisted compute request and always disables Solio"
     "forecast_version",
   ]);
   assert.equal(serialized.use_solio, false);
+  assert.equal(serialized.manager_state.free_transfers, 0);
   assert.notStrictEqual(serialized.manager_state, input.manager_state);
   assert.doesNotMatch(JSON.stringify(serialized), /password|access_token|never-copy-me/);
   assert.deepEqual(JSON.parse(stringifyPlannerRequest(input)), serialized);
@@ -687,6 +738,17 @@ test("validates planner actions, enriched transfers, confirmed state, and method
   fiveFreeTransfers.alternatives[0].free_transfers_next_gameweek = 5;
   fiveFreeTransfers.method.maximum_immediate_transfers = 5;
   assert.equal(isPlannerPayload(fiveFreeTransfers), true);
+
+  const noFreeTransfers = plannerPayload();
+  noFreeTransfers.confirmed_state.free_transfers = 0;
+  noFreeTransfers.best_action.free_transfers_before = 0;
+  noFreeTransfers.best_action.free_transfers_next_gameweek = 1;
+  noFreeTransfers.best_action.banked_ft_value_points = 0;
+  noFreeTransfers.alternatives[0].kind = "hit";
+  noFreeTransfers.alternatives[0].free_transfers_before = 0;
+  noFreeTransfers.alternatives[0].free_transfers_next_gameweek = 1;
+  noFreeTransfers.alternatives[0].hit_points = 4;
+  assert.equal(isPlannerPayload(noFreeTransfers), true);
 });
 
 test("validates an additive bounded two-deadline sequence and reconciles its totals", () => {
@@ -782,6 +844,13 @@ test("roadmap validation rejects a broken window, first action, provisional flag
   tooManyFutureTransfers.method.bounded_roadmap_modelled = true;
   tooManyFutureTransfers.method.next_deadline_transfer_modelled = true;
   assert.throws(() => parsePlannerPayload(tooManyFutureTransfers), /exceeds the bounded/);
+
+  const zeroAtProvisionalDeadline = plannerPayload();
+  zeroAtProvisionalDeadline.strategy = strategyPlan(zeroAtProvisionalDeadline);
+  zeroAtProvisionalDeadline.strategy.steps[1].free_transfers_before = 0;
+  zeroAtProvisionalDeadline.method.bounded_roadmap_modelled = true;
+  zeroAtProvisionalDeadline.method.next_deadline_transfer_modelled = true;
+  assert.throws(() => parsePlannerPayload(zeroAtProvisionalDeadline), /free_transfers_before/);
 
   const wrongTotal = plannerPayload();
   wrongTotal.strategy = strategyPlan(wrongTotal);
@@ -881,6 +950,12 @@ test("sequential validation rejects unknown fields, a mismatched first action an
   undercountedCandidatePool.method.next_deadline_transfer_modelled = true;
   undercountedCandidatePool.method.candidate_count = 16;
   assert.throws(() => parsePlannerPayload(undercountedCandidatePool), /referenced candidate set/);
+
+  const zeroAtFutureDeadline = plannerPayload();
+  zeroAtFutureDeadline.sequential = sequentialPlan(zeroAtFutureDeadline);
+  zeroAtFutureDeadline.method.next_deadline_transfer_modelled = true;
+  zeroAtFutureDeadline.sequential.best_sequence.steps[1].free_transfers_before = 0;
+  assert.throws(() => parsePlannerPayload(zeroAtFutureDeadline), /free_transfers_before/);
 });
 
 test("sequential validation requires reconciled totals and a matching method flag", () => {

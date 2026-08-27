@@ -149,13 +149,21 @@ def test_manual_state_is_strict_complete_and_json_safe() -> None:
     assert "password" not in encoded.casefold()
     assert "cookie" not in encoded.casefold()
 
+    spent_transfer_payload = _manual_payload()
+    spent_transfer_payload["free_transfers"] = 0
+    spent_transfer_state = parse_manual_current_state(
+        spent_transfer_payload,
+        known_player_ids=set(range(1, 100)),
+    )
+    assert spent_transfer_state.free_transfers == 0
+
 
 @pytest.mark.parametrize(
     "mutator, message",
     [
         (lambda value: value.update({"password": "never"}), "credentials"),
         (lambda value: value.update({"unknown": True}), "unsupported"),
-        (lambda value: value.update({"free_transfers": 0}), "free_transfers"),
+        (lambda value: value.update({"free_transfers": -1}), "free_transfers"),
         (lambda value: value.update({"free_transfers": True}), "integer"),
         (
             lambda value: value.update({"no_active_chip_confirmed": 1}),

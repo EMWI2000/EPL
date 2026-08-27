@@ -252,7 +252,7 @@ export function parseDecisionHistoryEntry(value: unknown, path = "entry"): Decis
     },
     confirmed: {
       bank_tenths: integer(confirmed.bank_tenths, `${path}.confirmed.bank_tenths`, 0, 1_000),
-      free_transfers: integer(confirmed.free_transfers, `${path}.confirmed.free_transfers`, 1, 5),
+      free_transfers: integer(confirmed.free_transfers, `${path}.confirmed.free_transfers`, 0, 5),
     },
     selection: { kind: selectionKind, alternative_index: alternativeIndex },
     action,

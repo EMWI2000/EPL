@@ -296,7 +296,6 @@ def _prepare_candidates(
     shared_ft = _integer(
         candidates[0].free_transfers_before,
         "free_transfers_before",
-        minimum=1,
     )
     if shared_ft > TRANSFERS.max_banked_free_transfers:
         raise SequentialTransferError("free_transfers_before is outside the legal range")

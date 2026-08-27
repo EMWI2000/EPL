@@ -1,4 +1,4 @@
-export const MANAGER_SYNC_SCHEMA_VERSION = "fpl-manager-state-response-v2" as const;
+export const MANAGER_SYNC_SCHEMA_VERSION = "fpl-manager-state-response-v3" as const;
 export const PERSONAL_STATE_SCHEMA_VERSION = "fpl-personal-state-v2" as const;
 export const SNAPSHOT_SCHEMA_VERSION = "fpl-deadline-state-snapshot-v2" as const;
 export const PRICE_SIGNAL_SCHEMA_VERSION = "fpl-official-price-signals-v1" as const;
@@ -59,6 +59,15 @@ export interface ManagerSyncPick {
   estimated_selling_price_tenths: number;
   purchase_price_basis: PurchasePriceBasis;
   official_price_signal: OfficialPriceSignal | null;
+}
+
+export interface ManagerSyncPlayerCatalogEntry {
+  id: number;
+  display_name: string;
+  position: PlayerPosition;
+  team_id: number;
+  team_name: string;
+  current_price_tenths: number;
 }
 
 export type PublicStateLimitation =
@@ -133,6 +142,7 @@ export interface ManagerSyncResponse {
   };
   target: { event: number; name: string; deadline_time: string };
   last_deadline_state: LastDeadlineState;
+  player_catalog: ManagerSyncPlayerCatalogEntry[];
   price_signals: {
     schema_version: typeof PRICE_SIGNAL_SCHEMA_VERSION;
     available: boolean;
@@ -647,6 +657,22 @@ function validateSyncPick(value: unknown, path: string, sourceEvent: number): Ma
   return row as unknown as ManagerSyncPick;
 }
 
+function validateSyncPlayerCatalogEntry(
+  value: unknown,
+  path: string,
+): ManagerSyncPlayerCatalogEntry {
+  const row = exactRecord(value, path, [
+    "id", "display_name", "position", "team_id", "team_name", "current_price_tenths",
+  ]);
+  integer(row.id, `${path}.id`, 1);
+  text(row.display_name, `${path}.display_name`);
+  oneOf(row.position, `${path}.position`, POSITIONS);
+  integer(row.team_id, `${path}.team_id`, 1);
+  text(row.team_name, `${path}.team_name`);
+  integer(row.current_price_tenths, `${path}.current_price_tenths`, 1, 500);
+  return row as unknown as ManagerSyncPlayerCatalogEntry;
+}
+
 function validatePositionQuotas(players: readonly { position: PlayerPosition }[], path: string): void {
   const expected: Record<PlayerPosition, number> = { GKP: 2, DEF: 5, MID: 5, FWD: 3 };
   for (const position of POSITIONS) {
@@ -768,7 +794,7 @@ export function parseManualManagerState(value: unknown): ManualManagerState {
   ]);
   const squadIds = uniqueIntegers(row.current_squad_ids, `${path}.current_squad_ids`, 15);
   integer(row.bank_tenths, `${path}.bank_tenths`, 0, MAX_BANK_TENTHS);
-  integer(row.free_transfers, `${path}.free_transfers`, 1, 5);
+  integer(row.free_transfers, `${path}.free_transfers`, 0, 5);
   validatePlayerPrices(row.player_prices, `${path}.player_prices`, squadIds);
   const effectiveEvent = integer(row.effective_event, `${path}.effective_event`, 1, 38);
   const chipUsage = validateChipUsage(row.chip_usage, `${path}.chip_usage`, {
@@ -782,7 +808,7 @@ export function parseManualManagerState(value: unknown): ManualManagerState {
 export function parseManagerSyncResponse(value: unknown): ManagerSyncResponse {
   const root = exactRecord(value, "sync", [
     "schema_version", "generated_at", "manager", "target", "last_deadline_state",
-    "price_signals", "manual_state_template", "snapshot", "warnings",
+    "price_signals", "player_catalog", "manual_state_template", "snapshot", "warnings",
   ]);
   literal(root.schema_version, "sync.schema_version", MANAGER_SYNC_SCHEMA_VERSION);
   const generatedAt = isoUtc(root.generated_at, "sync.generated_at");
@@ -837,6 +863,46 @@ export function parseManagerSyncResponse(value: unknown): ManagerSyncResponse {
     fail("sync.last_deadline_state.picks", "must contain one captain and one vice-captain");
   }
   validatePositionQuotas(picks, "sync.last_deadline_state.picks");
+
+  const playerCatalogValues = array(root.player_catalog, "sync.player_catalog");
+  if (playerCatalogValues.length < 15 || playerCatalogValues.length > 1_000) {
+    fail("sync.player_catalog", "must contain between 15 and 1000 players");
+  }
+  const playerCatalog = playerCatalogValues.map((player, index) =>
+    validateSyncPlayerCatalogEntry(player, `sync.player_catalog[${index}]`)
+  );
+  const catalogIds = playerCatalog.map((player) => player.id);
+  if (new Set(catalogIds).size !== catalogIds.length) {
+    fail("sync.player_catalog", "player ids must be unique");
+  }
+  if (catalogIds.some((id, index) => index > 0 && id <= catalogIds[index - 1])) {
+    fail("sync.player_catalog", "must be sorted by ascending player id");
+  }
+  const catalogById = new Map(playerCatalog.map((player) => [player.id, player]));
+  const pickIdSet = new Set(picks.map((pick) => pick.element_id));
+  for (const pick of picks) {
+    const catalogPlayer = catalogById.get(pick.element_id);
+    if (
+      catalogPlayer === undefined ||
+      catalogPlayer.display_name !== pick.name ||
+      catalogPlayer.position !== pick.position ||
+      catalogPlayer.team_id !== pick.club_id ||
+      catalogPlayer.team_name !== pick.club_name ||
+      catalogPlayer.current_price_tenths !== pick.current_price_tenths
+    ) {
+      fail("sync.player_catalog", `must match public pick ${pick.element_id}`);
+    }
+  }
+  for (const position of POSITIONS) {
+    if (!playerCatalog.some((player) =>
+      player.position === position && !pickIdSet.has(player.id)
+    )) {
+      fail(
+        "sync.player_catalog",
+        `must contain at least one non-owned ${position} candidate`,
+      );
+    }
+  }
 
   const priceSignals = exactRecord(root.price_signals, "sync.price_signals", [
     "schema_version", "available", "player_count", "price_change_deadlines", "warning",
@@ -933,7 +999,7 @@ export function parseBankTenths(value: string): number {
 export function parseFreeTransfers(value: string): number {
   if (typeof value !== "string") fail("free_transfers", "must be text");
   const normalized = value.trim();
-  if (!/^[1-5]$/.test(normalized)) fail("free_transfers", "must be a whole number from 1 to 5");
+  if (!/^[0-5]$/.test(normalized)) fail("free_transfers", "must be a whole number from 0 to 5");
   return Number(normalized);
 }
 
@@ -1094,7 +1160,7 @@ function validateAction(
   const bankBefore = integer(row.bank_before_tenths, `${path}.bank_before_tenths`, 0, MAX_BANK_TENTHS);
   const bankAfter = integer(row.bank_after_tenths, `${path}.bank_after_tenths`, 0, MAX_BANK_TENTHS);
   if (bankBefore !== bank || bankAfter !== bankBefore + bankDelta) fail(`${path}.bank_after_tenths`, "does not reconcile with confirmed bank and transfer prices");
-  const ftBefore = integer(row.free_transfers_before, `${path}.free_transfers_before`, 1, 5);
+  const ftBefore = integer(row.free_transfers_before, `${path}.free_transfers_before`, 0, 5);
   const ftNext = integer(row.free_transfers_next_gameweek, `${path}.free_transfers_next_gameweek`, 1, 5);
   if (ftBefore !== freeTransfers || ftNext !== Math.min(5, Math.max(0, ftBefore - transferCount) + 1)) fail(`${path}.free_transfers_next_gameweek`, "does not follow the rolling free-transfer rule");
   const hitPoints = integer(row.hit_points, `${path}.hit_points`, 0, 16);
@@ -1265,7 +1331,7 @@ function validateSequentialStep(
   const freeTransfersBefore = integer(
     row.free_transfers_before,
     `${path}.free_transfers_before`,
-    1,
+    options.provisional ? 1 : 0,
     5,
   );
   const freeTransfersNext = integer(
@@ -2138,7 +2204,7 @@ export function parsePlannerPayload(value: unknown): PlannerPayload {
     "bank_tenths", "free_transfers", "no_active_chip_confirmed", "squad",
   ]);
   const bank = integer(confirmed.bank_tenths, "planner.confirmed_state.bank_tenths", 0, MAX_BANK_TENTHS);
-  const freeTransfers = integer(confirmed.free_transfers, "planner.confirmed_state.free_transfers", 1, 5);
+  const freeTransfers = integer(confirmed.free_transfers, "planner.confirmed_state.free_transfers", 0, 5);
   literal(confirmed.no_active_chip_confirmed, "planner.confirmed_state.no_active_chip_confirmed", true);
   const squadValues = array(confirmed.squad, "planner.confirmed_state.squad");
   if (squadValues.length !== 15) fail("planner.confirmed_state.squad", "must contain exactly 15 players");

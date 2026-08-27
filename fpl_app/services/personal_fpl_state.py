@@ -529,7 +529,7 @@ def parse_manual_current_state(
 
         bank = _strict_int(data["bank_tenths"], "bank_tenths", maximum=1000)
         free_transfers = _strict_int(
-            data["free_transfers"], "free_transfers", minimum=1, maximum=5
+            data["free_transfers"], "free_transfers", maximum=5
         )
         no_active_chip_confirmed = data["no_active_chip_confirmed"]
         if not isinstance(no_active_chip_confirmed, bool):

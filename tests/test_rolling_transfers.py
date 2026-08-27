@@ -157,6 +157,28 @@ def test_two_transfers_charge_a_hit_only_above_the_free_transfer_bank() -> None:
     assert with_two_fts.best_action.free_transfers_next_gameweek == 1
 
 
+def test_zero_remaining_free_transfers_charges_the_next_move_as_a_hit() -> None:
+    players, squad_ids = _pool()
+    defender = players.index[players["id"] == 103][0]
+    players.loc[defender, ["ep_gw1", "ep_gw2"]] = [20.0, 18.0]
+
+    result = optimize_rolling_transfers(
+        players,
+        squad_ids,
+        bank_tenths=0,
+        free_transfers=0,
+        horizon=2,
+        roll_ft_value_points=0,
+    )
+
+    assert result.roll.free_transfers_before == 0
+    assert result.roll.free_transfers_next_gameweek == 1
+    assert result.best_action.transfer_count == 1
+    assert result.best_action.free_transfers_before == 0
+    assert result.best_action.hit_points == 4
+    assert result.best_action.free_transfers_next_gameweek == 1
+
+
 def test_club_limit_is_enforced_for_transfer_candidates() -> None:
     players, squad_ids = _pool()
     # Club 1 has two goalkeepers and a midfielder, so a fourth defender cannot
