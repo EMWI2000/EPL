@@ -13,6 +13,7 @@ import {
   type AiReviewModelOutput,
   type AiReviewRecommendationSource,
 } from "../lib/ai-review-contract.ts";
+import { MAX_AI_REVIEW_INBOUND_REQUEST_BYTES } from "../lib/ai-review-body-limit.ts";
 import type { ManagerSyncResponse, PlannerPayload } from "../lib/planner-contract.ts";
 import { parsePlannerPayload } from "../lib/planner-contract.ts";
 
@@ -238,6 +239,15 @@ test("builds and validates a compact review request tied to the solver result", 
   assert.equal(parsed.state_observed_at, "2026-08-23T12:00:00.123Z");
   assert.equal(parsed.squad_context.length, 15);
   assert.deepEqual(parsed.lineup.starting_ids, parsed.planner.best_action.gameweeks[0].starting_ids);
+});
+
+test("keeps a separate bounded transport budget for the full validated planner request", () => {
+  const request = buildAiReviewRequest(syncFixture(), recommendationFixture());
+  const requestBytes = new TextEncoder().encode(JSON.stringify(request)).byteLength;
+
+  assert.equal(MAX_AI_REVIEW_INBOUND_REQUEST_BYTES, 256 * 1_024);
+  assert.equal(MAX_AI_REVIEW_INBOUND_REQUEST_BYTES > 65_536, true);
+  assert.equal(requestBytes < MAX_AI_REVIEW_INBOUND_REQUEST_BYTES, true);
 });
 
 test("rejects reviews after the deadline or when the recommendation is older than 24 hours", () => {

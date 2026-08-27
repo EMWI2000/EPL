@@ -3,6 +3,10 @@ import {
   assertAiReviewRequestIsFresh,
   parseAiReviewRequest,
 } from "@/lib/ai-review-contract";
+import {
+  hasInvalidAiReviewContentLength,
+  isAiReviewBodyTooLarge,
+} from "@/lib/ai-review-body-limit";
 import { configuredFplManagerId } from "@/lib/fpl-manager-config";
 import {
   DEFAULT_OPENAI_REVIEW_MODEL,
@@ -19,7 +23,6 @@ import { getCurrentSession } from "@/lib/require-user";
 export const runtime = "nodejs";
 export const maxDuration = 300;
 
-const MAX_REQUEST_BYTES = 65_536;
 const COOLDOWN_MS = 60_000;
 const recentRequests = new Map<string, number>();
 const inFlightRequests = new Set<string>();
@@ -77,17 +80,12 @@ export async function POST(request: Request) {
   if (contentType !== "application/json") {
     return errorResponse(415, "unsupported_media_type", "Content-Type skal være application/json.");
   }
-  const declaredLength = Number(request.headers.get("content-length") ?? "0");
-  if (
-    !Number.isFinite(declaredLength) ||
-    declaredLength < 0 ||
-    declaredLength > MAX_REQUEST_BYTES
-  ) {
+  if (hasInvalidAiReviewContentLength(request.headers.get("content-length"))) {
     return errorResponse(413, "request_too_large", "Forespørgslen er for stor.");
   }
 
   const bodyText = await request.text();
-  if (Buffer.byteLength(bodyText, "utf8") > MAX_REQUEST_BYTES) {
+  if (isAiReviewBodyTooLarge(bodyText)) {
     return errorResponse(413, "request_too_large", "Forespørgslen er for stor.");
   }
 
