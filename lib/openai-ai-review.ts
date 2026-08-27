@@ -28,6 +28,7 @@ const ALLOWED_OPENAI_REASONING_EFFORTS = new Set<AiReviewReasoningEffort>([
   "max",
 ]);
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/g;
+const MODEL_META_COMMENTARY = /\s+(?:[a-z]{0,3}\?\s*)?(?:remove weird token\b|need (?:to )?ensure valid json\b|final output (?:can't|cannot) be edited\b|continue mentally\b)[\s\S]*$/i;
 
 export const AI_REVIEW_INSTRUCTIONS = `Du er den afsluttende, uafhængige FPL-beslutningsreviewer. Svar konkret på dansk og giv én entydig handling til den næste deadline.
 
@@ -46,7 +47,7 @@ solver.strategy_roadmap er en afgrænset fire-deadline-plan, ikke en låst fremt
 
 solver.chip_strategy er afgrænsede kontrafaktiske scenarier, ikke en ordre om at aktivere en chip. Du må kun omtale en chip ved loyalt at gentage et leveret scenarie eller den leverede chipanbefaling; du må ikke opfinde, ændre eller kombinere chipscenarier. En chip må aldrig erstatte dagens tilladte verdict, og appen aktiverer aldrig chips. Dagens anbefaling må fortsat kun være solverens bedste handling, ét nummereret alternativ eller at vente. Brug scope=solver_bounded_strategy_context_no_new_actions. Appen udfører aldrig transfers eller chips. Giv ingen garanti for udfaldet.
 
-Sæt alternative_index til null ved confirm_best_action og wait_for_information. Ved prefer_alternative skal den være det 0-baserede alternative_index fra præcis ét eksisterende solver-alternativ. execution_timing må ikke være act_now, hvis verdict er wait_for_information. Hold headline under 140 tegn, summary under 700 tegn, evidence_summary og strategic_outlook.summary under 900 tegn, hvert rationale/risiko/change-trigger/data-gap/prioritet/watchpoint under 280 tegn, hvert qualitative_evidence.finding under 360 tegn og hvert checklist-punkt under 240 tegn.`;
+Sæt alternative_index til null ved confirm_best_action og wait_for_information. Ved prefer_alternative skal den være det 0-baserede alternative_index fra præcis ét eksisterende solver-alternativ. execution_timing må ikke være act_now, hvis verdict er wait_for_information. Alle tekstfelter skal være færdige og skrevet på brugervendt dansk. Medtag aldrig scratchpad, intern monolog, JSON-redigeringsnoter, valideringsinstruktioner eller anden meta-kommentar om, hvordan svaret blev dannet. Hold headline under 140 tegn, summary under 700 tegn, evidence_summary og strategic_outlook.summary under 900 tegn, hvert rationale/risiko/change-trigger/data-gap/prioritet/watchpoint under 280 tegn, hvert qualitative_evidence.finding under 360 tegn og hvert checklist-punkt under 240 tegn.`;
 
 export type OpenAiReviewErrorKind =
   | "configuration"
@@ -144,7 +145,11 @@ function safeDataText(value: string, maximum: number): string {
 
 function normalizeOptionalText(value: unknown): unknown {
   return typeof value === "string"
-    ? value.replace(CONTROL_CHARACTERS, " ").replace(/\s+/g, " ").trim()
+    ? value
+        .replace(CONTROL_CHARACTERS, " ")
+        .replace(/\s+/g, " ")
+        .replace(MODEL_META_COMMENTARY, "")
+        .trim()
     : value;
 }
 
