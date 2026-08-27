@@ -599,6 +599,7 @@ test("fails closed on incomplete, refusal, missing research and malformed struct
 test("normalizes cosmetic model text without weakening structural validation", () => {
   const verbose = reviewFixture();
   verbose.rationale[1] = `${"Lang begrundelse ".repeat(30)}\nmed linjeskift`;
+  verbose.deadline_checklist[0] = "Kontrollér de seneste officielle skades-, karantæne-, startrolle-, minut-, pris- og pressemødeoplysninger før deadline. ".repeat(4);
 
   const result = parseOpenAiReviewResponseBody({
     status: "completed",
@@ -614,6 +615,8 @@ test("normalizes cosmetic model text without weakening structural validation", (
   assert.equal(result.review.rationale[1].length <= 280, true);
   assert.equal(result.review.rationale[1].includes("\n"), false);
   assert.equal(result.review.rationale[1].endsWith("…"), true);
+  assert.equal(result.review.deadline_checklist[0].length <= 240, true);
+  assert.equal(result.review.deadline_checklist[0].endsWith("…"), true);
 });
 
 test("normalization still fails closed on structural and decision invariants", () => {
