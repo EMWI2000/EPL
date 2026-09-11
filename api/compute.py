@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler
 import hmac
 import json
 import logging
+import math
 import os
 from time import monotonic
 from typing import Any, Mapping
@@ -1120,6 +1121,7 @@ def _serialize_chip_strategy(
         "model_scope": result.model_scope,
         "globally_optimal": bool(result.globally_optimal),
         "recalculate_each_deadline": bool(result.recalculate_each_deadline),
+        "sequence_comparison": result.sequence_comparison,
     }
 
 
@@ -1715,7 +1717,7 @@ def generate_recommendation(payload: Any = None) -> dict[str, Any]:
         except SquadPlanError as exc:
             raise RecommendationUnavailableError(str(exc)) from exc
 
-    return _serialize_recommendation(
+    response = _serialize_recommendation(
         result=result,
         eligible=eligible,
         window=window,
@@ -1726,6 +1728,71 @@ def generate_recommendation(payload: Any = None) -> dict[str, Any]:
         price_metadata=price_metadata,
         planner_payload=planner_payload,
     )
+    response["forecast_audit"] = _forecast_audit_capture(
+        bootstrap, pool, planner_payload, response["meta"]["generated_at"],
+        start_event, str(options["forecast_version"]),
+    )
+    return response
+
+
+def _forecast_audit_capture(
+    bootstrap: Mapping[str, Any], pool: pd.DataFrame,
+    planner: Mapping[str, Any] | None, generated_at: str,
+    target_event: int, version: str,
+) -> dict[str, Any] | None:
+    """Capture the original confirmed cohort, not only the optimiser's winners.
+
+    Baselines come from this same pre-deadline bootstrap, never from post-event
+    data. The minutes baseline is deliberately simple: season minutes divided
+    by finished gameweeks, not an independent calibrated minutes model.
+    """
+    if planner is None:
+        return None
+    events = bootstrap.get("events", [])
+    target = next((e for e in events if e.get("id") == target_event), {})
+    deadline = target.get("deadline_time")
+    if not isinstance(deadline, str):
+        return None
+    completed = sum(1 for e in events if e.get("id", 39) < target_event
+                    and e.get("finished") is True and e.get("data_checked") is True)
+    prior_events_complete = all(e.get("finished") is True and e.get("data_checked") is True
+                                for e in events if e.get("id", 39) < target_event)
+    raw = {e["id"]: e for e in bootstrap.get("elements", []) if "id" in e}
+    by_id = pool.set_index("id", drop=False)
+
+    def number(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed = float(value)
+            return round(parsed, 4) if math.isfinite(parsed) else None
+        except (ValueError, TypeError):
+            return None
+
+    players = []
+    for reference in planner["confirmed_state"]["squad"]:
+        player_id = int(reference["id"])
+        if player_id not in by_id.index:
+            return None
+        row = by_id.loc[player_id]
+        official = raw.get(player_id, {})
+        minutes = number(official.get("minutes"))
+        model_points = number(row.get("ep_gw1"))
+        model_minutes = number(row.get("expected_minutes_gw1"))
+        if model_points is None or model_minutes is None:
+            return None
+        players.append({
+            "id": player_id, "name": str(row["name"]),
+            "model_points": model_points, "model_minutes": model_minutes,
+            "baseline_points": number(official.get("ep_next")),
+            "baseline_minutes": round(minutes / completed, 4)
+                if minutes is not None and completed and prior_events_complete else None,
+        })
+    return {
+        "target_event": target_event, "target_deadline": deadline,
+        "generated_at": generated_at, "model_version": "v2.1" if version == "v2" else version,
+        "players": players,
+    }
 
 
 def _error_payload(

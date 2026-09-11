@@ -4,7 +4,9 @@ Chip values are always measured against the supplied no-chip roadmap.  The
 module does not turn a chip into an executable action: it screens Triple
 Captain and Bench Boost from the roadmap lineups, solves one bounded Wildcard
 rebuild, and only solves a Free Hit counterfactual when the official fixture
-data already contains a blank or double gameweek.
+data already contains a blank or double gameweek.  A paired continuation
+comparison evaluates normal transfers, Bench Boost, Wildcard, and Wildcard
+followed by Bench Boost within the same forecast and chip-set window.
 
 Future prices are held at today's values.  Every result is therefore a
 recalculate-at-deadline decision aid, not a season-wide chip optimum.
@@ -12,7 +14,7 @@ recalculate-at-deadline decision aid, not a season-wide chip optimum.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import isfinite
 from time import monotonic
 from typing import Collection, Mapping, Sequence
@@ -32,6 +34,7 @@ from .squad_plan import (
     optimize_squad_plan,
 )
 from .strategy_planner import BoundedStrategyResult
+from .chip_sequences import evaluate_chip_sequences
 
 
 CHIP_ORDER = (Chip.WILDCARD, Chip.FREE_HIT, Chip.BENCH_BOOST, Chip.TRIPLE_CAPTAIN)
@@ -124,9 +127,10 @@ class ChipStrategyResult:
     model_scope: str = MODEL_SCOPE
     globally_optimal: bool = False
     recalculate_each_deadline: bool = True
+    sequence_comparison: dict[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        result = {
             "horizon": self.horizon,
             "target_event": self.target_event,
             "inventory": [entry.as_dict() for entry in self.inventory],
@@ -136,6 +140,9 @@ class ChipStrategyResult:
             "globally_optimal": self.globally_optimal,
             "recalculate_each_deadline": self.recalculate_each_deadline,
         }
+        if self.sequence_comparison is not None:
+            result["sequence_comparison"] = self.sequence_comparison
+        return result
 
 
 def _normalized_usage(
@@ -406,8 +413,16 @@ def _wildcard_scenario(
         raise ChipStrategyError("current selling prices are required for Wildcard") from exc
 
     try:
+        # A retained player does not have to be sold and repurchased at market
+        # price.  Price owned players at their sale value in the rebuild MILP;
+        # total liquidation value then exactly reproduces the real WC budget.
+        wildcard_pool = players[players["id"].isin(eligible_transfer_in_ids | frozenset(current_squad_ids))].copy()
+        owned_mask = wildcard_pool["id"].isin(current_squad_ids)
+        wildcard_pool.loc[owned_mask, "now_cost"] = pd.to_numeric(
+            wildcard_pool.loc[owned_mask, "selling_price"], errors="raise"
+        ).astype(int)
         wildcard = optimize_squad_plan(
-            players[players["id"].isin(eligible_transfer_in_ids)].copy(),
+            wildcard_pool,
             horizon=roadmap.horizon,
             gw_weights=roadmap.gw_weights,
             budget_tenths=current_budget,
@@ -459,7 +474,8 @@ def _wildcard_scenario(
             model_scope="multiweek_rebuild",
             reason=(
                 "Én fuld 15-mands genopbygning er sammenlignet med roadmapet over "
-                "samme horisont. Senere post-Wildcard-transfers og prisændringer er ikke modelleret."
+                "samme horisont. Den separate parrede chipanalyse sammenligner "
+                "også efterfølgende transfers og Wildcard fulgt af Bench Boost."
             ),
             squad_ids=tuple(int(value) for value in wildcard.squad_ids),
             change_count=changes,
@@ -680,11 +696,12 @@ def evaluate_chip_strategy(
         for offset in range(1, roadmap.horizon + 1)
     )
     free_hit_reserve = 1.0 if free_hit_triggered else 0.0
+    sequence_reserve = min(0.75, solver_budget * 0.3)
     wildcard_budget = max(
         0.5,
-        min(solver_budget, solver_deadline - monotonic() - free_hit_reserve),
+        min(solver_budget, solver_deadline - monotonic() - free_hit_reserve - sequence_reserve),
     )
-    wildcard, _wildcard_plan = _wildcard_scenario(
+    wildcard, wildcard_plan = _wildcard_scenario(
         players,
         roadmap,
         target_event=target_event,
@@ -695,7 +712,7 @@ def evaluate_chip_strategy(
         eligible_transfer_in_ids=eligible_ids,
         solver_budget_seconds=wildcard_budget,
     )
-    free_hit_budget = max(0.0, solver_deadline - monotonic())
+    free_hit_budget = max(0.0, solver_deadline - monotonic() - sequence_reserve)
     free_hit = _free_hit_scenario(
         players,
         roadmap,
@@ -706,6 +723,54 @@ def evaluate_chip_strategy(
         eligible_transfer_in_ids=eligible_ids,
         solver_budget_seconds=free_hit_budget,
     )
+    sequence_comparison = evaluate_chip_sequences(
+        players,
+        roadmap,
+        wildcard_plan,
+        target_event=target_event,
+        usage=usage,
+        current_squad_ids=current_squad_ids,
+        bank_tenths=bank_tenths,
+        free_transfers=free_transfers,
+        eligible_transfer_in_ids=eligible_ids,
+        deadline=solver_deadline,
+    )
+    paired_paths = {
+        path["sequence_id"]: path
+        for path in sequence_comparison["sequences"]
+    }
+    if "normal" in paired_paths and "wildcard" in paired_paths:
+        baseline = float(paired_paths["normal"]["weighted_net_points"])
+        wildcard_points = float(paired_paths["wildcard"]["weighted_net_points"])
+        gain = round(wildcard_points - baseline, 3)
+        wildcard = replace(
+            wildcard,
+            estimated_gain_points=gain,
+            baseline_points=baseline,
+            chip_points=wildcard_points,
+            signal=(
+                "consider"
+                if gain >= WILDCARD_CONSIDER_GAIN_POINTS
+                and (wildcard.change_count or 0) >= WILDCARD_MINIMUM_CHANGES
+                else "hold"
+            ),
+            reason=(
+                "Wildcard og normale transfers er sammenlignet over samme horisont "
+                "med samme afgrænsede efterfølgende transferpolitik. Scoren er "
+                "vægtede forventede point minus hits, uden terminal FT-bonus. "
+                "Værdien af at gemme Wildcard til en senere deadline er ikke prissat."
+            ),
+        )
+    elif wildcard.squad_ids:
+        wildcard = replace(
+            wildcard,
+            signal="hold",
+            reason=(
+                "Kun en statisk Wildcard-screening kunne beregnes. Den parrede "
+                "sammenligning med efterfølgende transfers blev ikke færdig, så "
+                "dette tal kan ikke begrunde en Wildcard-anbefaling."
+            ),
+        )
     scenarios = (wildcard, free_hit, bench_boost, triple_captain)
 
     current_considerations = [
@@ -768,6 +833,7 @@ def evaluate_chip_strategy(
         inventory=inventory,
         scenarios=scenarios,
         recommendation=recommendation,
+        sequence_comparison=sequence_comparison,
     )
 
 

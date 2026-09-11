@@ -1,4 +1,5 @@
 import math
+from dataclasses import replace
 
 import pandas as pd
 import pytest
@@ -12,6 +13,8 @@ from fpl_app.logic.forecast_v2 import (
     forecast_player_v2,
     forecast_players_v2,
     shrunk_rates_for_player,
+    _expected_conceded_goal_blocks,
+    _fixture_components,
 )
 
 
@@ -478,3 +481,159 @@ def test_empty_pool_has_stable_output_schema():
     assert rows.empty
     assert "ep" in rows.columns
     assert "components" in rows.columns
+
+
+def test_unused_players_do_not_dilute_the_role_prior_for_observed_starters():
+    starters = [
+        _player(index, position="DEF", price=50, minutes=180, starts=2, sample_matches=2)
+        for index in range(1, 21)
+    ]
+    reserves = [
+        _player(index, position="DEF", price=50, minutes=0, starts=0, sample_matches=2)
+        for index in range(21, 61)
+    ]
+    active_priors = build_forecast_priors(pd.DataFrame(starters), start_event=3)
+    mixed_priors = build_forecast_priors(pd.DataFrame([*starters, *reserves]), start_event=3)
+    active = expected_minutes_for_player(starters[0], active_priors)
+    mixed = expected_minutes_for_player(starters[0], mixed_priors)
+    reserve = expected_minutes_for_player(reserves[0], mixed_priors)
+
+    assert mixed.expected_minutes == pytest.approx(active.expected_minutes)
+    assert mixed.expected_minutes > 80
+    assert mixed.sixty_probability > 0.85
+    assert reserve.expected_minutes < 12
+    # Predictable early-season role is not proof that attacking output is
+    # calibrated: its rate prior still has the unchanged 900-minute strength.
+    assert mixed.confidence.rate_prior_weight == pytest.approx(900 / 1080)
+    assert mixed.confidence.reliability is not Reliability.HIGH
+
+
+def test_own_start_and_minutes_evidence_leads_after_three_fixtures():
+    starter = _player(1, minutes=270, starts=3, sample_matches=3)
+    part_time = _player(2, minutes=120, starts=1, sample_matches=3)
+    unused = _player(3, minutes=0, starts=0, sample_matches=3)
+    priors = build_forecast_priors(pd.DataFrame([starter, part_time, unused]), start_event=4)
+
+    full = expected_minutes_for_player(starter, priors)
+    partial = expected_minutes_for_player(part_time, priors)
+    none = expected_minutes_for_player(unused, priors)
+
+    assert full.expected_minutes > 75
+    assert full.expected_minutes == pytest.approx((270 + priors.for_player(starter).minutes_per_match) / 4)
+    assert 30 < partial.expected_minutes < 50
+    assert none.expected_minutes < 15
+    assert none.expected_minutes < partial.expected_minutes < full.expected_minutes
+
+
+def test_one_minute_debut_does_not_trigger_a_starter_prior_cliff():
+    background = [
+        _player(index, minutes=180, starts=2, sample_matches=2)
+        for index in range(1, 21)
+    ] + [
+        _player(index, minutes=0, starts=0, sample_matches=2)
+        for index in range(21, 61)
+    ]
+    priors = build_forecast_priors(pd.DataFrame(background), start_event=3)
+    unused = _player(99, minutes=0, starts=0, sample_matches=2)
+    debut = dict(unused, minutes=1)
+
+    before = expected_minutes_for_player(unused, priors)
+    after = expected_minutes_for_player(debut, priors)
+
+    assert 0 < after.expected_minutes - before.expected_minutes < 1
+
+
+@pytest.mark.parametrize("mean", [0.0, 0.01, 0.5, 1.35, 2.0, 5.0, 8.0])
+def test_goals_conceded_matches_discrete_poisson_scoring(mean):
+    exact_sum = sum(
+        (goals // 2) * math.exp(-mean) * mean ** goals / math.factorial(goals)
+        for goals in range(90)
+    )
+    assert _expected_conceded_goal_blocks(mean) == pytest.approx(exact_sum, abs=1e-12)
+
+
+def test_goals_conceded_applies_before_sixty_minutes_and_scales_availability_once():
+    player = _player(1, position="DEF")
+    priors = build_forecast_priors(pd.DataFrame([player]), start_event=11)
+    minutes = replace(
+        expected_minutes_for_player(player, priors),
+        expected_minutes=30.0,
+        baseline_minutes=30.0,
+        appearance_probability=1.0,
+        sixty_probability=0.0,
+    )
+    rates = replace(shrunk_rates_for_player(player, priors), xgc_per90=1.35)
+    result = _fixture_components(position="DEF", minutes=minutes, rates=rates, fdr=3, is_home=False)
+    half_available = _fixture_components(
+        position="DEF",
+        minutes=replace(minutes, expected_minutes=15, appearance_probability=0.5, availability_probability=0.5),
+        rates=rates, fdr=3, is_home=False,
+    )
+    assert result.goals_conceded == pytest.approx(-_expected_conceded_goal_blocks(0.45))
+    assert result.goals_conceded < 0
+    assert half_available.goals_conceded == pytest.approx(result.goals_conceded * 0.5)
+    ninety = _fixture_components(
+        position="DEF", minutes=replace(minutes, expected_minutes=90, sixty_probability=1),
+        rates=rates, fdr=3, is_home=False,
+    )
+    assert ninety.goals_conceded == pytest.approx(-0.44180137818493744)
+
+
+def test_official_suspension_expiry_is_applied_to_each_fixture_including_dgw():
+    player = dict(_player(1, status="s", chance=0), news="Suspended until 19 Sep", news_added="2026-09-08T12:00:00Z")
+    fixtures = _fixtures([(4, 1, 2, 3, 3), (4, 3, 1, 3, 3), (5, 1, 4, 3, 3)])
+    fixtures["kickoff_time"] = ["2026-09-12T14:00:00Z", "2026-09-19T14:00:00Z", "2026-09-26T14:00:00Z"]
+    priors = build_forecast_priors(pd.DataFrame([player]), fixtures=fixtures, start_event=4)
+    forecast = forecast_player_v2(player, fixtures, priors, horizon=2, start_event=4)
+    healthy_minutes = expected_minutes_for_player(dict(player, status="a", chance_of_playing_next_round=100), priors)
+
+    assert forecast.per_gw[0].expected_minutes == pytest.approx(healthy_minutes.expected_minutes)
+    assert forecast.per_gw[1].expected_minutes == pytest.approx(healthy_minutes.expected_minutes)
+    assert forecast.per_gw[0].appearance_probability == pytest.approx(healthy_minutes.appearance_probability)
+
+
+@pytest.mark.parametrize("status,news", [
+    ("i", "Knee injury - Expected back 19 Sep"),
+    ("i", "Knee injury - Unknown return date"),
+    ("s", "Suspended until 31 Sep"),
+    ("s", "Suspended until sometime in September"),
+    ("s", "Suspended until 19 Jun"),
+])
+def test_ambiguous_or_injury_return_dates_never_invent_recovery(status, news):
+    player = dict(_player(1, status=status, chance=0), news=news, news_added="2026-09-08T12:00:00Z")
+    fixtures = _fixtures([(4, 1, 2, 3, 3), (5, 1, 3, 3, 3)])
+    fixtures["kickoff_time"] = ["2026-09-12T14:00:00Z", "2026-09-26T14:00:00Z"]
+    priors = build_forecast_priors(pd.DataFrame([player]), fixtures=fixtures, start_event=4)
+
+    forecast = forecast_player_v2(player, fixtures, priors, horizon=2, start_event=4)
+
+    assert [row.expected_minutes for row in forecast.per_gw] == [0, 0]
+
+
+def test_suspension_date_crosses_calendar_year_without_hallucinating_a_year():
+    player = dict(_player(1, status="s", chance=0), news="Suspended until 2 Jan", news_added="2026-12-28T12:00:00Z")
+    fixtures = _fixtures([(19, 1, 2, 3, 3), (20, 1, 3, 3, 3)])
+    fixtures["kickoff_time"] = ["2026-12-31T14:00:00Z", "2027-01-02T14:00:00Z"]
+    priors = build_forecast_priors(pd.DataFrame([player]), fixtures=fixtures, start_event=19)
+
+    forecast = forecast_player_v2(player, fixtures, priors, horizon=2, start_event=19)
+
+    assert forecast.per_gw[0].ep == 0
+    assert forecast.per_gw[1].ep > 0
+
+
+def test_missing_fixture_date_does_not_clear_a_suspension():
+    player = dict(_player(1, status="s", chance=0), news="Suspended until 19 Sep", news_added="2026-09-08T12:00:00Z")
+    fixtures = _one_fixture(6)
+    priors = build_forecast_priors(pd.DataFrame([player]), fixtures=fixtures, start_event=6)
+
+    assert forecast_player_v2(player, fixtures, priors, horizon=1, start_event=6).per_gw[0].ep == 0
+
+
+def test_previous_season_suspension_news_does_not_clear_current_status():
+    player = dict(_player(1, status="s", chance=0), news="Suspended until 19 Sep", news_added="2025-09-08T12:00:00Z")
+    fixtures = _one_fixture(4)
+    fixtures["kickoff_time"] = ["2026-09-26T14:00:00Z"]
+    priors = build_forecast_priors(pd.DataFrame([player]), fixtures=fixtures, start_event=4)
+
+    assert forecast_player_v2(player, fixtures, priors, horizon=1, start_event=4).per_gw[0].ep == 0

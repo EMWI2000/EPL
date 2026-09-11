@@ -1,0 +1,23 @@
+.panel { margin-top: 24px; }
+.header { display: flex; justify-content: space-between; align-items: start; gap: 20px; }
+.header h2 { margin: 0 0 10px; font-size: 23px; letter-spacing: -0.035em; }
+.description { max-width: 74ch; margin: 0; color: var(--ink-soft); font-size: 14px; line-height: 1.65; }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0; }
+.actions button { white-space: normal; }
+.notice { margin: 14px 0; font-size: 14px; color: var(--ink-soft); line-height: 1.6; }
+.error { color: var(--danger); }
+.tableWrap { overflow-x: auto; }
+.table { width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; }
+.table th { font-weight: 650; color: var(--ink-soft); }
+.table th, .table td { padding: 13px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.table th:first-child, .table td:first-child { padding-left: 0; }
+.table td:not(:first-child) { font-variant-numeric: tabular-nums; }
+.table small { display: block; margin-top: 5px; color: var(--ink-soft); font-size: 12px; line-height: 1.5; }
+.empty { padding: 18px 0; color: var(--ink-soft); line-height: 1.7; }
+.footnote { max-width: 80ch; margin: 16px 0 0; color: var(--ink-soft); font-size: 12px; line-height: 1.65; }
+@media (max-width: 680px) {
+  .header { display: block; }
+  .header h2 { font-size: 21px; }
+  .actions button { flex: 1 1 160px; }
+  .table { min-width: 500px; }
+}

@@ -1,3 +1,5 @@
+import { parseChipSequences, type ChipSequenceComparison } from "./chip-sequences.ts";
+
 export const MANAGER_SYNC_SCHEMA_VERSION = "fpl-manager-state-response-v3" as const;
 export const PERSONAL_STATE_SCHEMA_VERSION = "fpl-personal-state-v2" as const;
 export const SNAPSHOT_SCHEMA_VERSION = "fpl-deadline-state-snapshot-v2" as const;
@@ -339,6 +341,7 @@ export interface PlannerChipScenario {
 }
 
 export interface PlannerChipStrategy {
+  sequence_comparison?: ChipSequenceComparison | null;
   horizon: number;
   target_event: number;
   inventory: PlannerChipInventoryEntry[];
@@ -1871,6 +1874,7 @@ function validateChipStrategy(
   const root = exactRecord(value, "planner.chip_strategy", [
     "horizon", "target_event", "inventory", "scenarios", "recommendation",
     "model_scope", "globally_optimal", "recalculate_each_deadline",
+    ...(typeof value === "object" && value !== null && "sequence_comparison" in value ? ["sequence_comparison"] : []),
   ]);
   literal(root.horizon, "planner.chip_strategy.horizon", options.strategy.horizon);
   literal(root.target_event, "planner.chip_strategy.target_event", options.strategy.gameweek_window[0]);
@@ -2039,14 +2043,17 @@ function validateChipStrategy(
         bankAfter = integer(row.bank_after_tenths, `${path}.bank_after_tenths`, 0, MAX_BANK_TENTHS);
         const currentBudget = options.confirmedBank + [...options.confirmedSellingPrices.values()]
           .reduce((total, price) => total + price, 0);
-        const wildcardCost = squad.reduce((total, player) => total + player.price_tenths, 0);
+        const wildcardCost = squad.reduce((total, player) => total + (options.confirmedSellingPrices.get(player.id) ?? player.price_tenths), 0);
         if (bankAfter !== currentBudget - wildcardCost) {
           fail(`${path}.bank_after_tenths`, "does not reconcile with the confirmed Wildcard budget");
         }
       } else if (row.change_count !== null || row.bank_after_tenths !== null) {
         fail(path, "an unsolved Wildcard scenario cannot include change count or bank");
       }
-      if (baselinePoints !== null) {
+      if (baselinePoints !== null && !(typeof root.sequence_comparison === "object" && root.sequence_comparison !== null
+        && "status" in root.sequence_comparison && root.sequence_comparison.status === "ready"
+        && "sequences" in root.sequence_comparison && Array.isArray(root.sequence_comparison.sequences)
+        && root.sequence_comparison.sequences.some(s => typeof s === "object" && s !== null && s.sequence_id === "wildcard"))) {
         reconcileNumber(
           baselinePoints,
           options.strategy.decision_value_points,
@@ -2126,6 +2133,25 @@ function validateChipStrategy(
     fail("planner.chip_strategy.scenarios", "must contain four unique chip scenarios");
   }
 
+  const sequencePlayers = new Map<number, PlannerPlayerReference>([
+    ...options.confirmedSquad,
+    ...options.strategy.steps.flatMap(step => step.transfers.flatMap(move => [[move.out.id, move.out], [move.in.id, move.in]] as [number, PlannerPlayerReference][])),
+    ...scenarios.flatMap(scenario => scenario.squad.map(player => [player.id, player] as [number, PlannerPlayerReference])),
+  ]);
+  const sequenceComparison = root.sequence_comparison == null ? null : parseChipSequences(root.sequence_comparison, {
+    strategy: options.strategy, players: sequencePlayers, squad: options.confirmedSquad,
+    selling: options.confirmedSellingPrices, bank: options.confirmedBank, inventory,
+  });
+  if (sequenceComparison?.status === "ready") {
+    const normal = sequenceComparison.sequences.find(sequence => sequence.sequence_id === "normal");
+    const wildcard = sequenceComparison.sequences.find(sequence => sequence.sequence_id === "wildcard");
+    const scenario = scenarios.find(scenario => scenario.chip === "wildcard");
+    if (normal && wildcard && scenario) {
+      reconcileNumber(scenario.baseline_points!, normal.weighted_net_points, "planner.chip_strategy.wildcard.baseline");
+      reconcileNumber(scenario.chip_points!, wildcard.weighted_net_points, "planner.chip_strategy.wildcard.points");
+      if (!sameValues(scenario.squad.map(player => player.id), wildcard.actions[0].squad_ids)) fail("planner.chip_strategy.wildcard", "must match the paired Wildcard squad");
+    }
+  }
   const recommendationRow = exactRecord(
     root.recommendation,
     "planner.chip_strategy.recommendation",
@@ -2187,6 +2213,7 @@ function validateChipStrategy(
     model_scope: "bounded_chip_counterfactuals",
     globally_optimal: false,
     recalculate_each_deadline: true,
+    ...(root.sequence_comparison === undefined ? {} : { sequence_comparison: sequenceComparison }),
   };
 }
 

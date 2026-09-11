@@ -1,0 +1,18 @@
+.panel { margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--line); }
+.panel h3 { margin: 0 0 10px; font-size: 19px; letter-spacing: -0.02em; }
+.intro { max-width: 78ch; color: var(--ink-soft); font-size: 14px; line-height: 1.7; }
+.tableWrap { overflow-x: auto; }
+.table { width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; }
+.table th, .table td { padding: 12px 10px; border-bottom: 1px solid var(--line); }
+.table th { color: var(--ink-soft); font-weight: 650; }
+.table th:first-child, .table td:first-child { padding-left: 0; }
+.table td { font-variant-numeric: tabular-nums; }
+.table small { display: block; margin-top: 4px; font-size: 12px; color: var(--ink-soft); }
+.details { margin-top: 14px; font-size: 14px; }
+.details summary { cursor: pointer; padding: 10px 0; font-weight: 650; }
+.details summary:focus-visible { outline: 3px solid var(--solio); outline-offset: 3px; }
+.steps { padding-left: 22px; }
+.steps li { margin: 12px 0; color: var(--ink); line-height: 1.7; }
+.steps li small { display: block; color: var(--ink-soft); }
+.limits { max-width: 80ch; color: var(--ink-soft); font-size: 12px; line-height: 1.7; }
+@media (max-width: 680px) { .table { min-width: 460px; } }

@@ -14,7 +14,7 @@ Følgende er implementeret:
 - empirical-Bayes-shrinkage mod dynamiske positions- og prispriorer med 900 minutters priorstyrke
 - pointdekomponering, forventede minutter og usikkerhed for hver spiller og gameweek
 - en lovlig 15-mandstrup med separat XI, kaptajn, vicekaptajn og bænk i hver gameweek
-- en fast shortlist på 45 spillere til serverless-kørslen, som dækker billige budgetspillere, værdi og GW-specialister
+- en afgrænset shortlist til serverless-kørslen: 45 spillere ved ny trup og op til 60 plus nødvendige ejede spillere ved ugeplanlægning
 - MILP-optimering af truppen, XI og kaptajn inden for shortlisten; bænken sorteres efter tilgængelighedsjusteret EP
 - en global, fortløbende gameweek-horisont, som bevarer blanks og doubles korrekt
 - snapshots med metadata og atomisk skrivning til senere backtests
@@ -45,6 +45,16 @@ På samme roadmap sammenlignes fire chipscenarier. Wildcard løser én fuld perm
 
 Snapshot-checksummen identificerer den synkroniserede tilstand, men serveren kontrollerer ikke, om managerens private kladde siden er ændret.
 
+### Ligakontekst, chipforløb og eftermåling
+
+Prognoserevision `v2.1` bruger aktive spilleres rolledata uden at lade ubenyttede reserver sænke etablerede starteres minutprior. Spilletidsprioren svarer til én kamp; pointmodellens priorstyrke er fortsat 900 minutter. Minuspoint for indkasserede mål beregnes efter hele blokke af to mål. Kendte karantæneudløb vurderes pr. kamp. En forventet skadesretur behandles ikke som bekræftet kampklarhed.
+
+Ligaoverblikket henter op til tre invitationelle klassiske ligaer med ligalederen og nærmeste hold foran manageren. Pointgab bruger den enkelte ligas pointperiode. Rivalernes spillere, seneste kaptajn og resterende chips bygger på offentlige deadline-data. Manglende data vises som ukendte. AI-reviewet henter denne kontekst på serveren og modtager ingen manager-ID'er, liganavne eller rivalernes holdnavne. En vinderchance beregnes ikke.
+
+En ekstra chipanalyse sammenligner normale transfers, Bench Boost, Wildcard og Wildcard efterfulgt af Bench Boost. Samme begrænsede transferregel anvendes på begge trupper. Den viser konkrete spillerbytter og lovlige chipuger inden for den aktuelle sæsonhalvdel. Wildcard undersøges kun ved den aktuelle deadline. Fremtidige priser holdes faste; chippenes værdi uden for vinduet er ikke prissat. Det højeste beregnede pointtal er derfor ikke en ubetinget anbefaling om at bruge chips.
+
+Den første prognose for den oprindeligt bekræftede trup gemmes automatisk før deadline i browseren. Point sammenlignes senere med FPL's samtidigt hentede `ep_next`; minutter sammenlignes med sæsonminutter divideret med afsluttede spillerunder. Minutbaselinen udelades, hvis en tidligere runde stadig er ukontrolleret. Efter FPL har afsluttet og kontrolleret runden, kan slutresultater hentes og absolutte prognosefejl sammenlignes for de samme spillere. Journalen kan eksporteres. Den er lokal, kan manipuleres og følger ikke med til andre enheder. Ingen historiske prognoser genskabes med efterfølgende viden.
+
 Efter kontrol kan den viste anbefaling gemmes i en lokal beslutningsjournal. Den indeholder kun deadline, modelversion, bekræftet bank/FT, den valgte solver- eller AI-handling, kompakte transfers samt den valgte plans kaptajn. Manager-ID, GitHub-identitet, tokens, rå AI-output og hele API-svaret gemmes ikke. Journalen sendes ikke tilbage til beregningen eller OpenAI og kan eksporteres eller slettes fra browseren.
 
 ### AI-kvalificering til næste deadline
@@ -71,6 +81,7 @@ Kvalitetskontrol:
 
 ```bash
 npm run typecheck
+npm run test:web
 npm run build
 python -m pytest
 python -m compileall -q api fpl_app
@@ -141,7 +152,7 @@ Browser -> GitHub-login -> Next.js BFF
 
 ## Næste milepæle
 
-1. Gem deadline-snapshots hver gameweek, så forecast v2 kan evalueres uden datalækage.
+1. Supplér browserens prognosejournal med et vedvarende, uafhængigt deadline-arkiv, før resultater bruges som dokumenteret modelvalidering.
 2. Kør walk-forward-backtest mod legacy og eventuelle lovligt indsamlede benchmarks. Rapportér MAE, RMSE, kalibrering, Brier-score og captain regret.
 3. Kalibrér minut- og tilgængelighedsmodellen. Justér priorstyrke og shortlist ud fra beslutningsregret.
 4. Sæt kun et ML-modelartefakt i drift, hvis det slår de simple baselines på uafhængige gameweeks.

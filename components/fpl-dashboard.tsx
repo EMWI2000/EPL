@@ -3,6 +3,10 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { AccountControl } from "@/components/account-control";
+import { LeagueOverviewPanel } from "@/components/league-overview-panel";
+import { ChipSequencePanel } from "@/components/chip-sequence-panel";
+import { ForecastAuditPanel } from "@/components/forecast-audit-panel";
+import type { ForecastAuditCapture } from "@/lib/forecast-audit";
 import {
   actionForAiReview,
   buildAiReviewRequest,
@@ -156,6 +160,7 @@ type GameweekLineup = {
 };
 
 type RecommendationResponse = {
+  forecast_audit?: ForecastAuditCapture | null;
   meta: {
     generated_at: string;
     gameweek_window: number[];
@@ -2820,6 +2825,14 @@ export function FplDashboard({
                     ) : recommendation.planner.sequential ? (
                       <SequentialPlanPanel plan={recommendation.planner.sequential} planner={recommendation.planner} />
                     ) : null}
+                    {recommendation.planner.chip_strategy?.sequence_comparison && <ChipSequencePanel
+                      comparison={recommendation.planner.chip_strategy.sequence_comparison}
+                      playerNames={new Map([
+                        ...recommendation.planner.confirmed_state.squad.map(p => [p.id, p.name] as const),
+                        ...recommendation.planner.chip_strategy.scenarios.flatMap(s => s.squad.map(p => [p.id, p.name] as const)),
+                        ...(recommendation.planner.strategy?.steps.flatMap(s => s.transfers.flatMap(t => [[t.out_id, t.out.name], [t.in_id, t.in.name]] as [number, string][])) ?? []),
+                      ])}
+                    />}
                     <AiReviewPanel
                       response={aiReview}
                       planner={recommendation.planner}
@@ -2837,6 +2850,7 @@ export function FplDashboard({
                       onExport={exportDecisionHistory}
                       onClear={removeDecisionHistory}
                     />
+                    <LeagueOverviewPanel />
                   </>
                 )}
 
@@ -2899,6 +2913,10 @@ export function FplDashboard({
                 </section>
               </div>
             )}
+            {analysisMode === "weekly" && <ForecastAuditPanel capture={
+              squadConfirmed && !syncError && !isSyncing && !recommendationIsStale && !hasUnappliedChanges && !isLoading
+                ? recommendation?.forecast_audit ?? null : null
+            } />}
           </div>
         </div>
       </main>

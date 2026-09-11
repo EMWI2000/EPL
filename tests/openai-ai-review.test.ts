@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { AiReviewRequest } from "../lib/ai-review-contract.ts";
+import { leagueAiContext } from "../lib/league-overview.ts";
 import {
   AI_REVIEW_INSTRUCTIONS,
   DEFAULT_OPENAI_REASONING_EFFORT,
@@ -43,6 +44,22 @@ function action(kind: "roll" | "transfer") {
     gameweeks: [{ gameweek: 7, projected_points: isTransfer ? 73.5 : 72.5 }],
   };
 }
+
+test("adds sanitized server league context without changing the Sol decision authority", () => {
+  const league = leagueAiContext({ generated_at: "2026-09-11T12:00:00Z", source_event: 3, target_event: 4,
+    own_points: 192, own_chips_remaining: ["wildcard", "bboost"], warnings: [], leagues: [{
+      id: 530, name: "Private league name", rank: 8, previous_rank: 5, leader_gap: 25, partial: false,
+      rivals: [{ entry: 200, team: "Private team name", rank: 1, points: 217, gap: 25,
+        captain: "Haaland", different_players: ["Haaland"], chips_remaining: ["wildcard"] }],
+    }] });
+  const body = buildOpenAiReviewRequestBody(requestFixture(), DEFAULT_OPENAI_REVIEW_MODEL, "xhigh", 32_000, league);
+  const text = body.input[0].content[0].text;
+  assert.ok(text.includes('"leader_gap":25'));
+  assert.ok(!text.includes("Private league") && !text.includes("Private team"));
+  assert.equal(body.model, "gpt-5.6-sol");
+  assert.equal(body.reasoning.effort, "xhigh");
+  assert.ok(AI_REVIEW_INSTRUCTIONS.includes("ingen kalibreret vinderchance-model"));
+});
 
 function requestFixture(): AiReviewRequest {
   const squad = Array.from({ length: 15 }, (_, index) => {
@@ -406,7 +423,7 @@ test("exposes the bounded next-deadline preview as provisional AI context", () =
   const context = buildOpenAiReviewContext(request);
   const body = buildOpenAiReviewRequestBody(request, "gpt-5.6-sol");
 
-  assert.equal(context.context_schema, "fpl-ai-review-context-v4");
+  assert.equal(context.context_schema, "fpl-ai-review-context-v5");
   assert.equal(context.forecast.next_deadline_transfer_modelled, true);
   assert.equal(
     context.solver.next_deadline_preview?.next_deadline_step.status,
@@ -421,7 +438,7 @@ test("compacts the four-step roadmap and all four chip scenarios without creatin
   const context = buildOpenAiReviewContext(request);
   const body = buildOpenAiReviewRequestBody(request, "gpt-5.6-sol");
 
-  assert.equal(context.context_schema, "fpl-ai-review-context-v4");
+  assert.equal(context.context_schema, "fpl-ai-review-context-v5");
   assert.equal(context.solver.strategy_roadmap?.horizon_gameweeks, 8);
   assert.equal(context.solver.strategy_roadmap?.steps.length, 4);
   assert.equal(

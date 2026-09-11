@@ -17,15 +17,17 @@ The model is intentionally conservative:
   leaking ``NaN`` or infinity into the optimizer.
 
 It is still an experimental heuristic.  The prior strengths and calibration
-must be evaluated on deadline-safe historical snapshots before v2 replaces the
-current production forecast.
+must be evaluated on deadline-safe snapshots before claiming an improvement
+over independent baselines.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime
 from enum import Enum
 import math
+import re
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
@@ -34,7 +36,10 @@ import pandas as pd
 
 FORECAST_VERSION = "forecast_v2"
 DEFAULT_RATE_PRIOR_MINUTES = 900.0
-DEFAULT_MINUTES_PRIOR_MATCHES = 4.0
+# Playing role is observed much sooner than scoring ability.  One pseudo-match
+# lets actual starts/minutes lead after two or three fixtures; scoring-rate
+# shrinkage remains the separately documented 900-minute prior.
+DEFAULT_MINUTES_PRIOR_MATCHES = 1.0
 
 # These are deliberately the same documented fallback factors as v1.  In v2
 # they affect only the relevant attack/defence components, never appearance.
@@ -149,6 +154,8 @@ class RatePrior:
     saves_per90: float
     minutes_per_match: float
     start_probability: float
+    unused_minutes_per_match: float
+    unused_start_probability: float
     support_minutes: float
     support_player_matches: float
 
@@ -548,8 +555,58 @@ def _sample_matches(
     return max(sample, starts)
 
 
-def _availability(player: pd.Series | Mapping[str, Any]) -> float:
+def _iso_date(value: Any) -> date | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+    except (ValueError, OverflowError):
+        return None
+
+
+def _suspension_end(
+    player: pd.Series | Mapping[str, Any], reference_date: date | None
+) -> date | None:
+    """Read only FPL's explicit suspension wording, never infer injury recovery.
+
+    FPL normally omits the year.  Resolve it from the news timestamp (or the
+    first forecast fixture), rejecting dates outside a 120-day window rather
+    than extrapolating a season-long absence from ambiguous free text.
+    """
+
+    news = _get(player, "news", default="")
+    if not isinstance(news, str):
+        return None
+    match = re.fullmatch(r"Suspended until (\d{1,2}) ([A-Za-z]{3})(?: (\d{4}))?", news.strip())
+    if match is None:
+        return None
+    anchor = _iso_date(_get(player, "news_added", default=None)) or reference_date
+    if anchor is None:
+        return None
+    month_names = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+    try:
+        month = month_names.index(match[2].lower()) + 1
+        years = [int(match[3])] if match[3] else [anchor.year - 1, anchor.year, anchor.year + 1]
+        candidates = [date(year, month, int(match[1])) for year in years]
+    except (ValueError, OverflowError):
+        return None
+    eligible = [value for value in candidates if -7 <= (value - anchor).days <= 120]
+    if reference_date is not None:
+        eligible = [value for value in eligible if -7 <= (value - reference_date).days <= 120]
+    return min(eligible, key=lambda value: abs((value - anchor).days)) if eligible else None
+
+
+def _availability(
+    player: pd.Series | Mapping[str, Any],
+    *,
+    fixture_date: date | None = None,
+    reference_date: date | None = None,
+) -> float:
     status = str(_get(player, "status", default="a") or "a").strip().lower()
+    if status == "s" and fixture_date is not None:
+        suspension_end = _suspension_end(player, reference_date)
+        if suspension_end is not None and fixture_date >= suspension_end:
+            return 1.0
     # Hard-unavailable states fail closed even if an inconsistent chance field
     # says otherwise.
     if status in {"i", "s", "u", "n"}:
@@ -632,6 +689,7 @@ def _aggregate_role(
     fallback_minutes: float,
     start_event: int | None,
     team_matches_played: Mapping[int, float],
+    include_unused: bool = False,
 ) -> tuple[float, float, float]:
     weighted_minutes = 0.0
     weighted_starts = 0.0
@@ -646,6 +704,11 @@ def _aggregate_role(
             continue
         minutes = min(_non_negative(_get(row, "minutes", default=0.0)), 90.0 * sample)
         starts = min(_non_negative(_get(row, "starts", default=0.0)), sample)
+        # An unused squad member is evidence about their own role, not evidence
+        # that a player starting every match should lose most of their minutes.
+        # Keep the all-player prior separately for genuinely unused players.
+        if not include_unused and minutes <= 0.0 and starts <= 0.0:
+            continue
         weighted_minutes += minutes
         weighted_starts += starts
         support_matches += sample
@@ -725,6 +788,13 @@ def _make_prior(
         start_event=start_event,
         team_matches_played=team_matches_played,
     )
+    unused_minutes, unused_start, _ = _aggregate_role(
+        rows,
+        fallback_minutes=fallback_minutes,
+        start_event=start_event,
+        team_matches_played=team_matches_played,
+        include_unused=True,
+    )
     usable_supports = [
         xg_support,
         xa_support,
@@ -746,6 +816,8 @@ def _make_prior(
         saves_per90=saves,
         minutes_per_match=minutes_per_match,
         start_probability=start_probability,
+        unused_minutes_per_match=unused_minutes,
+        unused_start_probability=unused_start,
         support_minutes=max(usable_supports, default=0.0),
         support_player_matches=support_matches,
     )
@@ -883,6 +955,9 @@ def _confidence(
 def expected_minutes_for_player(
     player: pd.Series | Mapping[str, Any],
     priors: ForecastPriors,
+    *,
+    fixture_date: date | None = None,
+    reference_date: date | None = None,
 ) -> ExpectedMinutes:
     """Estimate unconditional minutes and threshold probabilities per fixture."""
 
@@ -893,6 +968,16 @@ def expected_minutes_for_player(
         player,
         start_event=priors.start_event,
         team_matches_played=priors.team_matches_played,
+    )
+    # Blend towards the active-role prior as the player's own starts/exposure
+    # support it.  A one-minute debut must not suddenly inherit a starter prior,
+    # while a player starting every match must not inherit unused reserves.
+    role_evidence = _probability(max(starts, minutes / 90.0) / sample_matches) if sample_matches > 0 else 0.0
+    prior_minutes = prior.unused_minutes_per_match + role_evidence * (
+        prior.minutes_per_match - prior.unused_minutes_per_match
+    )
+    prior_start = prior.unused_start_probability + role_evidence * (
+        prior.start_probability - prior.unused_start_probability
     )
     if sample_matches > 0.0:
         capped_minutes = min(minutes, 90.0 * sample_matches)
@@ -905,15 +990,15 @@ def expected_minutes_for_player(
         observed_role = 0.80 * observed_minutes + 0.20 * observed_start_minutes
         baseline = (
             observed_role * sample_matches
-            + prior.minutes_per_match * priors.minutes_prior_matches
+            + prior_minutes * priors.minutes_prior_matches
         ) / (sample_matches + priors.minutes_prior_matches)
         start_probability = (
             capped_starts
-            + prior.start_probability * priors.minutes_prior_matches
+            + prior_start * priors.minutes_prior_matches
         ) / (sample_matches + priors.minutes_prior_matches)
     else:
-        baseline = prior.minutes_per_match
-        start_probability = prior.start_probability
+        baseline = prior_minutes
+        start_probability = prior_start
 
     baseline = _clamp(baseline, 0.0, 90.0)
     start_probability = _probability(start_probability)
@@ -927,7 +1012,7 @@ def expected_minutes_for_player(
     sixty = _probability((baseline - 20.0 * appearance) / 55.0)
     sixty = min(sixty, appearance)
 
-    availability = _availability(player)
+    availability = _availability(player, fixture_date=fixture_date, reference_date=reference_date)
     projection = ExpectedMinutes(
         expected_minutes=_clamp(baseline * availability, 0.0, 90.0),
         baseline_minutes=baseline,
@@ -1027,8 +1112,8 @@ def _fixtures_for_player(
     *,
     team_id: int,
     event: int,
-    fixture_lookup: Mapping[tuple[int, int], tuple[tuple[int, bool], ...]] | None = None,
-) -> list[tuple[int, bool]]:
+    fixture_lookup: Mapping[tuple[int, int], tuple[tuple[int, bool, date | None], ...]] | None = None,
+) -> list[tuple[int, bool, date | None]]:
     if fixture_lookup is not None:
         return list(fixture_lookup.get((int(team_id), int(event)), ()))
     if fixtures.empty or "event" not in fixtures.columns or team_id <= 0:
@@ -1038,7 +1123,7 @@ def _fixtures_for_player(
     if not required.issubset(fixtures.columns):
         return []
 
-    result: list[tuple[int, bool]] = []
+    result: list[tuple[int, bool, date | None]] = []
     for _, fixture in fixtures.iterrows():
         fixture_event = _finite_or_none(fixture.get("event"))
         home = _finite_or_none(fixture.get(home_col))
@@ -1047,16 +1132,16 @@ def _fixtures_for_player(
             continue
         if home is not None and int(home) == team_id:
             fdr = _finite_or_none(fixture.get(home_fdr_col))
-            result.append((int(fdr) if fdr is not None else 3, True))
+            result.append((int(fdr) if fdr is not None else 3, True, _iso_date(fixture.get("kickoff_time"))))
         elif away is not None and int(away) == team_id:
             fdr = _finite_or_none(fixture.get(away_fdr_col))
-            result.append((int(fdr) if fdr is not None else 3, False))
+            result.append((int(fdr) if fdr is not None else 3, False, _iso_date(fixture.get("kickoff_time"))))
     return result
 
 
 def _build_fixture_lookup(
     fixtures: pd.DataFrame,
-) -> Mapping[tuple[int, int], tuple[tuple[int, bool], ...]]:
+) -> Mapping[tuple[int, int], tuple[tuple[int, bool, date | None], ...]]:
     """Index fixtures once for pool forecasts instead of scanning per player/GW."""
 
     if fixtures.empty or "event" not in fixtures.columns:
@@ -1065,7 +1150,7 @@ def _build_fixture_lookup(
     if not {home_col, away_col}.issubset(fixtures.columns):
         return MappingProxyType({})
 
-    mutable: dict[tuple[int, int], list[tuple[int, bool]]] = {}
+    mutable: dict[tuple[int, int], list[tuple[int, bool, date | None]]] = {}
     for _, fixture in fixtures.iterrows():
         raw_event = _finite_or_none(fixture.get("event"))
         raw_home = _finite_or_none(fixture.get(home_col))
@@ -1076,12 +1161,12 @@ def _build_fixture_lookup(
         if raw_home is not None and int(raw_home) > 0:
             raw_fdr = _finite_or_none(fixture.get(home_fdr_col))
             mutable.setdefault((int(raw_home), event), []).append(
-                (int(raw_fdr) if raw_fdr is not None else 3, True)
+                (int(raw_fdr) if raw_fdr is not None else 3, True, _iso_date(fixture.get("kickoff_time")))
             )
         if raw_away is not None and int(raw_away) > 0:
             raw_fdr = _finite_or_none(fixture.get(away_fdr_col))
             mutable.setdefault((int(raw_away), event), []).append(
-                (int(raw_fdr) if raw_fdr is not None else 3, False)
+                (int(raw_fdr) if raw_fdr is not None else 3, False, _iso_date(fixture.get("kickoff_time")))
             )
     return MappingProxyType(
         {key: tuple(values) for key, values in mutable.items()}
@@ -1110,6 +1195,18 @@ def _expected_goalkeeper_save_points(mean_saves: float) -> float:
         return 0.0
     upper = max(3, int(math.ceil(rate + 8.0 * math.sqrt(rate) + 9.0)))
     return sum(_poisson_tail(rate, threshold) for threshold in range(3, upper + 1, 3))
+
+
+def _expected_conceded_goal_blocks(mean_goals: float) -> float:
+    """E[floor(X / 2)] for Poisson X, the official one-point-per-two rule.
+
+    floor(X/2) = (X - 1{X is odd})/2 and P(X odd)=(1-exp(-2*mean))/2.
+    ``expm1`` avoids cancellation for small rates.  This is conditional on
+    playing and does not require a 60-minute appearance.
+    """
+
+    rate = _clamp(mean_goals, 0.0, 12.0)
+    return max(0.0, rate / 2.0 + math.expm1(-2.0 * rate) / 4.0)
 
 
 def _fixture_components(
@@ -1158,8 +1255,8 @@ def _fixture_components(
         saves = appearance_probability * _expected_goalkeeper_save_points(expected_saves)
     goals_conceded = 0.0
     if position in {"GKP", "DEF"}:
-        expected_conceded = rates.xgc_per90 / favorable
-        goals_conceded = -0.5 * minutes.sixty_probability * expected_conceded
+        expected_conceded = rates.xgc_per90 * conditional_minute_share / favorable
+        goals_conceded = -appearance_probability * _expected_conceded_goal_blocks(expected_conceded)
 
     values = (
         appearance,
@@ -1196,7 +1293,7 @@ def forecast_player_v2(
     horizon: int = 5,
     start_event: int | None = None,
     _fixture_lookup: Mapping[
-        tuple[int, int], tuple[tuple[int, bool], ...]
+        tuple[int, int], tuple[tuple[int, bool, date | None], ...]
     ] | None = None,
 ) -> PlayerForecast:
     """Forecast one player across consecutive gameweeks."""
@@ -1218,6 +1315,15 @@ def forecast_player_v2(
         if _fixture_lookup is not None
         else _build_fixture_lookup(fixtures)
     )
+    fixture_dates = [
+        fixture_date
+        for (fixture_team, fixture_event), values in fixture_lookup.items()
+        if fixture_team == team_id and fixture_event in window
+        for _, _, fixture_date in values
+        if fixture_date is not None
+    ]
+    reference_date = min(fixture_dates) if fixture_dates else None
+    has_suspension = str(_get(player, "status", default="a") or "a").strip().lower() == "s"
 
     per_gw: list[GameweekForecast] = []
     for offset, event in enumerate(window, start=1):
@@ -1230,16 +1336,21 @@ def forecast_player_v2(
         components = ForecastComponents()
         no_appearance_probability = 1.0
         no_sixty_probability = 1.0
-        for fdr, is_home in event_fixtures:
+        event_expected_minutes = 0.0
+        for fdr, is_home, fixture_date in event_fixtures:
+            fixture_minutes = expected_minutes_for_player(
+                player, priors, fixture_date=fixture_date, reference_date=reference_date
+            ) if has_suspension else minutes
             components = components + _fixture_components(
                 position=position,
-                minutes=minutes,
+                minutes=fixture_minutes,
                 rates=rates,
                 fdr=fdr,
                 is_home=is_home,
             )
-            no_appearance_probability *= 1.0 - minutes.appearance_probability
-            no_sixty_probability *= 1.0 - minutes.sixty_probability
+            event_expected_minutes += fixture_minutes.expected_minutes
+            no_appearance_probability *= 1.0 - fixture_minutes.appearance_probability
+            no_sixty_probability *= 1.0 - fixture_minutes.sixty_probability
 
         fixture_count = len(event_fixtures)
         per_gw.append(
@@ -1247,7 +1358,7 @@ def forecast_player_v2(
                 player_id=player_id,
                 event=event,
                 gw_offset=offset,
-                expected_minutes=minutes.expected_minutes * fixture_count,
+                expected_minutes=event_expected_minutes,
                 appearance_probability=(
                     1.0 - no_appearance_probability if fixture_count else 0.0
                 ),

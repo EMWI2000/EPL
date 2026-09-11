@@ -19,6 +19,7 @@ import {
 import { parsePlannerPayload } from "@/lib/planner-contract";
 import { hasValidPublicOrigin } from "@/lib/public-request-origin";
 import { getCurrentSession } from "@/lib/require-user";
+import { leagueAiContext, loadLeagueOverview } from "@/lib/league-overview";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -64,6 +65,7 @@ function markRequestFinished(key: string, now = Date.now()): void {
 }
 
 export async function POST(request: Request) {
+  const requestStarted = Date.now();
   const session = await getCurrentSession();
   if (!session) {
     return errorResponse(401, "unauthorized", "Du skal være logget ind for at få en AI-kvalificering.");
@@ -160,10 +162,14 @@ export async function POST(request: Request) {
 
   inFlightRequests.add(requestOwner);
   try {
+    const leagues = configuredManagerId === null ? null
+      : await loadLeagueOverview(configuredManagerId).catch(() => null);
     const result = await requestOpenAiReview(reviewRequest, {
       apiKey,
       model,
       reasoningEffort,
+      leagueContext: leagueAiContext(leagues?.target_event === reviewRequest.planner.target_event ? leagues : null),
+      timeoutMs: Math.max(15_000, 285_000 - (Date.now() - requestStarted)),
     });
     try {
       assertAiReviewRequestIsFresh(reviewRequest);
