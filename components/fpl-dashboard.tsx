@@ -1172,7 +1172,7 @@ function AiReviewPanel({
           <div>
             <p className="eyebrow">Beslutningsbrief · GW{planner.target_event}</p>
             <h2 id="ai-review-heading">Få én samlet handling for næste deadline</h2>
-            <p>GPT-5.6 Sol sammenholder solverens plan med horisontstrategi, holdnyt, taktisk rolle, minutrisiko og prisvindue.</p>
+            <p>GPT-5.6 Sol udfordrer den foreslåede transfer, sammenligner med rul og alternativer og bruger dit pointregnskab mod rivalerne.</p>
           </div>
           <button className="ai-review__button" type="button" onClick={onReview} disabled={isLoading || !canReview}>
             {isLoading
@@ -1192,7 +1192,7 @@ function AiReviewPanel({
           <div className="ai-review__empty">
             <div className="ai-review__empty-mark"><SparkIcon /></div>
             <div>
-              <strong>Få solver, strategi og aktuel research samlet</strong>
+              <strong>Holder anbefalingen, når vi prøver at modbevise den?</strong>
               <p>Reviewet sender kun en begrænset fodboldkontekst til OpenAI. OpenAI modtager ikke GitHub-identitet, manager-ID, sessioner eller nøgler.</p>
             </div>
             <span>{deadline ? `Deadline ${formatDateTime(deadline)}` : "Næste deadline"}</span>
@@ -1202,7 +1202,7 @@ function AiReviewPanel({
         {isLoading && !response && (
           <div className="ai-review__loading" role="status">
             <span className="spinner spinner--dark" />
-            <p><strong>Bygger den samlede beslutning</strong>Sammenholder solverdata, flerugerskonsekvenser og aktuelle, kildebegrænsede nyheder.</p>
+            <p><strong>Tester anbefalingen</strong>Kontrollerer pointmargin, modargumenter, kaptajn og rivalregnskab med aktuel research. Reviewet kan tage op til cirka fem minutter.</p>
           </div>
         )}
 
@@ -1246,9 +1246,9 @@ function AiReviewPanel({
             )}
 
             <div className="ai-review__grid">
-              <AiReviewList title="Hvorfor nu" items={review.rationale} />
-              <AiReviewList title="Risici" items={review.risks} />
-              <AiReviewList title="Det ændrer rådet" items={review.change_triggers} />
+              <AiReviewList title="Begrundelse og alternativer" items={review.rationale} />
+              <AiReviewList title="Modargumenter og risici" items={review.risks} />
+              <AiReviewList title="Det får os til at vælge anderledes" items={review.change_triggers} />
             </div>
 
             <div className="ai-review__strategy">

@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { AiReviewRequest } from "../lib/ai-review-contract.ts";
-import { leagueAiContext } from "../lib/league-overview.ts";
+import { leagueAiContext, type LeagueOverview } from "../lib/league-overview.ts";
+import { buildLeagueDiagnosis } from "../lib/league-diagnosis.ts";
+import { CHIP_SEQUENCE_ASSUMPTIONS, type ChipSequenceAction, type ChipSequence } from "../lib/chip-sequences.ts";
 import {
   AI_REVIEW_INSTRUCTIONS,
   DEFAULT_OPENAI_REASONING_EFFORT,
@@ -50,7 +52,9 @@ test("adds sanitized server league context without changing the Sol decision aut
     own_points: 192, own_chips_remaining: ["wildcard", "bboost"], warnings: [], leagues: [{
       id: 530, name: "Private league name", rank: 8, previous_rank: 5, leader_gap: 25, partial: false,
       rivals: [{ entry: 200, team: "Private team name", rank: 1, points: 217, gap: 25,
-        captain: "Haaland", different_players: ["Haaland"], chips_remaining: ["wildcard"] }],
+        captain: "Haaland", different_players: ["Haaland"], chips_remaining: ["wildcard"],
+        diagnosis: buildLeagueDiagnosis({ events: [], sourceEvent: 3, ownHistory: null, rivalHistory: null,
+          ownPicks: null, rivalPicks: null, live: null, playerNames: new Map() }) }],
     }] });
   const body = buildOpenAiReviewRequestBody(requestFixture(), DEFAULT_OPENAI_REVIEW_MODEL, "xhigh", 32_000, league);
   const text = body.input[0].content[0].text;
@@ -138,6 +142,47 @@ function requestFixture(): AiReviewRequest {
     },
     squad_context: squad,
   } as unknown as AiReviewRequest;
+}
+
+function sixRivalLeagueFixture(): LeagueOverview {
+  const playerNames = new Map(Array.from({ length: 105 }, (_, index) => [index + 1, `${index + 1} ${"P".repeat(100)}`.slice(0, 100)]));
+  const history = (points: number) => ({ current: [4, 5, 6].map(event => ({ event, points, event_transfers_cost: 0 })) });
+  const picks = (offset: number, points: number) => ({
+    active_chip: null, entry_history: { event: 6, points, event_transfers_cost: 0 },
+    picks: Array.from({ length: 15 }, (_, index) => ({
+      element: index + offset + 1, position: index + 1, multiplier: index === 0 ? 2 : index < 11 ? 1 : 0,
+      is_captain: index === 0, is_vice_captain: index === 1,
+    })),
+  });
+  return {
+    generated_at: "2026-09-11T12:00:00Z", source_event: 6, target_event: 7, own_points: 192,
+    own_chips_remaining: ["wildcard", "freehit", "bboost", "3xc"], warnings: [],
+    leagues: Array.from({ length: 3 }, (_, index) => ({
+      id: 800 + index, name: "Private league name", rank: 43, previous_rank: 27, leader_gap: 58, partial: false,
+      rivals: Array.from({ length: 2 }, (_, rivalIndex) => {
+        const squadIndex = index * 2 + rivalIndex + 1;
+        const offset = squadIndex * 15;
+        const points = (squadIndex + 1) * 12;
+        const diagnosis = buildLeagueDiagnosis({
+          events: [4, 5, 6].map(id => ({ id, finished: true, data_checked: true })), sourceEvent: 6,
+          ownHistory: history(12), rivalHistory: history(points), ownPicks: picks(0, 12), rivalPicks: picks(offset, points),
+          live: { elements: [...playerNames.keys()].map(id => ({ id, stats: { total_points: Math.floor((id - 1) / 15) + 1 } })) },
+          playerNames,
+        });
+        assert.equal(diagnosis.trend.rounds.length, 3);
+        assert.equal(diagnosis.latest.status, "available");
+        assert.equal(diagnosis.latest.rival?.gross, points);
+        assert.equal(diagnosis.latest.core_player_gains.length, 3);
+        assert.equal(diagnosis.latest.core_player_losses.length, 3);
+        return {
+          entry: 900 + index * 2 + rivalIndex, team: "Private team name", rank: rivalIndex === 0 ? 1 : 42,
+          points: 192 + squadIndex * 36, gap: squadIndex * 36, captain: playerNames.get(offset + 1)!,
+          different_players: Array.from({ length: 15 }, (_, i) => playerNames.get(i + offset + 1)!),
+          chips_remaining: ["wildcard", "freehit", "bboost", "3xc"], diagnosis,
+        };
+      }),
+    })),
+  };
 }
 
 function withBoundedStrategy(request = requestFixture()): AiReviewRequest {
@@ -423,7 +468,7 @@ test("exposes the bounded next-deadline preview as provisional AI context", () =
   const context = buildOpenAiReviewContext(request);
   const body = buildOpenAiReviewRequestBody(request, "gpt-5.6-sol");
 
-  assert.equal(context.context_schema, "fpl-ai-review-context-v5");
+  assert.equal(context.context_schema, "fpl-ai-review-context-v6");
   assert.equal(context.forecast.next_deadline_transfer_modelled, true);
   assert.equal(
     context.solver.next_deadline_preview?.next_deadline_step.status,
@@ -438,7 +483,7 @@ test("compacts the four-step roadmap and all four chip scenarios without creatin
   const context = buildOpenAiReviewContext(request);
   const body = buildOpenAiReviewRequestBody(request, "gpt-5.6-sol");
 
-  assert.equal(context.context_schema, "fpl-ai-review-context-v5");
+  assert.equal(context.context_schema, "fpl-ai-review-context-v6");
   assert.equal(context.solver.strategy_roadmap?.horizon_gameweeks, 8);
   assert.equal(context.solver.strategy_roadmap?.steps.length, 4);
   assert.equal(
@@ -459,7 +504,90 @@ test("compacts the four-step roadmap and all four chip scenarios without creatin
   assert.equal(AI_REVIEW_INSTRUCTIONS.includes("appen aktiverer aldrig chips"), true);
 });
 
-test("keeps a worst-case compact strategy request below 65,536 bytes", () => {
+test("paired chip context retains a sold current player absent from proposed and scenario squads", () => {
+  const request = withBoundedStrategy();
+  request.planner.confirmed_state.squad = request.squad_context.map((player, index) => ({
+    id: index === 0 ? 900 : player.id, name: index === 0 ? "Known sold owner" : player.name,
+    team: player.team, position: player.position, status: player.status, price_signal: null,
+    price_tenths: 50, purchase_price_tenths: 50, selling_price_tenths: 50,
+  }));
+  const originalIds = request.planner.confirmed_state.squad.map(player => player.id);
+  const wildcardPlayer = request.planner.chip_strategy!.scenarios.find(s => s.chip === "wildcard")!.squad[0];
+  request.planner.chip_strategy!.sequence_comparison = {
+    status: "ready", horizon: 8, model_scope: "paired_bounded_chip_sequences", globally_optimal: false,
+    recalculate_each_deadline: true, original_roadmap_weighted_net_points: 390,
+    highest_projected_sequence_id: "wildcard", assumptions: [...CHIP_SEQUENCE_ASSUMPTIONS], reason: "Test source mapping",
+    sequences: [{ sequence_id: "wildcard", label: "Wildcard", weighted_net_points: 400, gain_vs_normal_points: 10, total_hit_points: 0,
+      actions: Array.from({ length: 8 }, (_, index) => ({
+        event: 7 + index, chip: index === 0 ? "wildcard" : null,
+        transfer_out_ids: index === 0 ? [900] : [], transfer_in_ids: index === 0 ? [wildcardPlayer.id] : [],
+        squad_ids: originalIds.map(id => id === 900 ? wildcardPlayer.id : id), bank_after_tenths: 10,
+        free_transfers_before: 1, free_transfers_next_gameweek: 1, hit_points: 0,
+      })),
+    }],
+  };
+  assert.ok(!request.squad_context.some(player => player.id === 900));
+  assert.ok(!request.planner.chip_strategy!.scenarios.some(s => s.squad.some(player => player.id === 900)));
+  const context = buildOpenAiReviewContext(request);
+  assert.deepEqual(context.solver.chip_strategy!.sequence_comparison!.sequences[0].actions[0].transfers, [
+    { out: "Known sold owner", in: wildcardPlayer.name },
+  ]);
+});
+
+test("compact projection columns losslessly reconstruct null, zero, blank and double-gameweek evidence", () => {
+  const request = requestFixture();
+  request.squad_context[0].projections = [
+    { gameweek: 7, expected_points: 0, expected_minutes: null, appearance_probability: 0,
+      sixty_probability: 0, confidence: 0, reliability: "low", fixtures_count: 0, is_blank: true, is_dgw: false },
+    { gameweek: 8, expected_points: 13.75, expected_minutes: 151.5, appearance_probability: 0.98,
+      sixty_probability: 0.87, confidence: 0.72, reliability: "medium", fixtures_count: 2, is_blank: false, is_dgw: true },
+    { gameweek: 9, expected_points: -0.125, expected_minutes: 0, appearance_probability: 0,
+      sixty_probability: 0, confidence: 0.05, reliability: "low", fixtures_count: 1, is_blank: false, is_dgw: false },
+  ];
+  const context = buildOpenAiReviewContext(request);
+  assert.deepEqual(context.forecast.projection_columns, ["gameweek", "expected_points", "expected_minutes", "appearance_probability",
+    "sixty_minute_probability", "confidence", "reliability", "fixtures_count", "blank_gameweek", "double_gameweek"]);
+  const decoded = context.squad_outlook[0].projections.map(row => {
+    assert.equal(row.length, context.forecast.projection_columns.length);
+    return Object.fromEntries(context.forecast.projection_columns.map((key, index) => [key, row[index]]));
+  });
+  assert.deepEqual(decoded, request.squad_context[0].projections.map(p => ({
+    gameweek: p.gameweek, expected_points: p.expected_points, expected_minutes: p.expected_minutes,
+    appearance_probability: p.appearance_probability, sixty_minute_probability: p.sixty_probability,
+    confidence: p.confidence, reliability: p.reliability, fixtures_count: p.fixtures_count,
+    blank_gameweek: p.is_blank, double_gameweek: p.is_dgw,
+  })));
+});
+
+test("league player dictionary round-trips six distinct public squads and ledgers without private identities", () => {
+  const overview = sixRivalLeagueFixture();
+  const before = structuredClone(overview);
+  const context = leagueAiContext(overview);
+  assert.ok(context.available && context.leagues && context.player_labels);
+  const labels = context.player_labels;
+  assert.ok(Object.keys(labels).every(key => /^P[1-9]\d*$/.test(key)));
+  assert.equal(Object.values(labels).length, new Set(Object.values(labels)).size);
+  assert.deepEqual(context.own_latest_points, overview.leagues[0].rivals[0].diagnosis.latest.own);
+  for (const [leagueIndex, league] of context.leagues.entries()) {
+    for (const [rivalIndex, rival] of league.rivals.entries()) {
+      const original = overview.leagues[leagueIndex].rivals[rivalIndex];
+      assert.equal(labels[rival.last_captain!], original.captain);
+      assert.deepEqual(rival.different_players.map(key => labels[key]), original.different_players);
+      assert.deepEqual(rival.diagnosis.trend, original.diagnosis.trend);
+      assert.deepEqual(rival.diagnosis.latest.contributions, original.diagnosis.latest.contributions);
+      assert.deepEqual(rival.diagnosis.latest.core_player_gains.map(p => ({ name: labels[p.player], gap_change: p.gap_change })), original.diagnosis.latest.core_player_gains);
+      assert.deepEqual(rival.diagnosis.latest.core_player_losses.map(p => ({ name: labels[p.player], gap_change: p.gap_change })), original.diagnosis.latest.core_player_losses);
+      assert.equal(rival.diagnosis.latest.rival_net_points, original.diagnosis.latest.rival!.net);
+      assert.equal(rival.diagnosis.latest.rival_active_chip, original.diagnosis.latest.rival!.active_chip);
+    }
+  }
+  const serialized = JSON.stringify(context);
+  assert.ok(!serialized.includes("Private league") && !serialized.includes("Private team"));
+  assert.ok(!serialized.includes('"entry"') && !serialized.includes('"id"') && !serialized.includes('"player_name"'));
+  assert.deepEqual(overview, before);
+});
+
+test("keeps a worst-case strategy, paired chips and three-league diagnosis request below the bounded 96KiB limit", (t) => {
   const request = withBoundedStrategy();
   const longName = "N".repeat(80);
   const longTeam = "T".repeat(80);
@@ -480,17 +608,32 @@ test("keeps a worst-case compact strategy request below 65,536 bytes", () => {
       cost_change_event_tenths: 30,
     },
   }));
+  request.planner.confirmed_state.squad = request.squad_context.map(player => ({
+    id: player.id, name: player.name, team: player.team, position: player.position,
+    price_tenths: 150, purchase_price_tenths: 150, selling_price_tenths: 150,
+    status: player.status, price_signal: null,
+  }));
+  const afterTransferId = (id: number) => id >= 8 && id <= 12 ? id + 92 : id;
+  request.squad_context = request.squad_context.map(player => ({ ...player, id: afterTransferId(player.id) }));
+  request.lineup.starting_ids = request.lineup.starting_ids.map(afterTransferId);
+  request.lineup.bench_ids = request.lineup.bench_ids.map(afterTransferId);
 
   const maximalTransfer = (index: number) => ({
+    out_id: 8 + index % 5,
+    in_id: 100 + index,
+    out_purchase_price_tenths: 150,
+    out_current_price_tenths: 150,
     out_selling_price_tenths: 150,
     in_price_tenths: 150,
     position: "MID",
-    out: { name: `${index}${longName}`.slice(0, 80), team: "ARS" },
-    in: { name: `${index}${longName}`.slice(0, 80), team: "LIV" },
+    out: { id: 8 + index % 5, name: `${index}${longName}`.slice(0, 80), team: "ARS", position: "MID", price_tenths: 150, status: "a", price_signal: null },
+    in: { id: 100 + index, name: `${index}${longName}`.slice(0, 80), team: "LIV", position: "MID", price_tenths: 150, status: "a", price_signal: null },
   });
   const maximalAction = {
     ...request.planner.best_action,
     kind: "hit",
+    squad_ids: request.squad_context.map(player => player.id),
+    transfer_count: 5,
     transfers: Array.from({ length: 5 }, (_, index) => maximalTransfer(index)),
     gameweeks: Array.from({ length: 5 }, (_, index) => ({
       gameweek: 7 + index,
@@ -503,7 +646,8 @@ test("keeps a worst-case compact strategy request below 65,536 bytes", () => {
     transfers: maximalAction.transfers.map((transfer, transferIndex) => ({
       ...transfer,
       out: { ...transfer.out, name: `${index}${transferIndex}${longName}`.slice(0, 80) },
-      in: { ...transfer.in, name: `${transferIndex}${index}${longName}`.slice(0, 80) },
+      in_id: 200 + index * 5 + transferIndex,
+      in: { ...transfer.in, id: 200 + index * 5 + transferIndex, name: `${transferIndex}${index}${longName}`.slice(0, 80) },
     })),
   }));
   if (request.planner.strategy) {
@@ -539,11 +683,83 @@ test("keeps a worst-case compact strategy request below 65,536 bytes", () => {
       }
     });
     request.planner.chip_strategy.recommendation.reason = "C".repeat(360);
+    const originalIds = request.planner.confirmed_state.squad.map(player => player.id);
+    const wildcardIds = request.planner.chip_strategy.scenarios.find(scenario => scenario.chip === "wildcard")!.squad.map(player => player.id);
+    const sequencePath = (wildcard: boolean): ChipSequenceAction[] => {
+      let squad = [...originalIds];
+      let ft = request.planner.confirmed_state.free_transfers;
+      return Array.from({ length: 8 }, (_, index) => {
+        const outgoing = index === 0
+          ? wildcard ? originalIds : request.planner.best_action.transfers.map(transfer => transfer.out_id)
+          : index < 4 ? (wildcard ? wildcardIds : originalIds).slice((index - 1) * 2, index * 2) : [];
+        const incoming = index === 0
+          ? wildcard ? wildcardIds : request.planner.best_action.transfers.map(transfer => transfer.in_id)
+          : index < 4 ? (wildcard ? originalIds : wildcardIds).slice((index - 1) * 2, index * 2) : [];
+        squad = squad.map(id => outgoing.includes(id) ? incoming[outgoing.indexOf(id)] : id);
+        const chip = wildcard && index === 0 ? "wildcard" : null;
+        const nextFt = chip === "wildcard" ? ft : Math.min(5, Math.max(0, ft - outgoing.length) + 1);
+        const result: ChipSequenceAction = {
+          event: 7 + index, chip, transfer_out_ids: outgoing, transfer_in_ids: incoming,
+          squad_ids: [...squad], bank_after_tenths: request.planner.confirmed_state.bank_tenths,
+          free_transfers_before: ft, free_transfers_next_gameweek: nextFt,
+          hit_points: chip === "wildcard" ? 0 : 4 * Math.max(0, outgoing.length - ft),
+        };
+        ft = nextFt;
+        return result;
+      });
+    };
+    const normalPath = sequencePath(false), wildcardPath = sequencePath(true);
+    const sequences: ChipSequence[] = (["normal", "normal-bboost", "wildcard", "wildcard-bboost"] as const).map((sequenceId, index) => {
+      const actions = structuredClone(sequenceId.startsWith("wildcard") ? wildcardPath : normalPath);
+      if (sequenceId.endsWith("-bboost")) actions[1].chip = "bboost";
+      return { sequence_id: sequenceId, label: sequenceId, weighted_net_points: 400 + index * 5,
+        gain_vs_normal_points: index * 5, total_hit_points: actions.reduce((sum, action) => sum + action.hit_points, 0), actions };
+    });
+    request.planner.chip_strategy.sequence_comparison = {
+      status: "ready", horizon: 8, model_scope: "paired_bounded_chip_sequences",
+      globally_optimal: false, recalculate_each_deadline: true,
+      original_roadmap_weighted_net_points: request.planner.strategy!.weighted_projected_points,
+      highest_projected_sequence_id: "wildcard-bboost", sequences,
+      assumptions: [...CHIP_SEQUENCE_ASSUMPTIONS], reason: "Paired comparison within the same bounded continuation policy.",
+    };
+    assert.equal(sequences[2].actions[0].transfer_out_ids.length, 15);
+    assert.ok(sequences.every(sequence => sequence.actions.slice(1, 4).every(action => action.transfer_out_ids.length === 2)));
+    assert.ok(sequences.every(sequence => sequence.actions.slice(4).every(action => action.transfer_out_ids.length === 0)));
   }
 
-  const body = buildOpenAiReviewRequestBody(request, "gpt-5.6-sol", "max");
-  const bytes = new TextEncoder().encode(JSON.stringify(body)).byteLength;
-  assert.equal(bytes < MAX_OPENAI_REVIEW_REQUEST_BYTES, true, `${bytes} byte request`);
+  const overview = sixRivalLeagueFixture();
+  assert.equal(new Set(overview.leagues.flatMap(l => l.rivals.flatMap(r => r.different_players))).size, 90);
+  const league = leagueAiContext(overview);
+  const leagueBytes = new TextEncoder().encode(JSON.stringify(league)).byteLength;
+  assert.ok(!JSON.stringify(league).includes("Private") && !JSON.stringify(league).includes('"entry"'));
+  // Capture the exact serialization for diagnostics without bypassing the production size guard.
+  const nativeEncode = TextEncoder.prototype.encode;
+  let encodedRequest = "";
+  const capture = t.mock.method(TextEncoder.prototype, "encode", function (this: TextEncoder, input?: string) {
+    if (input?.startsWith('{"model":"gpt-5.6-sol"')) encodedRequest = input;
+    return nativeEncode.call(this, input);
+  });
+  try { buildOpenAiReviewRequestBody(request, "gpt-5.6-sol", "max"); } catch { /* Report the guarded baseline size below. */ }
+  const baselineBytes = Buffer.byteLength(encodedRequest);
+  let body: ReturnType<typeof buildOpenAiReviewRequestBody> | undefined;
+  let error: unknown;
+  try { body = buildOpenAiReviewRequestBody(request, "gpt-5.6-sol", "max", 32_000, league); } catch (caught) { error = caught; }
+  capture.mock.restore();
+  assert.ok(encodedRequest, "Production size check must serialize its request");
+  const bytes = Buffer.byteLength(encodedRequest);
+  const serialized = JSON.parse(encodedRequest) as ReturnType<typeof buildOpenAiReviewRequestBody>;
+  const context = JSON.parse(serialized.input[0].content[0].text) as Record<string, unknown>;
+  t.diagnostic(JSON.stringify({
+    bytes, baselineBytes, leagueBytes,
+    instructionsBytes: Buffer.byteLength(serialized.instructions),
+    outputSchemaBytes: Buffer.byteLength(JSON.stringify(serialized.text.format.schema)),
+    inputTextBytes: Buffer.byteLength(serialized.input[0].content[0].text),
+    inputContextFields: Object.fromEntries(Object.entries(context).map(([key, value]) => [key, Buffer.byteLength(JSON.stringify(value))])),
+  }));
+  assert.equal(bytes < MAX_OPENAI_REVIEW_REQUEST_BYTES, true, `${bytes} byte request including ${leagueBytes} bytes of league context`);
+  if (error) throw error;
+  assert.ok(body);
+  assert.equal(Buffer.byteLength(JSON.stringify(body)), bytes);
 });
 
 test("parses variable output order and keeps only deduplicated allowed citations", () => {
@@ -913,10 +1129,62 @@ test("retries a Responses server_error without lowering reasoning", async () => 
   assert.equal(result.fallbackReason, "upstream");
 });
 
-test("retries a response-body timeout with bounded high reasoning", async () => {
+test("gives the primary review the full remaining budget and keeps retries inside it", async (t) => {
+  let now = 1_000;
+  const timeouts: number[] = [];
+  let calls = 0;
+  t.mock.method(Date, "now", () => now);
+  t.mock.method(AbortSignal, "timeout", (milliseconds: number) => {
+    timeouts.push(milliseconds);
+    return new AbortController().signal;
+  });
+  const result = await requestOpenAiReview(requestFixture(), {
+    apiKey: "server-test-key",
+    model: "gpt-5.6-sol",
+    reasoningEffort: "xhigh",
+    sleepImpl: async (milliseconds) => { now += milliseconds; },
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) {
+        now += 40_000;
+        return new Response(null, { status: 503 });
+      }
+      return Response.json(completedResponse());
+    },
+  });
+
+  assert.deepEqual(timeouts, [285_000, 244_000]);
+  assert.equal(result.attemptCount, 2);
+  assert.equal(result.reasoningEffort, "xhigh");
+  assert.equal(result.fallbackReason, "upstream");
+});
+
+test("does not restart a timed-out primary review or lower its reasoning", async () => {
   const efforts: unknown[] = [];
   let calls = 0;
-  const result = await requestOpenAiReview(requestFixture(), {
+  await assert.rejects(
+    requestOpenAiReview(requestFixture(), {
+      apiKey: "server-test-key",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "xhigh",
+      fetchImpl: async (_input, init) => {
+        calls += 1;
+        const body = JSON.parse(String(init?.body)) as { reasoning: { effort: unknown } };
+        efforts.push(body.reasoning.effort);
+        throw new DOMException("timed out", "TimeoutError");
+      },
+    }),
+    (error: unknown) => error instanceof OpenAiReviewError &&
+      error.kind === "timeout" && error.attemptCount === 1 && error.fallbackReason === null,
+  );
+  assert.equal(calls, 1);
+  assert.deepEqual(efforts, ["xhigh"]);
+});
+
+test("does not restart a response-body timeout or lower its reasoning", async () => {
+  const efforts: unknown[] = [];
+  let calls = 0;
+  await assert.rejects(requestOpenAiReview(requestFixture(), {
     apiKey: "server-test-key",
     model: "gpt-5.6-sol",
     reasoningEffort: "xhigh",
@@ -943,13 +1211,11 @@ test("retries a response-body timeout with bounded high reasoning", async () => 
         headers: { "Content-Type": "application/json" },
       });
     },
-  });
+  }), (error: unknown) => error instanceof OpenAiReviewError &&
+    error.kind === "timeout" && error.attemptCount === 1 && error.fallbackReason === null);
 
-  assert.equal(calls, 2);
-  assert.deepEqual(efforts, ["xhigh", "high"]);
-  assert.equal(result.reasoningEffort, "high");
-  assert.equal(result.attemptCount, 2);
-  assert.equal(result.fallbackReason, "timeout");
+  assert.equal(calls, 1);
+  assert.deepEqual(efforts, ["xhigh"]);
 });
 
 test("fails closed after one bounded retry when OpenAI remains incomplete", async () => {

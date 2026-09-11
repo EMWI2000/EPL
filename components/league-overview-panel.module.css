@@ -5,4 +5,16 @@
 .league h3 { margin: 0; }
 .rival { display: grid; gap: 6px; margin-top: 12px; line-height: 1.55; overflow-wrap: anywhere; }
 .rival span, .note { color: var(--ink-soft); font-size: .9rem; }
+.diagnosis { min-width: 0; margin: 4px 0 10px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--paper); }
+.diagnosis summary { cursor: pointer; font-weight: 650; }
+.diagnosis summary:focus-visible { outline: 2px solid var(--forest); outline-offset: 4px; border-radius: 4px; }
+.diagnosis p { margin: 12px 0; }
+.tableWrap { position: relative; overflow-x: auto; }
+.pointTable { min-width: 0; width: 100%; font-size: .85rem; }
+.pointTable caption { padding: 8px 0; text-align: left; font-weight: 650; }
+.pointTable th, .pointTable td { padding: 9px 7px; white-space: normal; text-align: right; }
+.pointTable th:first-child { text-align: left; }
+.pointTable tbody th { font-weight: 500; }
+.pointTable tbody tr:last-child { font-weight: 700; border-top: 2px solid var(--line); }
+.pointTable tbody tr:last-child th { font-weight: 700; }
 @media (max-width: 600px) { .panel { padding: 18px; } .heading { flex-direction: column; } }
