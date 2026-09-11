@@ -208,6 +208,7 @@ export async function POST(request: Request) {
       detail: safeDetail,
       attempts: error instanceof OpenAiReviewError ? error.attemptCount : null,
       fallback_reason: error instanceof OpenAiReviewError ? error.fallbackReason : null,
+      upstream: error instanceof OpenAiReviewError ? error.upstream : null,
     });
     if (kind === "configuration") {
       return errorResponse(503, "ai_unconfigured", "AI-kvalificeringen er ikke konfigureret korrekt.");

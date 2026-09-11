@@ -1458,8 +1458,13 @@ main {
 
 .result-content {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 24px;
   transition: opacity 160ms ease;
+}
+
+.result-content > * {
+  min-width: 0;
 }
 
 .result-content--updating > *:not(.updating-banner) {

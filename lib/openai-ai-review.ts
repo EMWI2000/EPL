@@ -67,10 +67,61 @@ export type OpenAiReviewFallbackReason =
   | "timeout"
   | "upstream";
 
+type OpenAiReviewIncompleteReason = "max_output_tokens" | "content_filter" | "unknown";
+
+type UpstreamDiagnostic = {
+  status: number;
+  code: string | null;
+  parameter: string | null;
+  requestId: string | null;
+};
+
+// Log only known machine codes, never upstream messages or request contents.
+const SAFE_UPSTREAM_CODES = new Set([
+  "server_error", "invalid_request_error", "invalid_api_key", "model_not_found",
+  "insufficient_quota", "rate_limit_exceeded", "unsupported_parameter",
+  "unsupported_value", "context_length_exceeded", "invalid_json_schema",
+]);
+const SAFE_UPSTREAM_PARAMETERS = new Set([
+  "model", "reasoning", "reasoning.context", "reasoning.effort", "tools",
+  "tool_choice", "text.format", "text.format.schema", "max_output_tokens",
+  "max_tool_calls", "include", "store",
+]);
+
+async function upstreamDiagnostic(response: Response): Promise<UpstreamDiagnostic> {
+  const requestId = response.headers.get("x-request-id");
+  let code: string | null = null;
+  let parameter: string | null = null;
+  try {
+    const body: unknown = await response.json();
+    if (body && typeof body === "object" && "error" in body) {
+      const error = body.error;
+      if (error && typeof error === "object") {
+        if ("code" in error && typeof error.code === "string" && SAFE_UPSTREAM_CODES.has(error.code)) {
+          code = error.code;
+        }
+        if ("param" in error && typeof error.param === "string" && SAFE_UPSTREAM_PARAMETERS.has(error.param)) {
+          parameter = error.param;
+        }
+      }
+    }
+  } catch {
+    // The HTTP status remains useful even for an empty, non-JSON or timed-out body.
+  }
+  return {
+    status: response.status,
+    code,
+    parameter,
+    requestId: requestId && /^req_[A-Za-z0-9_-]{1,128}$/.test(requestId) ? requestId : null,
+  };
+}
+
 export class OpenAiReviewError extends Error {
   readonly kind: OpenAiReviewErrorKind;
   readonly attemptCount: number | null;
   readonly fallbackReason: OpenAiReviewFallbackReason | null;
+  readonly upstream: UpstreamDiagnostic | null;
+  readonly incompleteReason: OpenAiReviewIncompleteReason | null;
 
   constructor(
     kind: OpenAiReviewErrorKind,
@@ -78,6 +129,8 @@ export class OpenAiReviewError extends Error {
     metadata: {
       attemptCount?: number;
       fallbackReason?: OpenAiReviewFallbackReason | null;
+      upstream?: UpstreamDiagnostic | null;
+      incompleteReason?: OpenAiReviewIncompleteReason | null;
     } = {},
   ) {
     super(message);
@@ -85,6 +138,8 @@ export class OpenAiReviewError extends Error {
     this.kind = kind;
     this.attemptCount = metadata.attemptCount ?? null;
     this.fallbackReason = metadata.fallbackReason ?? null;
+    this.upstream = metadata.upstream ?? null;
+    this.incompleteReason = metadata.incompleteReason ?? null;
   }
 }
 
@@ -93,7 +148,9 @@ function withAttemptMetadata(
   attemptCount: number,
   fallbackReason: OpenAiReviewFallbackReason | null,
 ): OpenAiReviewError {
-  return new OpenAiReviewError(error.kind, error.message, { attemptCount, fallbackReason });
+  return new OpenAiReviewError(error.kind, error.message, {
+    attemptCount, fallbackReason, upstream: error.upstream, incompleteReason: error.incompleteReason,
+  });
 }
 
 export function configuredOpenAiApiKey(
@@ -615,10 +672,13 @@ export function parseOpenAiReviewResponseBody(
   if (root.status !== "completed") {
     if (root.status === "incomplete") {
       const details = unknownRecord(root.incomplete_details);
-      const safeReason = details?.reason === "max_output_tokens"
+      const incompleteReason: OpenAiReviewIncompleteReason = details?.reason === "max_output_tokens"
+        ? "max_output_tokens"
+        : details?.reason === "content_filter" ? "content_filter" : "unknown";
+      const safeReason = incompleteReason === "max_output_tokens"
         ? " because max_output_tokens was reached"
         : "";
-      throw new OpenAiReviewError("incomplete", `OpenAI did not complete the review${safeReason}.`);
+      throw new OpenAiReviewError("incomplete", `OpenAI did not complete the review${safeReason}.`, { incompleteReason });
     }
     if (root.status === "failed") {
       const failure = unknownRecord(root.error);
@@ -790,21 +850,22 @@ export async function requestOpenAiReview(
     }
 
     if (!upstream.ok) {
+      const diagnostic = await upstreamDiagnostic(upstream);
       if (upstream.status === 401 || upstream.status === 403) {
         throw withAttemptMetadata(
-          new OpenAiReviewError("configuration", "OpenAI rejected the server credentials."),
+          new OpenAiReviewError("configuration", "OpenAI rejected the server credentials.", { upstream: diagnostic }),
           index + 1,
           fallbackReason,
         );
       }
       if (upstream.status === 429) {
         throw withAttemptMetadata(
-          new OpenAiReviewError("rate_limited", "OpenAI rate limit reached."),
+          new OpenAiReviewError("rate_limited", "OpenAI rate limit reached.", { upstream: diagnostic }),
           index + 1,
           fallbackReason,
         );
       }
-      const mapped = new OpenAiReviewError("upstream", "OpenAI returned an upstream error.");
+      const mapped = new OpenAiReviewError("upstream", "OpenAI returned an upstream error.", { upstream: diagnostic });
       if (index === 0 && upstream.status >= 500) {
         fallbackReason = "upstream";
         retryableError = withAttemptMetadata(mapped, 1, fallbackReason);
@@ -843,7 +904,7 @@ export async function requestOpenAiReview(
       };
     } catch (error) {
       if (error instanceof OpenAiReviewError && index === 0) {
-        if (error.kind === "incomplete") {
+        if (error.kind === "incomplete" && error.incompleteReason === "max_output_tokens") {
           fallbackReason = "max_output_tokens";
           retryableError = withAttemptMetadata(error, 1, fallbackReason);
           continue;

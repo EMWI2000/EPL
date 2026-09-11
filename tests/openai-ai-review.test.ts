@@ -792,6 +792,67 @@ test("retries one transient upstream failure inside the shared timeout", async (
   assert.equal(result.fallbackReason, "upstream");
 });
 
+test("preserves safe upstream diagnostics across retries without retaining response text", async () => {
+  let calls = 0;
+  await assert.rejects(
+    requestOpenAiReview(requestFixture(), {
+      apiKey: "server-test-key",
+      model: "gpt-5.6-sol",
+      fetchImpl: async () => {
+        calls += 1;
+        return Response.json({ error: {
+          code: calls === 1 ? "server_error" : "unsupported_parameter",
+          param: "reasoning.context",
+          message: "private key server-test-key and private manager data",
+        } }, { status: calls === 1 ? 503 : 400, headers: { "x-request-id": "req_release_test" } });
+      },
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof OpenAiReviewError);
+      assert.equal(error.attemptCount, 2);
+      assert.equal(error.fallbackReason, "upstream");
+      assert.deepEqual(error.upstream, {
+        status: 400, code: "unsupported_parameter", parameter: "reasoning.context", requestId: "req_release_test",
+      });
+      assert.equal(JSON.stringify(error).includes("server-test-key"), false);
+      assert.equal(error.message.includes("private"), false);
+      return true;
+    },
+  );
+  assert.equal(calls, 2);
+});
+
+test("does not log unknown upstream fields or arbitrary header contents", async () => {
+  await assert.rejects(
+    requestOpenAiReview(requestFixture(), {
+      apiKey: "server-test-key",
+      model: "gpt-5.6-sol",
+      fetchImpl: async () => Response.json({ error: {
+        code: "secret_value", param: "manager_id=123", message: "private content",
+      } }, { status: 400, headers: { "x-request-id": "Bearer secret_value" } }),
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof OpenAiReviewError);
+      assert.equal(error.attemptCount, 1);
+      assert.deepEqual(error.upstream, { status: 400, code: null, parameter: null, requestId: null });
+      assert.equal(JSON.stringify(error).includes("secret_value"), false);
+      return true;
+    },
+  );
+});
+
+test("retains HTTP status for non-JSON upstream errors without replacing classification", async () => {
+  await assert.rejects(
+    requestOpenAiReview(requestFixture(), {
+      apiKey: "server-test-key",
+      model: "gpt-5.6-sol",
+      fetchImpl: async () => new Response("<html>private error</html>", { status: 403 }),
+    }),
+    (error: unknown) => error instanceof OpenAiReviewError && error.kind === "configuration" &&
+      error.attemptCount === 1 && error.upstream?.status === 403 && error.upstream.code === null,
+  );
+});
+
 test("retries a transient network failure without lowering reasoning", async () => {
   const efforts: unknown[] = [];
   let calls = 0;
@@ -906,8 +967,59 @@ test("fails closed after one bounded retry when OpenAI remains incomplete", asyn
     }),
     (error: unknown) => error instanceof OpenAiReviewError &&
       error.kind === "incomplete" &&
+      error.incompleteReason === "max_output_tokens" &&
       error.attemptCount === 2 &&
       error.fallbackReason === "max_output_tokens",
+  );
+  assert.equal(calls, 2);
+});
+
+test("does not retry filtered or unknown incomplete responses or retain arbitrary reasons", async () => {
+  for (const reason of ["content_filter", "private-secret-reason", null, undefined]) {
+    let calls = 0;
+    await assert.rejects(
+      requestOpenAiReview(requestFixture(), {
+        apiKey: "server-test-key",
+        model: "gpt-5.6-sol",
+        fetchImpl: async () => {
+          calls += 1;
+          return Response.json({
+            status: "incomplete",
+            incomplete_details: reason === undefined ? null : { reason },
+            output: [],
+          });
+        },
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof OpenAiReviewError);
+        assert.equal(error.kind, "incomplete");
+        assert.equal(error.incompleteReason, reason === "content_filter" ? "content_filter" : "unknown");
+        assert.equal(error.attemptCount, 1);
+        assert.equal(error.fallbackReason, null);
+        assert.equal(JSON.stringify(error).includes("private-secret-reason"), false);
+        assert.equal(error.message.includes("max_output_tokens"), false);
+        return true;
+      },
+    );
+    assert.equal(calls, 1);
+  }
+});
+
+test("retains the actual incomplete reason after an upstream retry", async () => {
+  let calls = 0;
+  await assert.rejects(
+    requestOpenAiReview(requestFixture(), {
+      apiKey: "server-test-key",
+      model: "gpt-5.6-sol",
+      fetchImpl: async () => {
+        calls += 1;
+        return calls === 1 ? new Response(null, { status: 503 }) : Response.json({
+          status: "incomplete", incomplete_details: { reason: "content_filter" }, output: [],
+        });
+      },
+    }),
+    (error: unknown) => error instanceof OpenAiReviewError && error.kind === "incomplete" &&
+      error.incompleteReason === "content_filter" && error.attemptCount === 2 && error.fallbackReason === "upstream",
   );
   assert.equal(calls, 2);
 });

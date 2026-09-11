@@ -2,7 +2,7 @@
 .panel h3 { margin: 0 0 10px; font-size: 19px; letter-spacing: -0.02em; }
 .intro { max-width: 78ch; color: var(--ink-soft); font-size: 14px; line-height: 1.7; }
 .tableWrap { overflow-x: auto; }
-.table { width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; }
+.table { width: 100%; min-width: 0; border-collapse: collapse; text-align: left; font-size: 14px; }
 .table th, .table td { padding: 12px 10px; border-bottom: 1px solid var(--line); }
 .table th { color: var(--ink-soft); font-weight: 650; }
 .table th:first-child, .table td:first-child { padding-left: 0; }
