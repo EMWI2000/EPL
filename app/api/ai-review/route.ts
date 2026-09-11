@@ -219,6 +219,9 @@ export async function POST(request: Request) {
     if (kind === "timeout") {
       return errorResponse(504, "ai_timeout", "AI-kvalificeringen nåede ikke at blive færdig. Prøv igen.");
     }
+    if (error instanceof OpenAiReviewError && error.upstream?.status === 503) {
+      return errorResponse(503, "ai_upstream_unavailable", "OpenAI er midlertidigt utilgængelig. Prøv AI-kvalificeringen igen senere. Du kan stadig se den beregnede FPL-plan.");
+    }
     return errorResponse(
       502,
       "ai_unavailable",

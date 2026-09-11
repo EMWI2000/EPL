@@ -80,7 +80,7 @@ type UpstreamDiagnostic = {
 const SAFE_UPSTREAM_CODES = new Set([
   "server_error", "invalid_request_error", "invalid_api_key", "model_not_found",
   "insufficient_quota", "rate_limit_exceeded", "unsupported_parameter",
-  "unsupported_value", "context_length_exceeded", "invalid_json_schema",
+  "unsupported_value", "context_length_exceeded", "invalid_json_schema", "server_is_overloaded",
 ]);
 const SAFE_UPSTREAM_PARAMETERS = new Set([
   "model", "reasoning", "reasoning.context", "reasoning.effort", "tools",
@@ -114,6 +114,13 @@ async function upstreamDiagnostic(response: Response): Promise<UpstreamDiagnosti
     parameter,
     requestId: requestId && /^req_[A-Za-z0-9_-]{1,128}$/.test(requestId) ? requestId : null,
   };
+}
+
+function upstreamRetryDelayMs(value: string | null, now: number): number {
+  if (value !== null && /^\d+$/.test(value.trim())) return Number(value.trim()) * 1_000;
+  const date = value !== null && /^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(value)
+    ? Date.parse(value) : NaN;
+  return Number.isFinite(date) ? Math.max(0, date - now) : 1_000;
 }
 
 export class OpenAiReviewError extends Error {
@@ -790,6 +797,7 @@ export async function requestOpenAiReview(
     reasoningEffort?: AiReviewReasoningEffort;
     timeoutMs?: number;
     fetchImpl?: FetchLike;
+    sleepImpl?: (milliseconds: number) => Promise<void>;
     leagueContext?: LeagueContext;
   },
 ): Promise<OpenAiResponseResult> {
@@ -869,6 +877,12 @@ export async function requestOpenAiReview(
       if (index === 0 && upstream.status >= 500) {
         fallbackReason = "upstream";
         retryableError = withAttemptMetadata(mapped, 1, fallbackReason);
+        const delayMs = upstreamRetryDelayMs(upstream.headers.get("retry-after"), Date.now());
+        // Never retry earlier than requested or leave too little time for the final attempt.
+        if (delayMs > 60_000 || deadline - Date.now() - delayMs < MIN_OPENAI_RETRY_TIME_MS) {
+          throw retryableError;
+        }
+        await (options.sleepImpl ?? ((milliseconds) => new Promise<void>(resolve => setTimeout(resolve, milliseconds))))(delayMs);
         continue;
       }
       throw withAttemptMetadata(mapped, index + 1, fallbackReason);

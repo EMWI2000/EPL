@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
+import pulp
 
 from fpl_app.logic.initial_squad import (
     EXPERIMENTAL_NOTICE_DA,
@@ -38,6 +40,19 @@ def _candidate_pool() -> pd.DataFrame:
 
 
 class InitialSquadOptimizerTests(unittest.TestCase):
+    def test_default_solver_uses_fixed_nonzero_seeds_for_both_random_sources(self) -> None:
+        # Checking the configuration makes this regression deterministic:
+        # seed 0 can coincidentally return equal squads in two quick solves.
+        with patch(
+            "fpl_app.logic.initial_squad.pulp.PULP_CBC_CMD",
+            wraps=pulp.PULP_CBC_CMD,
+        ) as solver_factory:
+            optimize_initial_squad(_candidate_pool(), horizon=3, gw_weights=(1.0, 0.8, 0.6))
+        options = dict(option.split() for option in solver_factory.call_args.kwargs["options"])
+        self.assertGreater(int(options["randomSeed"]), 0)
+        self.assertGreater(int(options["randomCbcSeed"]), 0)
+        self.assertEqual(solver_factory.call_args.kwargs["threads"], 1)
+
     def test_builds_complete_valid_and_deterministic_squad(self) -> None:
         players = _candidate_pool()
         result = optimize_initial_squad(players, horizon=3, gw_weights=(1.0, 0.8, 0.6))

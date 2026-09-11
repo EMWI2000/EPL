@@ -773,6 +773,7 @@ test("retries one transient upstream failure inside the shared timeout", async (
     apiKey: "server-test-key",
     model: "gpt-5.6-sol",
     reasoningEffort: "xhigh",
+    sleepImpl: async () => {},
     fetchImpl: async (_input, init) => {
       calls += 1;
       const body = JSON.parse(String(init?.body)) as { reasoning: { effort: unknown } };
@@ -798,6 +799,7 @@ test("preserves safe upstream diagnostics across retries without retaining respo
     requestOpenAiReview(requestFixture(), {
       apiKey: "server-test-key",
       model: "gpt-5.6-sol",
+      sleepImpl: async () => {},
       fetchImpl: async () => {
         calls += 1;
         return Response.json({ error: {
@@ -1011,6 +1013,7 @@ test("retains the actual incomplete reason after an upstream retry", async () =>
     requestOpenAiReview(requestFixture(), {
       apiKey: "server-test-key",
       model: "gpt-5.6-sol",
+      sleepImpl: async () => {},
       fetchImpl: async () => {
         calls += 1;
         return calls === 1 ? new Response(null, { status: 503 }) : Response.json({
@@ -1022,4 +1025,35 @@ test("retains the actual incomplete reason after an upstream retry", async () =>
       error.incompleteReason === "content_filter" && error.attemptCount === 2 && error.fallbackReason === "upstream",
   );
   assert.equal(calls, 2);
+});
+
+test("delays at most one HTTP server retry and respects Retry-After within the shared deadline", async () => {
+  const date = new Date(Date.now() + 10_000).toUTCString();
+  for (const header of [null, "invalid", "2", "0", date, "61", "300", "999999999999999999999999"]) {
+    let calls = 0;
+    const delays: number[] = [];
+    const skip = header === "61" || header === "300" || header === "999999999999999999999999";
+    await assert.rejects(requestOpenAiReview(requestFixture(), {
+      apiKey: "server-test-key", model: "gpt-5.6-sol", reasoningEffort: "xhigh",
+      sleepImpl: async milliseconds => { delays.push(milliseconds); },
+      fetchImpl: async (_input, init) => {
+        calls++;
+        assert.equal(JSON.parse(String(init?.body)).reasoning.effort, "xhigh");
+        return Response.json({ error: { code: "server_is_overloaded" } }, {
+          status: 503, headers: header === null ? {} : { "Retry-After": header },
+        });
+      },
+    }), (error: unknown) => error instanceof OpenAiReviewError && error.attemptCount === (skip ? 1 : 2)
+      && error.upstream?.code === "server_is_overloaded" && error.upstream.status === 503);
+    assert.equal(calls, skip ? 1 : 2);
+    if (header === date) assert.ok(delays.length === 1 && delays[0] > 8_000 && delays[0] <= 10_000);
+    else assert.deepEqual(delays, skip ? [] : [header === "2" ? 2_000 : header === "0" ? 0 : 1_000]);
+  }
+  let calls = 0;
+  await assert.rejects(requestOpenAiReview(requestFixture(), {
+    apiKey: "server-test-key", model: "gpt-5.6-sol", timeoutMs: 16_000,
+    sleepImpl: async () => { assert.fail("must not wait when retry would lack 15 seconds"); },
+    fetchImpl: async () => { calls++; return new Response(null, { status: 503, headers: { "Retry-After": "2" } }); },
+  }), (error: unknown) => error instanceof OpenAiReviewError && error.attemptCount === 1);
+  assert.equal(calls, 1);
 });

@@ -336,7 +336,9 @@ def optimize_initial_squad(
     selected_solver = solver or pulp.PULP_CBC_CMD(
         msg=False,
         threads=1,
-        options=["randomSeed 0"],
+        # CBC/CLP interpret seed 0 as the current time, not a fixed seed.
+        # Fix both sources of randomness so tied optima cannot vary by clock.
+        options=["randomSeed 17", "randomCbcSeed 17"],
     )
     try:
         model.solve(selected_solver)
