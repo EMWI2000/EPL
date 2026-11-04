@@ -9,6 +9,10 @@
 .diagnosis summary { cursor: pointer; font-weight: 650; }
 .diagnosis summary:focus-visible { outline: 2px solid var(--forest); outline-offset: 4px; border-radius: 4px; }
 .diagnosis p { margin: 12px 0; }
+.period { display: grid; gap: 6px; font-weight: 600; max-width: 28rem; }
+.period select { width: 100%; min-height: 44px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--card); font: inherit; }
+.period select:focus-visible { outline: 2px solid var(--forest); outline-offset: 2px; }
+.rival .role { font-size: .8rem; font-weight: 700; color: var(--forest); }
 .tableWrap { position: relative; overflow-x: auto; }
 .pointTable { min-width: 0; width: 100%; font-size: .85rem; }
 .pointTable caption { padding: 8px 0; text-align: left; font-weight: 650; }

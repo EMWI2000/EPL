@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   DECISION_HISTORY_STORAGE_KEY,
+  LEGACY_DECISION_HISTORY_STORAGE_KEY,
   MAX_DECISION_HISTORY_ENTRIES,
   buildDecisionHistoryEntry,
   clearDecisionHistory,
@@ -10,6 +11,7 @@ import {
   parseDecisionHistory,
   parseDecisionHistoryEntry,
   readDecisionHistory,
+  saveDecisionHistoryEntry,
   upsertDecisionHistory,
   writeDecisionHistory,
   type DecisionHistoryEntry,
@@ -190,7 +192,8 @@ test("builds an allowlisted compact entry without identity or secret-shaped fiel
   const serialized = JSON.stringify(entry);
   assert.equal(entry.selection.kind, "best");
   assert.equal(entry.action?.kind, "roll");
-  assert.doesNotMatch(serialized, /manager_id|github_id|internal_token|secret-token/);
+  assert.equal(entry.manager_id, 8425806);
+  assert.doesNotMatch(serialized, /github_id|internal_token|secret-token/);
 });
 
 test("preserves zero remaining free transfers for the current deadline", () => {
@@ -231,26 +234,17 @@ test("rejects extra fields and inconsistent selection data", () => {
       selection: { kind: "alternative", alternative_index: 0 },
       ai: null,
     }),
-    /ai is required/,
+    /Selected action does not match/,
   );
 });
 
-test("deduplicates deadlines, sorts newest first and keeps at most one season", () => {
-  let history = emptyDecisionHistory();
-  for (let event = 1; event <= MAX_DECISION_HISTORY_ENTRIES + 2; event += 1) {
-    const entry = build(null, `2026-08-${String(Math.min(event, 28)).padStart(2, "0")}T12:00:00Z`) as DecisionHistoryEntry;
-    entry.source_event = Math.max(1, Math.min(37, event));
-    entry.target_event = Math.min(38, entry.source_event + 1);
-    entry.target_deadline = new Date(Date.UTC(2026, 7, event + 1)).toISOString();
-    history = upsertDecisionHistory(history, parseDecisionHistoryEntry(entry));
-  }
-  assert.equal(history.entries.length, MAX_DECISION_HISTORY_ENTRIES);
-  assert.ok(Date.parse(history.entries[0].target_deadline) > Date.parse(history.entries.at(-1)!.target_deadline));
-
-  const replacement = { ...history.entries[0], saved_at: "2026-09-30T12:00:00Z" };
-  const updated = upsertDecisionHistory(history, replacement);
-  assert.equal(updated.entries.length, MAX_DECISION_HISTORY_ENTRIES);
-  assert.equal(updated.entries.find((entry) => entry.target_deadline === replacement.target_deadline)?.saved_at, "2026-09-30T12:00:00.000Z");
+test("keeps every save at the same deadline and rejects rewriting a saved snapshot", () => {
+  const first = build();
+  const second = build(null, "2026-08-23T12:06:00Z");
+  const history = upsertDecisionHistory(upsertDecisionHistory(emptyDecisionHistory(), first), second);
+  assert.equal(history.entries.length, 2);
+  assert.equal(history.entries[0].snapshot_id, second.snapshot_id);
+  assert.throws(() => upsertDecisionHistory(history, { ...first, saved_at: "2026-08-23T12:07:00Z" }), /kan ikke ændres/);
 });
 
 test("storage failures are nonfatal and clear only removes the history key", () => {
@@ -260,7 +254,7 @@ test("storage failures are nonfatal and clear only removes the history key", () 
   assert.deepEqual(readDecisionHistory(storage), parseDecisionHistory(JSON.parse(storage.getItem(DECISION_HISTORY_STORAGE_KEY)!)));
   storage.setItem("unrelated", "keep");
   assert.equal(clearDecisionHistory(storage), true);
-  assert.deepEqual(storage.removed, [DECISION_HISTORY_STORAGE_KEY]);
+  assert.deepEqual(storage.removed, [DECISION_HISTORY_STORAGE_KEY, LEGACY_DECISION_HISTORY_STORAGE_KEY]);
   assert.equal(storage.getItem("unrelated"), "keep");
 
   const broken: StorageLike = {
@@ -268,7 +262,102 @@ test("storage failures are nonfatal and clear only removes the history key", () 
     setItem() { throw new Error("quota"); },
     removeItem() { throw new Error("disabled"); },
   };
-  assert.deepEqual(readDecisionHistory(broken), emptyDecisionHistory());
+  assert.ok(readDecisionHistory(broken).storage_error);
   assert.equal(writeDecisionHistory(broken, history), false);
   assert.equal(clearDecisionHistory(broken), false);
+});
+
+test("migrates v1 without inventing a squad, manager, or vice captain", () => {
+  const current = build();
+  const added = new Set(["snapshot_id", "origin", "manager_id", "season", "state_fingerprint", "selection_source", "plans", "context"]);
+  const old = Object.fromEntries(Object.entries(current).filter(([key]) => !added.has(key)));
+  const migrated = parseDecisionHistory({ schema_version: "fpl-decision-history-v1", entries: [old] }).entries[0];
+  assert.equal(migrated.origin, "migrated_v1");
+  assert.equal(migrated.manager_id, null);
+  assert.equal(migrated.plans, null);
+  assert.deepEqual(migrated.lineup, old.lineup);
+  assert.deepEqual(parseDecisionHistoryEntry(migrated), migrated);
+  const storage = new MemoryStorage();
+  const original = JSON.stringify({ schema_version: "fpl-decision-history-v1", entries: [old] });
+  storage.setItem(LEGACY_DECISION_HISTORY_STORAGE_KEY, original);
+  assert.equal(writeDecisionHistory(storage, upsertDecisionHistory(readDecisionHistory(storage), build())), true);
+  assert.equal(storage.getItem(LEGACY_DECISION_HISTORY_STORAGE_KEY), original);
+  assert.equal(readDecisionHistory(storage).entries.length, 2);
+});
+
+test("records full candidate lineups when provided and leaves old missing detail unknown", () => {
+  const p = planner();
+  Object.assign(p.best_action.gameweeks[0], { vice_captain_id: 2, bench_ids: [12, 13, 14, 15] });
+  const entry = buildDecisionHistoryEntry({
+    saved_at: "2026-08-23T12:05:00Z", target_deadline: "2026-08-28T18:30:00Z",
+    state_observed_at: "2026-08-23T12:00:00Z", recommendation_generated_at: "2026-08-23T12:01:00Z",
+    forecast: { version: "v2", horizon: 2, validation_status: "unvalidated" }, planner: p, ai_review: null,
+  });
+  assert.equal(entry.plans?.best?.squad_ids.length, 15);
+  assert.equal(entry.plans?.best?.gameweeks[0].vice_captain_id, 2);
+  assert.deepEqual(entry.plans?.best?.gameweeks[0].bench_ids, [12, 13, 14, 15]);
+  assert.equal(entry.plans?.alternatives[0].gameweeks[0].vice_captain_id, null);
+  assert.equal(entry.plans?.alternatives[0].gameweeks[0].bench_ids, null);
+  assert.equal(entry.context?.budget_tenths, 760);
+  assert.equal(entry.context?.chips, null);
+});
+
+test("an explicit user choice overrides advisory AI without changing its recorded verdict", () => {
+  const entry = buildDecisionHistoryEntry({
+    saved_at: "2026-08-23T12:05:00Z", target_deadline: "2026-08-28T18:30:00Z",
+    state_observed_at: "2026-08-23T12:00:00Z", recommendation_generated_at: "2026-08-23T12:01:00Z",
+    forecast: { version: "v2", horizon: 2, validation_status: "unvalidated" }, planner: planner(),
+    ai_review: aiReview("confirm_best_action"), selection: { kind: "alternative", alternative_index: 0 },
+  });
+  assert.equal(entry.selection_source, "user");
+  assert.equal(entry.action?.transfers[0].in_id, 100);
+  assert.equal(entry.ai?.verdict, "confirm_best_action");
+});
+
+test("new snapshots cannot be recorded on or after the deadline or before their evidence", () => {
+  assert.throws(() => build(null, "2026-08-28T18:30:00Z"), /før deadline/);
+  assert.throws(() => build(null, "2026-08-29T12:00:00Z"), /før deadline/);
+  assert.throws(() => build(null, "2026-08-23T11:59:00Z"), /predates/);
+});
+
+test("capacity errors retain every existing snapshot and never evict an older deadline", () => {
+  const base = build();
+  const full = { ...emptyDecisionHistory(), entries: Array.from({ length: MAX_DECISION_HISTORY_ENTRIES },
+    (_, index) => ({ ...base, snapshot_id: `snapshot-${index}` })) };
+  assert.throws(() => upsertDecisionHistory(full, build()), /Journalen er fuld/);
+  assert.equal(full.entries.length, MAX_DECISION_HISTORY_ENTRIES);
+});
+
+test("a stale tab merges new records but cannot replace saved records or malformed storage", () => {
+  const storage = new MemoryStorage();
+  const first = build();
+  assert.equal(writeDecisionHistory(storage, upsertDecisionHistory(emptyDecisionHistory(), first)), true);
+  const second = build(null, "2026-08-23T12:06:00Z");
+  assert.equal(writeDecisionHistory(storage, upsertDecisionHistory(emptyDecisionHistory(), second)), true);
+  assert.equal(readDecisionHistory(storage).entries.length, 2);
+  const before = storage.getItem(DECISION_HISTORY_STORAGE_KEY);
+  assert.equal(writeDecisionHistory(storage, { ...emptyDecisionHistory(), entries: [{ ...first, saved_at: "2026-08-23T12:07:00Z" }] }), false);
+  assert.equal(storage.getItem(DECISION_HISTORY_STORAGE_KEY), before);
+  storage.setItem(DECISION_HISTORY_STORAGE_KEY, '{"broken": true}');
+  assert.ok(readDecisionHistory(storage).storage_error);
+  assert.equal(writeDecisionHistory(storage, { ...emptyDecisionHistory(), entries: [second] }), false);
+  assert.equal(storage.getItem(DECISION_HISTORY_STORAGE_KEY), '{"broken": true}');
+});
+
+test("a browser quota failure keeps the previously saved JSON", () => {
+  const storage = new MemoryStorage();
+  assert.equal(writeDecisionHistory(storage, { ...emptyDecisionHistory(), entries: [build()] }), true);
+  const before = storage.getItem(DECISION_HISTORY_STORAGE_KEY);
+  storage.setItem = () => { throw new Error("QuotaExceededError"); };
+  assert.equal(writeDecisionHistory(storage, { ...emptyDecisionHistory(), entries: [build()] }), false);
+  assert.equal(storage.getItem(DECISION_HISTORY_STORAGE_KEY), before);
+});
+
+test("the actual save checks the deadline again after a snapshot has been built", async () => {
+  const storage = new MemoryStorage();
+  const snapshot = build();
+  await assert.rejects(saveDecisionHistoryEntry(storage, snapshot, () => Date.parse(snapshot.target_deadline)), /Deadline er passeret/);
+  assert.equal(storage.getItem(DECISION_HISTORY_STORAGE_KEY), null);
+  const saved = await saveDecisionHistoryEntry(storage, snapshot, () => Date.parse(snapshot.saved_at));
+  assert.equal(saved.entries.length, 1);
 });

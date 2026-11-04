@@ -317,7 +317,7 @@ def _prepare_candidates(
             )
 
         transfer_count = len(plan.transfers)
-        if transfer_count > max(2, shared_ft):
+        if transfer_count > immediate.maximum_immediate_transfer_count(shared_ft):
             raise SequentialTransferError(
                 f"{path} exceeds the immediate optimiser's transfer-count bound"
             )
@@ -595,7 +595,9 @@ def optimize_two_deadline_sequence(
 
     count_choice: dict[tuple[int, int], pulp.LpVariable] = {}
     for candidate_index, candidate in enumerate(candidates):
-        maximum = max(2, candidate.plan.free_transfers_next_gameweek)
+        maximum = immediate.maximum_immediate_transfer_count(
+            candidate.plan.free_transfers_next_gameweek
+        )
         choices = []
         for transfer_count in range(maximum + 1):
             choice = pulp.LpVariable(

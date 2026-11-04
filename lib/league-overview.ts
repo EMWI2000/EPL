@@ -1,17 +1,23 @@
 /** Public, bounded league context. Never receives FPL login credentials. */
-import { buildLeagueDiagnosis, type LeagueDiagnosis } from "./league-diagnosis.ts";
+import { LEAGUE_DETAIL_BATCH_SIZE, buildLeagueDiagnosis, buildLeagueSeasonSummary, type LeagueDiagnosis, type LeagueSeasonSummary, type LeagueRoundDiagnosis } from "./league-diagnosis.ts";
+import { createLeagueFetcher } from "./league-fetch.ts";
 
 export type LeagueRival = {
   entry: number; team: string; rank: number; points: number; gap: number | null;
   captain: string | null; different_players: string[];
   chips_remaining: string[] | null;
   diagnosis: LeagueDiagnosis;
+  roles?: ("leader" | "nearest" | "podium")[];
+  season?: LeagueSeasonSummary;
 };
 export type LeagueOverview = {
   generated_at: string; source_event: number; target_event: number;
   own_points: number; own_chips_remaining: string[] | null;
   leagues: { id: number; name: string; rank: number | null; previous_rank: number | null;
-    leader_gap: number | null; rivals: LeagueRival[]; partial: boolean }[];
+    leader_gap: number | null; rivals: LeagueRival[]; partial: boolean;
+    start_event?: number | null;
+    field?: { complete: boolean; observed_count: number; median_points: number | null; median_gap: number | null; podium_points: number | null };
+  }[];
   warnings: string[];
 };
 type Obj = Record<string, unknown>;
@@ -21,6 +27,35 @@ const int = (v: unknown): number | null => typeof v === "number" && Number.isSaf
 const signedInt = (v: unknown): number | null => typeof v === "number" && Number.isSafeInteger(v) ? v : null;
 const label = (v: unknown): string => typeof v === "string" ? v.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 100) : "Ukendt";
 const chipNames = ["wildcard", "freehit", "bboost", "3xc"];
+
+const MAX_STANDINGS_PAGES = 20;
+
+async function loadStandings(id: number, rank: number, get: ReturnType<typeof createLeagueFetcher>) {
+  const payloads: unknown[] = [];
+  const pages: number[] = [];
+  let complete = false;
+  try {
+    for (let page = 1; page <= MAX_STANDINGS_PAGES; page += 1) {
+      const payload = await get(`leagues-classic/${id}/standings/?page_standings=${page}`);
+      const standings = obj(obj(payload).standings);
+      if (!Array.isArray(standings.results) || (standings.page !== undefined && standings.page !== page)) break;
+      payloads.push(payload); pages.push(page);
+      if (standings.has_next === false) { complete = true; break; }
+      if (standings.has_next !== true || standings.results.length === 0) {
+        // Older/incomplete upstream payloads cannot establish a full-field median.
+        for (const near of new Set([Math.max(1, Math.floor((rank - 2) / 50) + 1), Math.floor((rank - 1) / 50) + 1])) {
+          if (!pages.includes(near)) { payloads.push(await get(`leagues-classic/${id}/standings/?page_standings=${near}`)); pages.push(near); }
+        }
+        break;
+      }
+    }
+  } catch { complete = false; }
+  const all = payloads.flatMap(p => rows(obj(obj(p).standings).results));
+  const valid = all.filter(r => int(r.entry) && int(r.rank) && signedInt(r.total) !== null);
+  if (all.length !== valid.length || new Set(valid.map(r => r.entry)).size !== valid.length) complete = false;
+  const start = int(obj(obj(payloads[0]).league).start_event);
+  return { rows: valid, pages, complete, start: start && start <= 38 ? start : null };
+}
 
 export function remainingLeagueChips(history: unknown, target: number): string[] | null {
   const value = obj(history).chips;
@@ -39,17 +74,7 @@ export async function loadLeagueOverview(
   managerId: number, fetcher: typeof fetch = fetch, now = Date.now(),
 ): Promise<LeagueOverview> {
   if (!Number.isSafeInteger(managerId) || managerId <= 0) throw new Error("Invalid manager");
-  const started = Date.now();
-  const get = async (path: string): Promise<unknown> => {
-    const remaining = 18_000 - (Date.now() - started);
-    if (remaining <= 0) throw new Error("League time budget exceeded");
-    const response = await fetcher(`https://fantasy.premierleague.com/api/${path}`, {
-      headers: { Accept: "application/json" }, cache: "no-store",
-      signal: AbortSignal.timeout(Math.max(1, Math.min(5_000, remaining))), redirect: "error",
-    });
-    if (!response.ok) throw new Error("Official league data unavailable");
-    return response.json();
-  };
+  const get = createLeagueFetcher(fetcher);
   const [rawManager, rawBootstrap] = await Promise.all([get(`entry/${managerId}/`), get("bootstrap-static/")]);
   const manager = obj(rawManager), bootstrap = obj(rawBootstrap);
   const events = rows(bootstrap.events);
@@ -58,14 +83,15 @@ export async function loadLeagueOverview(
   const source = events.filter(e => int(e.id) && typeof e.deadline_time === "string" && Date.parse(e.deadline_time) <= now)
     .sort((a, b) => Number(b.id) - Number(a.id))[0];
   const ownPoints = signedInt(manager.summary_overall_points);
-  if (!target || !source || ownPoints === null) throw new Error("No current league context");
-  const targetEvent = Number(target.id), sourceEvent = Number(source.id);
+  const seasonEnded = !target && source?.id === 38 && source.finished === true && source.data_checked === true;
+  if ((!target && !seasonEnded) || !source || ownPoints === null) throw new Error("No current league context");
+  const targetEvent = target ? Number(target.id) : 38, sourceEvent = Number(source.id);
   const sourceFinalized = source.finished === true && source.data_checked === true;
   const players = new Map(rows(bootstrap.elements).filter(p => int(p.id)).map(p => [Number(p.id), label(p.web_name)]));
   const memberships = rows(obj(manager.leagues).classic).filter(l => l.league_type === "x" && int(l.id) && int(l.entry_rank));
   const selected = memberships.slice(0, 3);
   const warnings = ["Offentlige hold er låst ved seneste deadline. Nye transfers og næste kaptajn er ikke synlige.",
-    "Udvalget viser ligalederen og nærmeste hold foran dig, ikke en beregnet sandsynlighed for at vinde."];
+    "Sammenligningerne følger de aktuelt valgte rivaler. Pointregnskabet beskriver udfaldet; det måler ikke kvaliteten af tidligere beslutninger."];
   if (memberships.length > 3) warnings.push("Kun de første tre invitationelle ligaer er med i dette overblik.");
   const picksCache = new Map<number, Promise<unknown>>();
   const historyCache = new Map<number, Promise<unknown>>();
@@ -79,16 +105,7 @@ export async function loadLeagueOverview(
   };
   const [ownPicksRaw, ownHistory, standings, live] = await Promise.all([
     picks(managerId), history(managerId),
-    Promise.all(selected.map(async l => {
-      try {
-        // FPL returns 50 standings per page; page above the user also covers rank51 etc.
-        const nearPage = Math.floor((Number(l.entry_rank) - 2) / 50) + 1;
-        const ownPage = Math.floor((Number(l.entry_rank) - 1) / 50) + 1;
-        const paths = [...new Set([1, Math.max(1, nearPage), ownPage])];
-        const pages = await Promise.all(paths.map(page => get(`leagues-classic/${l.id}/standings/?page_standings=${page}`)));
-        return { rows: pages.flatMap(p => rows(obj(obj(p).standings).results)), pages: paths };
-      } catch { return null; }
-    })),
+    Promise.all(selected.map(l => loadStandings(Number(l.id), Number(l.entry_rank), get))),
     sourceFinalized
       ? get(`event/${sourceEvent}/live/`).catch(() => null) : Promise.resolve(null),
   ]);
@@ -99,22 +116,27 @@ export async function loadLeagueOverview(
   };
   const ownIds = new Set(validSquad(ownPicksRaw).map(p => Number(p.element)));
   const leagues = await Promise.all(selected.map(async (l, index) => {
-    const leagueRows = standings[index]?.rows ?? null;
+    const table = standings[index];
+    const leagueRows = table.rows;
     const valid = leagueRows?.filter(r => int(r.entry) && int(r.rank) && signedInt(r.total) !== null) ?? [];
     const leader = valid.find(r => r.rank === 1);
     const ownRows = valid.filter(r => r.entry === managerId);
     // Entry-summary ranks can lag behind standings. Conflicting pages are also unknown.
     const ownRow = new Set(ownRows.map(r => `${r.rank}:${r.total}`)).size === 1 ? ownRows[0] : undefined;
     const ownRank = int(ownRow?.rank), ownLeaguePoints = signedInt(ownRow?.total);
-    const nearPage = ownRank === null ? null : Math.max(1, Math.floor((ownRank - 2) / 50) + 1);
-    const near = ownRank !== null && nearPage !== null && standings[index]?.pages.includes(nearPage)
-      ? valid.filter(r => Number(r.rank) < ownRank).sort((a, b) => Number(b.rank) - Number(a.rank))[0] : undefined;
-    const unique = [...new Map([leader, near].filter((r): r is Obj => Boolean(r) && r?.entry !== managerId).map(r => [r.entry, r])).values()];
-    let partial = leagueRows === null || !leader || ownLeaguePoints === null || (ownRank !== null && ownRank > 1 && !near);
+    const ownPosition = int(ownRow?.rank_sort) ?? ownRank;
+    const nearPage = ownPosition === null ? null : Math.max(1, Math.floor((ownPosition - 2) / 50) + 1);
+    const near = ownRank !== null && nearPage !== null && table.pages.includes(nearPage)
+      ? valid.filter(r => (int(r.rank_sort) ?? Number(r.rank)) < ownPosition!)
+        .sort((a, b) => (int(b.rank_sort) ?? Number(b.rank)) - (int(a.rank_sort) ?? Number(a.rank)))[0] : undefined;
+    const podium = valid.find(r => r.rank_sort === 3) ?? (table.complete
+      ? [...valid].sort((a, b) => Number(a.rank) - Number(b.rank))[2] : valid.find(r => r.rank === 3));
+    const unique = [...new Map([leader, near, podium].filter((r): r is Obj => Boolean(r) && r?.entry !== managerId).map(r => [r.entry, r])).values()];
+    let partial = !leader || ownLeaguePoints === null || (ownRank !== null && ownRank > 1 && !near);
     const rivals = await Promise.all(unique.map(async r => {
       const [p, h] = await Promise.all([picks(Number(r.entry)), history(Number(r.entry))]);
       const squad = validSquad(p);
-      const chips = remainingLeagueChips(h, targetEvent);
+      const chips = seasonEnded ? [] : remainingLeagueChips(h, targetEvent);
       if (squad.length !== 15 || chips === null || ownIds.size !== 15) partial = true;
       const effectiveCaptains = squad.filter(v => v.multiplier === 2 || v.multiplier === 3);
       const captain = sourceFinalized ? effectiveCaptains.length === 1 ? effectiveCaptains[0] : undefined
@@ -131,13 +153,66 @@ export async function loadLeagueOverview(
           ? squad.filter(v => !ownIds.has(Number(v.element))).map(v => players.get(Number(v.element)) ?? "Ukendt") : [],
         chips_remaining: chips,
         diagnosis,
+        roles: ([...(leader?.entry === r.entry ? ["leader"] : []), ...(near?.entry === r.entry ? ["nearest"] : []),
+          ...(podium?.entry === r.entry ? ["podium"] : [])] as ("leader" | "nearest" | "podium")[]),
+        season: table.start ? buildLeagueSeasonSummary({ events, sourceEvent, startEvent: table.start,
+          ownHistory, rivalHistory: h, ownLeaguePoints, rivalLeaguePoints: Number(r.total) }) : undefined,
       };
     }));
+    const totals = table.complete ? valid.map(r => Number(r.total)).sort((a, b) => a - b) : [];
+    const middle = Math.floor(totals.length / 2);
+    const median = totals.length ? (totals[middle] + totals[Math.floor((totals.length - 1) / 2)]) / 2 : null;
     return { id: Number(l.id), name: label(l.name), rank: ownRank, previous_rank: int(l.entry_last_rank) ?? ownRank,
-      leader_gap: leader && ownLeaguePoints !== null ? Number(leader.total) - ownLeaguePoints : null, rivals, partial };
+      leader_gap: leader && ownLeaguePoints !== null ? Number(leader.total) - ownLeaguePoints : null, rivals, partial,
+      start_event: table.start, field: { complete: table.complete, observed_count: new Set(valid.map(r => r.entry)).size,
+        median_points: median, median_gap: median !== null && ownLeaguePoints !== null ? median - ownLeaguePoints : null,
+        podium_points: podium ? Number(podium.total) : null } };
   }));
   return { generated_at: new Date(now).toISOString(), source_event: sourceEvent, target_event: targetEvent,
-    own_points: ownPoints, own_chips_remaining: remainingLeagueChips(ownHistory, targetEvent), leagues, warnings };
+    own_points: ownPoints, own_chips_remaining: seasonEnded ? [] : remainingLeagueChips(ownHistory, targetEvent), leagues, warnings };
+}
+
+export class LeagueScopeError extends Error {}
+export type LeagueSeasonBatch = {
+  league_id: number; rival_entry: number; from_event: number; to_event: number;
+  rounds: LeagueRoundDiagnosis[];
+};
+
+/** Six rounds per request keep 38-week reviews bounded on serverless hosts. */
+export async function loadLeagueSeasonDetails(
+  managerId: number, request: { leagueId: number; rivalId: number; fromEvent: number; toEvent: number },
+  fetcher: typeof fetch = fetch, now = Date.now(),
+): Promise<LeagueSeasonBatch> {
+  const { leagueId, rivalId, fromEvent, toEvent } = request;
+  if (![leagueId, rivalId, fromEvent, toEvent].every(n => Number.isSafeInteger(n) && n > 0)
+    || toEvent > 38 || fromEvent > toEvent || toEvent - fromEvent >= LEAGUE_DETAIL_BATCH_SIZE) {
+    throw new LeagueScopeError("Ugyldig liga eller rundeperiode.");
+  }
+  const started = Date.now();
+  const overview = await loadLeagueOverview(managerId, fetcher, now);
+  const league = overview.leagues.find(l => l.id === leagueId);
+  const rival = league?.rivals.find(r => r.entry === rivalId);
+  if (!league?.start_event || !rival?.season?.end_event || fromEvent < league.start_event || toEvent > rival.season.end_event) {
+    throw new LeagueScopeError("Sammenligningen er ikke tilgængelig for dit ligaoverblik. Opdatér ligaerne.");
+  }
+  const get = createLeagueFetcher(fetcher, Math.max(1, 22_000 - (Date.now() - started)));
+  const safe = (path: string, finalized = false) => get(path, finalized).catch(() => null);
+  const [bootstrapRaw, ownHistory, rivalHistory] = await Promise.all([
+    safe("bootstrap-static/"), safe(`entry/${managerId}/history/`), safe(`entry/${rivalId}/history/`),
+  ]);
+  const bootstrap = obj(bootstrapRaw);
+  const players = new Map(rows(bootstrap.elements).filter(p => int(p.id)).map(p => [Number(p.id), label(p.web_name)]));
+  const rounds = await Promise.all(Array.from({ length: toEvent - fromEvent + 1 }, async (_, index) => {
+    const event = fromEvent + index;
+    const finalized = rows(bootstrap.events).some(e => e.id === event && e.finished === true && e.data_checked === true);
+    const [ownPicks, rivalPicks, live] = finalized ? await Promise.all([
+      safe(`entry/${managerId}/event/${event}/picks/`, true), safe(`entry/${rivalId}/event/${event}/picks/`, true),
+      safe(`event/${event}/live/`, true),
+    ]) : [null, null, null];
+    return buildLeagueDiagnosis({ events: bootstrap.events, sourceEvent: event, ownHistory, rivalHistory,
+      ownPicks, rivalPicks, live, playerNames: players }).latest;
+  }));
+  return { league_id: leagueId, rival_entry: rivalId, from_event: fromEvent, to_event: toEvent, rounds };
 }
 
 /** Deliberately excludes manager/league IDs and user-controlled team names. */

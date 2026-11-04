@@ -1,0 +1,21 @@
+.panel { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 24px; margin: 20px 0; box-shadow: var(--shadow-sm); }
+.panel h2 { margin: 4px 0 10px; font-size: 1.35rem; }
+.panel header > p:last-child { color: var(--ink-soft); line-height: 1.6; }
+.scroll { overflow-x: auto; margin: 20px 0 12px; border: 1px solid var(--line); border-radius: 12px; }
+.panel table { width: 100%; border-collapse: collapse; min-width: 690px; font-size: .86rem; }
+.panel th, .panel td { padding: 13px 12px; border-bottom: 1px solid var(--line); text-align: right; vertical-align: top; }
+.panel th:first-child { text-align: left; min-width: 260px; width: 45%; }
+.panel thead { color: var(--ink-soft); background: var(--paper); }
+.panel tbody tr:last-child > * { border-bottom: 0; }
+.selected { background: var(--mint); }
+.choice { display: flex; align-items: flex-start; gap: 10px; line-height: 1.6; cursor: pointer; font-weight: 650; }
+.choice input { margin-top: 5px; accent-color: var(--forest); }
+.choice small { display: block; color: var(--ink-soft); font-size: .73rem; font-weight: 400; }
+.note { color: var(--ink-soft); font-size: .82rem; line-height: 1.7; }
+.detail { border-top: 1px solid var(--line); margin-top: 18px; padding-top: 16px; }
+.detail h3 { margin: 0 0 12px; font-size: 1rem; }
+.detail p { font-size: .88rem; line-height: 1.65; }
+.detail dl { display: grid; gap: 14px; font-size: .88rem; }
+.detail dt { font-weight: 700; margin-bottom: 4px; }
+.detail dd { margin: 0; line-height: 1.65; color: var(--ink-soft); }
+@media (max-width: 600px) { .panel { padding: 18px 14px; } }

@@ -287,6 +287,45 @@ def test_optimizer_shortlist_is_bounded_diverse_and_deterministic():
         assert cheapest_ids.issubset(set(first["id"]))
 
 
+def test_every_transfer_action_serializes_its_own_complete_lineups():
+    pool = _synthetic_pool(horizon=2)
+    squad_ids = pool["id"].tolist()
+    candidate = pool.loc[pool["id"] == 8].copy()
+    candidate.loc[:, ["id", "team_id", "ep_gw1", "ep_gw2"]] = [101, 6, 35, 30]
+    candidate.loc[:, "name"] = "Incoming midfielder"
+    candidate.loc[:, "team"] = "T6"
+    pool = pd.concat([pool, candidate], ignore_index=True)
+    pool["purchase_price"] = 50
+    pool["selling_price"] = 50
+    pool["no_show_prob_gw1"] = 0.0
+    pool["no_show_prob_gw2"] = 0.0
+    result = compute.optimize_rolling_transfers(
+        pool, squad_ids, bank_tenths=0, free_transfers=1, horizon=2,
+        plans_per_transfer_count=3,
+    )
+    by_id = pool.set_index("id")
+    serialized_squads = set()
+    for plan in (result.best_action, *result.alternatives):
+        action = compute._serialize_transfer_action(
+            plan, pool=pool, window=[7, 8], roll=result.roll,
+        )
+        serialized_squads.add(tuple(action["squad_ids"]))
+        assert [gw["gameweek"] for gw in action["gameweeks"]] == [7, 8]
+        for gw in action["gameweeks"]:
+            starters = gw["starting_ids"]
+            bench = gw["bench_ids"]
+            assert len(set(starters)) == 11
+            assert len(set(bench)) == 4
+            assert set(starters).isdisjoint(bench)
+            assert set(starters) | set(bench) == set(action["squad_ids"])
+            assert gw["captain_id"] in starters
+            assert gw["vice_captain_id"] in starters
+            assert gw["captain_id"] != gw["vice_captain_id"]
+            assert by_id.at[bench[-1], "pos"] == "GKP"
+            assert all(by_id.at[player_id, "pos"] != "GKP" for player_id in bench[:-1])
+    assert len(serialized_squads) > 1
+
+
 def test_generate_recommendation_returns_frontend_contract(monkeypatch):
     pool = _synthetic_pool(horizon=2)
     official = pd.DataFrame({"id": pool["id"]})

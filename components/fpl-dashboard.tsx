@@ -2,6 +2,9 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { DecisionHistoryPanel } from "@/components/decision-history-panel";
+import { PlanComparisonPanel } from "@/components/plan-comparison-panel";
+import type { PlanChoice } from "@/lib/plan-comparison";
 import { AccountControl } from "@/components/account-control";
 import { LeagueOverviewPanel } from "@/components/league-overview-panel";
 import { ChipSequencePanel } from "@/components/chip-sequence-panel";
@@ -16,13 +19,13 @@ import {
 } from "@/lib/ai-review-contract";
 import {
   buildDecisionHistoryEntry,
+  DECISION_HISTORY_STORAGE_KEY,
+  LEGACY_DECISION_HISTORY_STORAGE_KEY,
   clearDecisionHistory,
   emptyDecisionHistory,
   readDecisionHistory,
-  upsertDecisionHistory,
-  writeDecisionHistory,
+  saveDecisionHistoryEntry,
   type DecisionHistory,
-  type DecisionHistoryEntry,
 } from "@/lib/decision-history";
 import { resolveInitialFplManagerId } from "@/lib/fpl-manager-config";
 import { canSubmitWeeklyPlanner } from "@/components/fpl-dashboard-state";
@@ -954,82 +957,6 @@ function StrategyPlanPanel({
   );
 }
 
-function historyActionLabel(entry: DecisionHistoryEntry) {
-  if (entry.selection.kind === "wait") return entry.ai?.headline ?? "Afvent og genberegn";
-  if (!entry.action || entry.action.kind === "roll") return "Rul transferen";
-  return entry.action.transfers
-    .map((transfer) => `${transfer.out_name} til ${transfer.in_name}`)
-    .join(" + ");
-}
-
-function DecisionHistoryPanel({
-  history,
-  canSave,
-  status,
-  onSave,
-  onExport,
-  onClear,
-}: {
-  history: DecisionHistory;
-  canSave: boolean;
-  status: string | null;
-  onSave: () => void;
-  onExport: () => void;
-  onClear: () => void;
-}) {
-  const [showAll, setShowAll] = useState(false);
-  const visibleEntries = showAll ? history.entries : history.entries.slice(0, 4);
-  return (
-    <section className="decision-history" aria-labelledby="decision-history-heading">
-      <div className="decision-history__header">
-        <div>
-          <p className="eyebrow">Uge for uge</p>
-          <h2 id="decision-history-heading">Din beslutningsjournal</h2>
-          <p>Gem den aktuelle anbefaling, inklusive et eventuelt AI-valg. Journalen ligger kun i denne browser og sendes ikke til beregningen eller OpenAI.</p>
-        </div>
-        <button className="secondary-button" type="button" onClick={onSave} disabled={!canSave}>
-          <DatabaseIcon /> Gem anbefalingen
-        </button>
-      </div>
-      {status && <p className="decision-history__status" role="status"><InfoIcon /> {status}</p>}
-      {visibleEntries.length === 0 ? (
-        <div className="decision-history__empty">
-          <strong>Ingen gemte deadlines endnu</strong>
-          <span>Gem først, når du har kontrolleret planen og eventuelt kørt AI-vurderingen.</span>
-        </div>
-      ) : (
-        <div className="decision-history__list">
-          {visibleEntries.map((entry) => (
-            <article key={`${entry.target_event}-${entry.target_deadline}`}>
-              <span>GW{entry.target_event}</span>
-              <div>
-                <strong>{historyActionLabel(entry)}</strong>
-                <small>Deadline {formatDateTime(entry.target_deadline)} · gemt {formatDateTime(entry.saved_at)}</small>
-              </div>
-              <div>
-                <strong>{entry.action ? `${entry.action.hit_points} hitpoint` : "Vent"}</strong>
-                <small>{entry.ai ? `AI: ${entry.ai.confidence}` : "Uden AI-review"}</small>
-              </div>
-            </article>
-          ))}
-        </div>
-      )}
-      <div className="decision-history__footer">
-        <span>Højst 38 deadlines. Historikken kan blive slettet af browseren og følger ikke med til andre enheder.</span>
-        <div>
-          {history.entries.length > 4 && (
-            <button type="button" onClick={() => setShowAll((value) => !value)} aria-expanded={showAll}>
-              {showAll ? "Vis seneste" : `Vis alle ${history.entries.length}`}
-            </button>
-          )}
-          <button type="button" onClick={onExport} disabled={history.entries.length === 0}><DownloadIcon /> Eksportér</button>
-          <button type="button" onClick={onClear} disabled={history.entries.length === 0}>Slet historik</button>
-        </div>
-      </div>
-    </section>
-  );
-}
-
 function AiReviewList({ title, items }: { title: string; items: string[] }) {
   return (
     <div className="ai-review__list">
@@ -1345,32 +1272,6 @@ function AiReviewPanel({
   );
 }
 
-function PlannerAlternatives({ actions }: { actions: PlannerAction[] }) {
-  if (!actions.length) return null;
-  return (
-    <section className="panel alternatives-panel" aria-labelledby="alternatives-heading">
-      <div className="section-heading section-heading--compact">
-        <div>
-          <p className="eyebrow">Plan B</p>
-          <h2 id="alternatives-heading">Nærmeste alternativer</h2>
-        </div>
-        <p>Sammenlignet på samme horisont, budget og regelsæt.</p>
-      </div>
-      <div className="alternatives-list">
-        {actions.map((action, index) => (
-          <article className="alternative-card" key={`${action.kind}-${action.transfers.map((move) => `${move.out_id}-${move.in_id}`).join("-")}-${index}`}>
-            <div className="alternative-card__top">
-              <strong>{action.kind === "roll" ? "Rul transferen" : action.transfers.map((move) => `${move.out.name} → ${move.in.name}`).join(" + ")}</strong>
-              <small>{signedPoints(action.net_points_vs_roll)} EP</small>
-            </div>
-            <p>{action.hit_points ? `${action.hit_points} point i hit · ` : "Intet hit · "}{formatPrice(action.bank_after_tenths / 10)} tilbage</p>
-          </article>
-        ))}
-      </div>
-    </section>
-  );
-}
-
 function ForecastTable({ data, gameweek }: { data: RecommendationResponse; gameweek: number }) {
   const gameweeks = data.meta.gameweek_window;
   const selectedLineup = data.team.gameweeks.find((lineup) => lineup.gameweek === gameweek) ?? data.team.gameweeks[0];
@@ -1657,6 +1558,8 @@ export function FplDashboard({
   const [aiReview, setAiReview] = useState<AiReviewResponse | null>(null);
   const [isAiReviewing, setIsAiReviewing] = useState(false);
   const [aiReviewError, setAiReviewError] = useState<string | null>(null);
+  const [journalSelection, setJournalSelection] = useState<PlanChoice | undefined>(undefined);
+  const [isSavingDecision, setIsSavingDecision] = useState(false);
   const [decisionHistory, setDecisionHistory] = useState<DecisionHistory>(emptyDecisionHistory);
   const [decisionHistoryStatus, setDecisionHistoryStatus] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -1736,6 +1639,7 @@ export function FplDashboard({
       }
       if (recommendationRequestIdRef.current !== requestId) return;
 
+      setJournalSelection(undefined);
       setRecommendation(body);
       setSelectedGameweek(body.team.gameweeks[0]?.gameweek ?? body.meta.gameweek_window[0] ?? null);
       setAppliedSettings(requestSettings);
@@ -1828,7 +1732,13 @@ export function FplDashboard({
   }, [initialManagerId, syncManagerById]);
 
   useEffect(() => {
-    setDecisionHistory(readDecisionHistory(window.localStorage));
+    const refreshHistory = () => setDecisionHistory(readDecisionHistory(window.localStorage));
+    const onStorage = (event: StorageEvent) => {
+      if (event.storageArea === window.localStorage && (event.key === null || event.key === DECISION_HISTORY_STORAGE_KEY || event.key === LEGACY_DECISION_HISTORY_STORAGE_KEY)) refreshHistory();
+    };
+    refreshHistory();
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
   }, []);
 
   useEffect(() => {
@@ -2186,11 +2096,13 @@ export function FplDashboard({
     URL.revokeObjectURL(url);
   }
 
-  function saveDeadlineDecision() {
+  async function saveDeadlineDecision() {
     if (!managerSync || !recommendation?.planner || syncError || isSyncing || recommendationIsStale || hasUnappliedChanges || !squadConfirmed) {
       setDecisionHistoryStatus("Opdatér og bekræft planen, før du gemmer beslutningen.");
       return;
     }
+    if (isSavingDecision) return;
+    setIsSavingDecision(true);
     try {
       const entry = buildDecisionHistoryEntry({
         target_deadline: managerSync.target.deadline_time,
@@ -2203,22 +2115,28 @@ export function FplDashboard({
         },
         planner: recommendation.planner,
         ai_review: aiReview,
+        selection: journalSelection,
+        manager_state: confirmedPlannerState() ?? undefined,
       });
-      const updated = upsertDecisionHistory(decisionHistory, entry);
-      if (!writeDecisionHistory(window.localStorage, updated)) {
-        setDecisionHistoryStatus("Browseren kunne ikke gemme journalen. Eksportér planen som JSON i stedet.");
-        return;
-      }
+      const updated = await saveDecisionHistoryEntry(window.localStorage, entry);
       setDecisionHistory(updated);
       setDecisionHistoryStatus(`Beslutningen til GW${entry.target_event} er gemt lokalt i denne browser.`);
-    } catch {
-      setDecisionHistoryStatus("Beslutningen kunne ikke valideres og blev ikke gemt.");
+    } catch (error) {
+      setDecisionHistoryStatus(error instanceof Error ? error.message : "Beslutningen kunne ikke gemmes. Eksportér journalen og prøv igen.");
+    } finally {
+      setIsSavingDecision(false);
     }
   }
 
   function exportDecisionHistory() {
-    if (decisionHistory.entries.length === 0) return;
-    const blob = new Blob([JSON.stringify(decisionHistory, null, 2)], { type: "application/json" });
+    const latest = readDecisionHistory(window.localStorage);
+    setDecisionHistory(latest);
+    if (latest.storage_error) {
+      setDecisionHistoryStatus(latest.storage_error);
+      return;
+    }
+    if (latest.entries.length === 0) return;
+    const blob = new Blob([JSON.stringify(latest, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
@@ -2817,6 +2735,15 @@ export function FplDashboard({
                 {recommendation.planner && (
                   <>
                     <TransferDecision action={recommendation.planner.best_action} horizon={recommendation.meta.horizon} />
+                    <PlanComparisonPanel
+                      planner={recommendation.planner}
+                      selection={journalSelection ?? {
+                        kind: aiReview?.review.verdict === "wait_for_information" ? "wait" : aiReview?.review.verdict === "prefer_alternative" ? "alternative" : "best",
+                        alternative_index: aiReview?.review.verdict === "prefer_alternative" ? aiReview.review.alternative_index : null,
+                      }}
+                      onSelect={setJournalSelection}
+                      disabled={recommendationIsStale || isLoading || isSavingDecision}
+                    />
                     {recommendation.planner.strategy ? (
                       <StrategyPlanPanel
                         strategy={recommendation.planner.strategy}
@@ -2844,9 +2771,9 @@ export function FplDashboard({
                     />
                     <DecisionHistoryPanel
                       history={decisionHistory}
-                      canSave={squadConfirmed && !syncError && !isSyncing && !recommendationIsStale && !hasUnappliedChanges && !isLoading && !isAiReviewing}
+                      canSave={squadConfirmed && !syncError && !isSyncing && !recommendationIsStale && !hasUnappliedChanges && !isLoading && !isAiReviewing && !isSavingDecision}
                       status={decisionHistoryStatus}
-                      onSave={saveDeadlineDecision}
+                      onSave={() => void saveDeadlineDecision()}
                       onExport={exportDecisionHistory}
                       onClear={removeDecisionHistory}
                     />
@@ -2893,7 +2820,6 @@ export function FplDashboard({
                   data={recommendation}
                   gameweek={activeLineup?.gameweek ?? recommendation.meta.gameweek_window[0]}
                 />
-                {recommendation.planner && <PlannerAlternatives actions={recommendation.planner.alternatives} />}
                 <div id="data"><DataCoverage data={recommendation} /></div>
 
                 <section className="method-panel" id="metode" aria-labelledby="method-heading">

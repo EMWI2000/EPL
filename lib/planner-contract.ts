@@ -196,6 +196,9 @@ export interface PlannerActionGameweek {
   captain_id: number;
   formation: string;
   projected_points: number;
+  /** Missing on older saved responses. Bench is ordered outfield first, reserve keeper last. */
+  vice_captain_id?: number;
+  bench_ids?: number[];
 }
 
 export type PlannerActionKind = "roll" | "transfer" | "hit";
@@ -1090,6 +1093,15 @@ function validateFormation(gameweek: UnknownRecord, path: string, squad: Map<num
   for (const id of starters) if (!squad.has(id)) fail(`${path}.starting_ids`, `contains player ${id} outside action squad`);
   const captain = integer(gameweek.captain_id, `${path}.captain_id`, 1);
   if (!starters.includes(captain)) fail(`${path}.captain_id`, "must be a starter");
+  if (gameweek.vice_captain_id !== undefined || gameweek.bench_ids !== undefined) {
+    const vice = integer(gameweek.vice_captain_id, `${path}.vice_captain_id`, 1);
+    if (vice === captain || !starters.includes(vice)) fail(`${path}.vice_captain_id`, "must be a different starter");
+    const bench = uniqueIntegers(gameweek.bench_ids, `${path}.bench_ids`, 4);
+    if (bench.some((id) => !squad.has(id) || starters.includes(id))) fail(`${path}.bench_ids`, "must contain the four non-starters");
+    if (bench.slice(0, 3).some((id) => squad.get(id)!.position === "GKP") || squad.get(bench[3])!.position !== "GKP") {
+      fail(`${path}.bench_ids`, "must list three ordered outfield reserves then the reserve keeper");
+    }
+  }
   const formation = text(gameweek.formation, `${path}.formation`);
   const counts = { GKP: 0, DEF: 0, MID: 0, FWD: 0 } satisfies Record<PlayerPosition, number>;
   for (const id of starters) counts[squad.get(id)!.position] += 1;
@@ -1115,7 +1127,8 @@ function validateAction(
     "decision_value_vs_roll", "explanation",
   ]);
   const kind = oneOf(row.kind, `${path}.kind`, ["roll", "transfer", "hit"] as const);
-  const transferCount = integer(row.transfer_count, `${path}.transfer_count`, 0, 5);
+  const transferCount = integer(row.transfer_count, `${path}.transfer_count`, 0, 6);
+  if (transferCount > Math.max(2, freeTransfers + 1)) fail(`${path}.transfer_count`, "exceeds the bounded immediate-transfer search");
   const transferValues = array(row.transfers, `${path}.transfers`);
   if (transferValues.length !== transferCount) fail(`${path}.transfers`, "length must match transfer_count");
   const actionSquad = new Map(confirmed);
@@ -1175,7 +1188,8 @@ function validateAction(
   if (gameweeks.length < 1 || gameweeks.length > 5) fail(`${path}.gameweeks`, "must contain one to five gameweeks");
   gameweeks.forEach((gameweek, index) => {
     const gameweekPath = `${path}.gameweeks[${index}]`;
-    const gw = exactRecord(gameweek, gameweekPath, ["gameweek", "starting_ids", "captain_id", "formation", "projected_points"]);
+    const extra = record(gameweek, gameweekPath).bench_ids !== undefined || record(gameweek, gameweekPath).vice_captain_id !== undefined;
+    const gw = exactRecord(gameweek, gameweekPath, ["gameweek", "starting_ids", "captain_id", "formation", "projected_points", ...(extra ? ["vice_captain_id", "bench_ids"] : [])]);
     validateFormation(gw, gameweekPath, actionSquad);
     const event = gw.gameweek as number;
     if (index === 0 && event !== targetEvent) fail(`${gameweekPath}.gameweek`, `must begin at target event ${targetEvent}`);
@@ -1202,6 +1216,18 @@ function resultingSquad(
     result.set(transfer.in_id, transfer.in);
   }
   return result;
+}
+
+function samePlannedLineup(left: PlannerActionGameweek, right: PlannerActionGameweek): boolean {
+  // Future strategy steps in older responses do not include the reserve details.
+  const core = (week: PlannerActionGameweek) => ({
+    gameweek: week.gameweek,
+    starting_ids: week.starting_ids,
+    captain_id: week.captain_id,
+    formation: week.formation,
+    projected_points: week.projected_points,
+  });
+  return sameJson(core(left), core(right));
 }
 
 function closeEnough(left: number, right: number): boolean {
@@ -1246,8 +1272,8 @@ function validateSequentialStep(
   literal(row.target_event, `${path}.target_event`, options.targetEvent);
 
   const kind = oneOf(row.kind, `${path}.kind`, ["roll", "transfer", "hit"] as const);
-  const transferCount = integer(row.transfer_count, `${path}.transfer_count`, 0, 5);
-  if (transferCount > (options.maximumTransfers ?? Math.max(2, options.freeTransfersBefore))) {
+  const transferCount = integer(row.transfer_count, `${path}.transfer_count`, 0, 6);
+  if (transferCount > (options.maximumTransfers ?? Math.max(2, options.freeTransfersBefore + 1))) {
     fail(`${path}.transfer_count`, "exceeds the bounded immediate-transfer search");
   }
   const transferValues = array(row.transfers, `${path}.transfers`);
@@ -1547,7 +1573,7 @@ function validateSequentialPlan(
     first.step.free_transfers_before === selectedAction.free_transfers_before &&
     first.step.free_transfers_next_gameweek === selectedAction.free_transfers_next_gameweek &&
     first.step.hit_points === selectedAction.hit_points &&
-    sameJson(first.step.gameweeks[0], selectedAction.gameweeks[0])
+    samePlannedLineup(first.step.gameweeks[0], selectedAction.gameweeks[0])
   );
   if (!firstStepMatchesSelectedAction) {
     fail(
@@ -1766,7 +1792,7 @@ function validateStrategyPlan(
       bankBefore,
       freeTransfersBefore,
       fixedPurchasePrices,
-      maximumTransfers: index === 0 ? Math.max(2, options.freeTransfers) : 2,
+      maximumTransfers: index === 0 ? Math.max(2, options.freeTransfers + 1) : 2,
     });
     const step = validated.step as unknown as PlannerStrategyStep;
     if (index === 0) {
@@ -1780,7 +1806,7 @@ function validateStrategyPlan(
         step.free_transfers_before === selectedAction.free_transfers_before &&
         step.free_transfers_next_gameweek === selectedAction.free_transfers_next_gameweek &&
         step.hit_points === selectedAction.hit_points &&
-        sameJson(step.gameweeks[0], selectedAction.gameweeks[0])
+        samePlannedLineup(step.gameweeks[0], selectedAction.gameweeks[0])
       );
       if (!matchesSelectedAction) {
         fail(path, "must exactly match the referenced visible action at the first deadline");
@@ -2264,8 +2290,8 @@ export function parsePlannerPayload(value: unknown): PlannerPayload {
   const candidateCount = integer(method.candidate_count, "planner.method.candidate_count", 15);
   literal(method.plans_per_transfer_count, "planner.method.plans_per_transfer_count", 5);
   literal(method.higher_transfer_count_plans, "planner.method.higher_transfer_count_plans", 1);
-  const maximumImmediateTransfers = integer(method.maximum_immediate_transfers, "planner.method.maximum_immediate_transfers", 2, 5);
-  if (maximumImmediateTransfers !== Math.max(2, freeTransfers)) fail("planner.method.maximum_immediate_transfers", "must cover all available free transfers");
+  const maximumImmediateTransfers = integer(method.maximum_immediate_transfers, "planner.method.maximum_immediate_transfers", 2, 6);
+  if (![Math.max(2, freeTransfers), Math.max(2, freeTransfers + 1)].includes(maximumImmediateTransfers)) fail("planner.method.maximum_immediate_transfers", "must describe the current or legacy bounded search");
   if ([best, ...parsedAlternatives].some((action) => action.transfer_count > maximumImmediateTransfers)) fail("planner.method.maximum_immediate_transfers", "must cover every returned action");
   const rollFtValuePoints = finiteNumber(method.roll_ft_value_points, "planner.method.roll_ft_value_points", 0);
   const chipsModelled = boolean(method.chips_modelled, "planner.method.chips_modelled");

@@ -39,6 +39,7 @@ from fpl_app.logic.rolling_transfers import (
     DEFAULT_SOLVER_BUDGET_SECONDS as DEFAULT_ROLLING_SOLVER_BUDGET_SECONDS,
     RollingTransferError,
     TransferPlan,
+    maximum_immediate_transfer_count,
     optimize_rolling_transfers,
 )
 from fpl_app.logic.sequential_transfers import (
@@ -857,6 +858,7 @@ def _serialize_transfer_action(
         - float(plan.hit_points)
         - float(roll.projected_points)
     )
+    lineups = _transfer_plan_as_squad_result(plan, pool, horizon=len(window)).gameweeks
     return {
         "kind": kind,
         "transfer_count": int(plan.transfer_count),
@@ -866,6 +868,8 @@ def _serialize_transfer_action(
             {
                 **gameweek.as_dict(),
                 "gameweek": int(window[index]),
+                "vice_captain_id": int(lineups[index].vice_captain_id),
+                "bench_ids": [int(player_id) for player_id in lineups[index].bench_ids],
             }
             for index, gameweek in enumerate(plan.gameweeks)
         ],
@@ -1441,7 +1445,7 @@ def _build_weekly_plan(
             ),
             "plans_per_transfer_count": 5,
             "higher_transfer_count_plans": 1,
-            "maximum_immediate_transfers": max(2, int(state.free_transfers)),
+            "maximum_immediate_transfers": maximum_immediate_transfer_count(int(state.free_transfers)),
             "roll_ft_value_points": _round(rolling.roll_ft_value_points),
             "chips_modelled": chip_result is not None,
             "bounded_roadmap_modelled": strategy_result is not None,
