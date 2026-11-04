@@ -1942,6 +1942,7 @@ function validateChipStrategy(
     requireSorted: false,
   });
   const inventoryByChip = new Map(inventory.map((entry) => [entry.chip, entry]));
+  const chipWindowEnd = options.strategy.gameweek_window[0] <= 19 ? 19 : 38;
   const roadmapGameweeks = new Map(
     options.strategy.steps.flatMap((step) => step.gameweeks).map((gameweek) => [
       gameweek.gameweek,
@@ -1976,7 +1977,7 @@ function validateChipStrategy(
     const scenarioId = text(row.scenario_id, `${path}.scenario_id`);
     const event = row.event === null
       ? null
-      : integer(row.event, `${path}.event`, options.strategy.gameweek_window[0], options.strategy.gameweek_window.at(-1));
+      : integer(row.event, `${path}.event`, options.strategy.gameweek_window[0], Math.min(chipWindowEnd, options.strategy.gameweek_window.at(-1)!));
     const signal = oneOf(row.signal, `${path}.signal`, ["hold", "watch", "consider"] as const);
     const available = boolean(row.available, `${path}.available`);
     const confidence = oneOf(row.confidence, `${path}.confidence`, ["low", "medium"] as const);
@@ -1992,7 +1993,7 @@ function validateChipStrategy(
     const expectedAvailability = chip === "wildcard"
       ? inventoryEntry.available_for_target
       : options.strategy.gameweek_window.some((candidateEvent) =>
-          chipAvailableAt(chip, candidateEvent, inventoryEntry.used_events),
+          candidateEvent <= chipWindowEnd && chipAvailableAt(chip, candidateEvent, inventoryEntry.used_events),
         );
     if (available !== expectedAvailability) {
       fail(`${path}.available`, "is inconsistent with inventory and the strategy window");

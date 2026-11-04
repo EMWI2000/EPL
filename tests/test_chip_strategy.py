@@ -172,6 +172,79 @@ def test_used_chip_is_unavailable_only_in_its_used_half() -> None:
     assert {scenario.chip: scenario for scenario in first_half.scenarios}["3xc"].available is False
 
 
+@pytest.mark.parametrize("target_event", [18, 19])
+def test_current_chip_scenarios_ignore_stronger_next_half_opportunities(target_event) -> None:
+    players = _players()
+    last_current_offset = 20 - target_event
+    first_next_offset = last_current_offset + 1
+    players.loc[players["id"] == 8, f"ep_gw{last_current_offset}"] = 15.0
+    players.loc[players["id"].isin([2, 6, 7, 15]), f"ep_gw{last_current_offset}"] = 10.0
+    players[f"ep_gw{first_next_offset}"] = 100.0
+    players.loc[players["id"] == 1, "is_blank_gw1"] = True
+    players[f"is_dgw_gw{first_next_offset}"] = True
+
+    result = evaluate_chip_strategy(
+        players, _roadmap(), target_event=target_event, chip_usage=_usage(),
+        current_squad_ids=tuple(range(1, 16)), bank_tenths=0, free_transfers=1,
+        chip_solver_budget_seconds=2.0,
+    )
+    scenarios = {scenario.chip: scenario for scenario in result.scenarios}
+    assert scenarios["3xc"].event == 19
+    assert scenarios["3xc"].estimated_gain_points == 15.0
+    assert scenarios["bboost"].event == 19
+    assert scenarios["bboost"].estimated_gain_points == pytest.approx(37.4)
+    assert scenarios["freehit"].event == target_event
+    assert all(scenario.event is None or scenario.event <= 19 for scenario in result.scenarios)
+
+
+@pytest.mark.parametrize("target_event", [18, 19])
+def test_used_current_chips_are_not_replaced_by_next_half_inventory(target_event) -> None:
+    players = _players()
+    first_next_offset = 21 - target_event
+    players[f"ep_gw{first_next_offset}"] = 100.0
+    players[f"is_dgw_gw{first_next_offset}"] = True
+    result = evaluate_chip_strategy(
+        players, _roadmap(), target_event=target_event,
+        chip_usage=_usage(wildcard=(2,), freehit=(3,), bboost=(4,), **{"3xc": (5,)}),
+        current_squad_ids=tuple(range(1, 16)), bank_tenths=0, free_transfers=1,
+        chip_solver_budget_seconds=2.0,
+    )
+    assert all(not entry.available_for_target for entry in result.inventory)
+    assert all(not scenario.available and scenario.event is None for scenario in result.scenarios)
+    assert result.recommendation.event is None
+
+
+@pytest.mark.parametrize("target_event", [18, 19])
+def test_only_next_half_blank_or_double_does_not_trigger_current_free_hit(target_event) -> None:
+    players = _players()
+    players[f"is_dgw_gw{21 - target_event}"] = True
+    result = evaluate_chip_strategy(
+        players, _roadmap(), target_event=target_event, chip_usage=_usage(),
+        current_squad_ids=tuple(range(1, 16)), bank_tenths=0, free_transfers=1,
+        chip_solver_budget_seconds=2.0,
+    )
+    free_hit = next(scenario for scenario in result.scenarios if scenario.chip == "freehit")
+    assert free_hit.available is True
+    assert free_hit.event is None
+    assert free_hit.estimated_gain_points is None
+    assert free_hit.signal == "hold"
+
+
+def test_new_chip_half_is_available_despite_usage_in_previous_half() -> None:
+    players = _players()
+    players["is_dgw_gw2"] = True
+    result = evaluate_chip_strategy(
+        players, _roadmap(), target_event=20,
+        chip_usage=_usage(wildcard=(2,), freehit=(3,), bboost=(4,), **{"3xc": (5,)}),
+        current_squad_ids=tuple(range(1, 16)), bank_tenths=0, free_transfers=1,
+        chip_solver_budget_seconds=2.0,
+    )
+    assert all(entry.available_for_target for entry in result.inventory)
+    assert all(scenario.available for scenario in result.scenarios)
+    free_hit = next(scenario for scenario in result.scenarios if scenario.chip == "freehit")
+    assert free_hit.event == 21
+
+
 def test_confirmed_blank_or_double_creates_only_a_free_hit_watchpoint() -> None:
     players = _players()
     players["is_blank_gw3"] = True
