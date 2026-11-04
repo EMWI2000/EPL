@@ -8,6 +8,8 @@ import type { PlanChoice } from "@/lib/plan-comparison";
 import { AccountControl } from "@/components/account-control";
 import { LeagueOverviewPanel } from "@/components/league-overview-panel";
 import { ChipSequencePanel } from "@/components/chip-sequence-panel";
+import { ChipRulesPanel } from "@/components/chip-rules-panel";
+import { buildChipPolicy, type ChipPolicy } from "@/lib/chip-policy";
 import { ForecastAuditPanel } from "@/components/forecast-audit-panel";
 import type { ForecastAuditCapture } from "@/lib/forecast-audit";
 import {
@@ -826,9 +828,13 @@ function ChipScenarioCard({
 function StrategyPlanPanel({
   strategy,
   chipStrategy,
+  chipPolicy,
+  chipEvidenceCurrent,
 }: {
   strategy: PlannerStrategyPlan;
   chipStrategy: PlannerChipStrategy | null;
+  chipPolicy: ChipPolicy | null;
+  chipEvidenceCurrent: boolean;
 }) {
   const firstStep = strategy.steps[0];
   const futureSteps = strategy.steps.slice(1);
@@ -915,8 +921,8 @@ function StrategyPlanPanel({
         <section className="chip-strategy" aria-labelledby="chip-strategy-heading">
           <div className="strategy-plan__subheading">
             <div>
-              <p className="eyebrow">Chipscenarier</p>
-              <h3 id="chip-strategy-heading">Gem, følg eller overvej</h3>
+              <p className="eyebrow">Modelberegning</p>
+              <h3 id="chip-strategy-heading">Scenarier for dine chips</h3>
             </div>
             <span>Ingen chip aktiveres i appen</span>
           </div>
@@ -924,9 +930,13 @@ function StrategyPlanPanel({
             <>
               <div className={classNames("chip-strategy__recommendation", `chip-strategy__recommendation--${chipStrategy.recommendation.action}`)}>
                 <strong>{chipStrategy.recommendation.action === "consider" && chipStrategy.recommendation.chip
-                  ? `Overvej ${chipNames[chipStrategy.recommendation.chip]}${chipStrategy.recommendation.event ? ` i GW${chipStrategy.recommendation.event}` : ""}`
-                  : "Hold chips"}</strong>
-                <span>{chipStrategy.recommendation.reason}</span>
+                  ? `Beregnet mulighed · ${chipNames[chipStrategy.recommendation.chip]}${chipStrategy.recommendation.event ? ` i GW${chipStrategy.recommendation.event}` : ""}`
+                  : "Scenariet vælger ingen chip nu"}</strong>
+                <span>{!chipEvidenceCurrent
+                  ? "Denne beregning skal opdateres med din bekræftede trup. Se chipregler og udløb i overblikket ovenfor."
+                  : chipStrategy.recommendation.action !== "consider" && chipPolicy && ["urgent", "review", "consider"].includes(chipPolicy.status)
+                    ? "Chipreglerne kræver en ny vurdering af planen. Se det aktuelle holdepunkt og udløb i overblikket ovenfor."
+                    : chipStrategy.recommendation.reason}</span>
               </div>
               <div className="chip-strategy__grid">
                 {chipOrder.map((chip) => chipStrategy.scenarios.find((scenario) => scenario.chip === chip))
@@ -937,7 +947,7 @@ function StrategyPlanPanel({
               </div>
             </>
           ) : (
-            <p className="chip-strategy__unavailable"><InfoIcon /> Chipscenarierne kunne ikke bevises inden for denne beregnings tidsbudget. Behold chips og beregn igen ved næste deadline.</p>
+            <p className="chip-strategy__unavailable"><InfoIcon /> Chipscenarierne kunne ikke bevises inden for beregningens tidsbudget. Se chipregler og udløb i overblikket ovenfor, og genberegn før du vælger.</p>
           )}
         </section>
       </div>
@@ -1538,6 +1548,7 @@ export function FplDashboard({
     initialManagerId === null ? "" : String(initialManagerId),
   );
   const [managerSync, setManagerSync] = useState<ManagerSyncResponse | null>(null);
+  const [chipNow, setChipNow] = useState(Date.now);
   const [bankInput, setBankInput] = useState("0,0");
   const [freeTransfers, setFreeTransfers] = useState(1);
   const [squadSourceChoice, setSquadSourceChoice] = useState<SquadSourceChoice>(null);
@@ -1568,6 +1579,21 @@ export function FplDashboard({
   const aiAbortRef = useRef<AbortController | null>(null);
   const aiRequestKeyRef = useRef<string | null>(null);
   const recommendationIsStale = Boolean(error && recommendation);
+  const chipDeadlineTime = Date.parse(managerSync?.target.deadline_time ?? "");
+  useEffect(() => {
+    if (!Number.isFinite(chipDeadlineTime)) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const refreshClock = () => {
+      clearTimeout(timer);
+      const now = Date.now();
+      setChipNow(now);
+      const remaining = chipDeadlineTime - now;
+      if (remaining > 0) timer = setTimeout(refreshClock, Math.min(remaining + 1, 2_147_483_647));
+    };
+    refreshClock();
+    window.addEventListener("focus", refreshClock);
+    return () => { clearTimeout(timer); window.removeEventListener("focus", refreshClock); };
+  }, [chipDeadlineTime]);
 
   const clearAiReview = useCallback(() => {
     aiAbortRef.current?.abort();
@@ -1992,6 +2018,22 @@ export function FplDashboard({
         })())
     );
   }, [analysisMode, appliedMode, settings, appliedSettings, recommendation, bankInput, freeTransfers, squadConfirmed, managerIdInput, managerSync, currentSquadIds, currentPlayerPrices]);
+
+  const chipEvidenceCurrent = Boolean(
+    analysisMode === "weekly" && managerSync && recommendation?.planner
+    && recommendation.planner.manager_id === managerSync.manager.id
+    && recommendation.planner.target_event === managerSync.target.event
+    && !isLoading && !syncError && !isSyncing && !recommendationIsStale
+    && !hasUnappliedChanges && squadConfirmed
+    && chipDeadlineTime > Math.max(chipNow, Date.now())
+  );
+  const chipPolicy = analysisMode === "weekly" && managerSync ? buildChipPolicy({
+    targetEvent: managerSync.target.event,
+    chips: managerSync.manual_state_template.state.chips,
+    chipUsage: managerSync.manual_state_template.state.chip_usage,
+    strategy: chipEvidenceCurrent ? recommendation?.planner?.chip_strategy ?? null : null,
+    evidenceCurrent: chipEvidenceCurrent,
+  }) : null;
 
   function runCurrentAnalysis() {
     if (analysisMode === "weekly") {
@@ -2701,6 +2743,10 @@ export function FplDashboard({
           </aside>
 
           <div className="results" id="hold">
+            {chipPolicy && <ChipRulesPanel policy={chipPolicy}
+              inventoryConfirmed={squadConfirmed && !syncError && !isSyncing && chipDeadlineTime > Math.max(chipNow, Date.now())}
+              deadlinePassed={chipDeadlineTime <= Math.max(chipNow, Date.now())}
+              inventoryRefreshing={isSyncing} />}
             {isLoading && !recommendation && <ResultSkeleton />}
             {error && !recommendation && <ErrorState message={error} onRetry={runCurrentAnalysis} />}
             {!isLoading && !error && !recommendation && (
@@ -2748,6 +2794,8 @@ export function FplDashboard({
                       <StrategyPlanPanel
                         strategy={recommendation.planner.strategy}
                         chipStrategy={recommendation.planner.chip_strategy}
+                        chipPolicy={chipPolicy}
+                        chipEvidenceCurrent={chipEvidenceCurrent}
                       />
                     ) : recommendation.planner.sequential ? (
                       <SequentialPlanPanel plan={recommendation.planner.sequential} planner={recommendation.planner} />

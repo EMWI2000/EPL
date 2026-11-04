@@ -252,6 +252,16 @@ def _available_for_event(
     )
 
 
+def _current_chip_half_offsets(target_event: int, horizon: int) -> range:
+    # Team-chip windows cover every GW, including GW1 before transfer chips
+    # become available. All four chips expire at the same half boundary.
+    current_window = chip_window(Chip.BENCH_BOOST, target_event)
+    if current_window is None:
+        raise ChipStrategyError("target_event is outside the chip windows")
+    last_offset = min(horizon, current_window.last_gameweek - target_event + 1)
+    return range(1, last_offset + 1)
+
+
 def _lineup_scenarios(
     players: pd.DataFrame,
     roadmap: BoundedStrategyResult,
@@ -266,7 +276,7 @@ def _lineup_scenarios(
 
     tc_candidates: list[tuple[float, int, float, int, str]] = []
     bb_candidates: list[tuple[float, int, float, tuple[int, ...], str]] = []
-    for offset in range(1, roadmap.horizon + 1):
+    for offset in _current_chip_half_offsets(target_event, roadmap.horizon):
         event = target_event + offset - 1
         squad_ids, gameweek = gameweeks[offset]
         starters = tuple(int(value) for value in gameweek.starting_ids)
@@ -334,8 +344,8 @@ def _lineup_scenarios(
             confidence=confidence,
             model_scope="captain_marginal",
             reason=(
-                "Bedste anfører-margin i den aktuelle prognosehorisont; "
-                "startstatus og kampinformation skal genbekræftes ved deadline."
+                "Bedste anfører-margin i prognosehorisonten inden chipsættets udløb. "
+                "Startstatus og kampinformation skal genbekræftes ved deadline."
             ),
         )
     else:
@@ -363,7 +373,7 @@ def _lineup_scenarios(
             confidence=confidence,
             model_scope="bench_marginal",
             reason=(
-                "Bedste bænk-margin i roadmapet efter fradrag for den normale "
+                "Bedste bænk-margin inden chipsættets udløb efter fradrag for den normale "
                 "forventede indskiftningsværdi."
             ),
         )
@@ -496,11 +506,11 @@ def _free_hit_scenario(
     eligible_transfer_in_ids: frozenset[int],
     solver_budget_seconds: float,
 ) -> ChipScenario:
-    available_events = [
-        event
-        for event in range(target_event, target_event + roadmap.horizon)
-        if _available_for_event(Chip.FREE_HIT, event, usage)
-    ]
+    available_events = {
+        target_event + offset - 1
+        for offset in _current_chip_half_offsets(target_event, roadmap.horizon)
+        if _available_for_event(Chip.FREE_HIT, target_event + offset - 1, usage)
+    }
     if not available_events:
         return ChipScenario(
             scenario_id="freehit-unavailable",
@@ -517,10 +527,8 @@ def _free_hit_scenario(
         )
 
     triggered: list[tuple[int, int]] = []
-    for offset, event in enumerate(
-        range(target_event, target_event + roadmap.horizon),
-        start=1,
-    ):
+    for offset in _current_chip_half_offsets(target_event, roadmap.horizon):
+        event = target_event + offset - 1
         if event not in available_events:
             continue
         blank_column = f"is_blank_gw{offset}"
@@ -544,7 +552,7 @@ def _free_hit_scenario(
             model_scope="confirmed_blank_double_screen",
             reason=(
                 "Der er ingen officielt placeret blank eller double gameweek i "
-                "prognosevinduet, så Free Hit bør gemmes."
+                "prognosevinduet inden det aktuelle chipsæts udløb."
             ),
         )
 
@@ -693,7 +701,8 @@ def evaluate_chip_strategy(
     free_hit_triggered = any(
         bool(players[f"is_blank_gw{offset}"].any())
         or bool(players[f"is_dgw_gw{offset}"].any())
-        for offset in range(1, roadmap.horizon + 1)
+        for offset in _current_chip_half_offsets(target_event, roadmap.horizon)
+        if _available_for_event(Chip.FREE_HIT, target_event + offset - 1, usage)
     )
     free_hit_reserve = 1.0 if free_hit_triggered else 0.0
     sequence_reserve = min(0.75, solver_budget * 0.3)

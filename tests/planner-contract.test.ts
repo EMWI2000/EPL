@@ -908,6 +908,49 @@ test("roadmap validation rejects a broken window, first action, provisional flag
   assert.throws(() => parsePlannerPayload(wrongTotal), /does not reconcile/);
 });
 
+test("chip scenarios stay in the current chip set when the forecast crosses GW19", () => {
+  const payload = plannerPayload();
+  payload.strategy = strategyPlan(payload);
+  payload.chip_strategy = chipStrategy(payload);
+  payload.method.bounded_roadmap_modelled = true;
+  payload.method.chips_modelled = true;
+  payload.method.next_deadline_transfer_modelled = true;
+  payload.source_event += 11;
+  payload.target_event += 11;
+  for (const action of [payload.best_action, ...payload.alternatives]) {
+    for (const week of action.gameweeks) week.gameweek += 11;
+  }
+  payload.strategy.gameweek_window = payload.strategy.gameweek_window.map((event: number) => event + 11);
+  for (const step of payload.strategy.steps) {
+    step.target_event += 11;
+    for (const week of step.gameweeks) week.gameweek += 11;
+  }
+  payload.chip_strategy.target_event += 11;
+  for (const scenario of payload.chip_strategy.scenarios) {
+    if (scenario.event !== null) {
+      scenario.event += 11;
+      scenario.scenario_id = `${scenario.chip}-gw${scenario.event}`;
+    }
+  }
+  payload.chip_strategy.recommendation.event += 11;
+  payload.chip_strategy.recommendation.scenario_id = "3xc-gw18";
+  assert.equal(parsePlannerPayload(payload).chip_strategy?.scenarios[2].event, 19);
+
+  const nextHalf = structuredClone(payload);
+  nextHalf.chip_strategy.scenarios[2].event = 20;
+  nextHalf.chip_strategy.scenarios[2].scenario_id = "bboost-gw20";
+  assert.throws(() => parsePlannerPayload(nextHalf), /scenarios\[2\].event/);
+
+  const used = structuredClone(payload);
+  used.chip_strategy.inventory[2].used_events = [10];
+  used.chip_strategy.inventory[2].available_for_target = false;
+  Object.assign(used.chip_strategy.scenarios[2], {
+    scenario_id: "bboost-unavailable", event: null, signal: "hold", available: false,
+    estimated_gain_points: null, baseline_points: null, chip_points: null, confidence: "low",
+  });
+  assert.equal(parsePlannerPayload(used).chip_strategy?.scenarios[2].available, false);
+});
+
 test("chip strategy validation rejects inventory, scenario and recommendation contradictions", () => {
   const wrongAvailability = plannerPayload();
   wrongAvailability.strategy = strategyPlan(wrongAvailability);
