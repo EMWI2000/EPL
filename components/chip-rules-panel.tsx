@@ -3,6 +3,7 @@
 import { useId } from "react";
 import type { ChipPolicy } from "@/lib/chip-policy";
 import type { ChipName } from "@/lib/planner-contract";
+import { WildcardBenchmarkPanel } from "@/components/wildcard-benchmark-panel";
 import styles from "./chip-rules-panel.module.css";
 
 const chipNames: Record<ChipName, string> = {
@@ -67,6 +68,7 @@ export function ChipRulesPanel({ policy, inventoryConfirmed, inventoryRefreshing
       </dl>
       <p className={styles.note}>Gevinsterne er vægtede nettopoint fra modelscenarier med samme horisont. Sammenhold dem med mindst fire planlagte spillerændringer og grænsen på 15 point.</p>
     </div>}
+    <WildcardBenchmarkPanel key={`${policy.half}-${policy.targetEvent}`} targetEvent={policy.targetEvent} half={policy.half} />
     <details className={styles.rules}>
       <summary>Se chipreglerne, der bruges ved hver deadline</summary>
       <p>Én chip pr. runde. Ubrugte chips udløber med sættet. Modellen kvalificerer tidspunktet med din trup og de kendte kampe.</p>

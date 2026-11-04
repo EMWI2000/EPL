@@ -1,0 +1,52 @@
+.panel { margin-top: 22px; border: 1px solid var(--line); border-radius: 12px; background: var(--paper); }
+.panel > summary { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 18px; padding: 17px 18px; cursor: pointer; color: var(--forest); }
+.panel > summary > span { font-weight: 750; }
+.panel > summary > small { font-size: .76rem; color: var(--ink-soft); }
+.panel > summary::after { content: "+"; font-weight: 700; }
+.panel[open] > summary::after { content: "−"; }
+.panel > summary:focus-visible, .method summary:focus-visible { outline: 3px solid rgba(117, 89, 232, .38); outline-offset: 3px; border-radius: 8px; }
+.body { padding: 2px 18px 18px; }
+.header { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+.header h3 { margin: 5px 0 0; font-size: 1.14rem; line-height: 1.3; max-width: 33ch; }
+.eyebrow { margin: 0; color: var(--forest-mid); font-size: .69rem; font-weight: 750; letter-spacing: .06em; text-transform: uppercase; }
+.refresh { flex-shrink: 0; padding: 9px 11px; border: 1px solid var(--line-strong); background: var(--card); color: var(--forest); border-radius: 8px; font-size: .74rem; font-weight: 650; cursor: pointer; }
+.refresh:disabled { opacity: .6; cursor: wait; }
+.intro, .notice, .secondary, .method { color: var(--ink-soft); font-size: .82rem; line-height: 1.6; }
+.intro { max-width: 74ch; }
+.error, .warning { padding: 12px 14px; font-size: .82rem; line-height: 1.6; border-radius: 8px; }
+.error { background: #f9ece9; color: var(--danger); }
+.warning { background: var(--warning-soft); color: #75400e; }
+.horizons { display: flex; gap: 7px; border: 0; padding: 0; margin: 20px 0 10px; }
+.horizons legend { padding: 0; margin-bottom: 8px; color: var(--ink-soft); font-size: .75rem; }
+.horizons label { position: relative; display: inline-flex; cursor: pointer; }
+.horizons input { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; }
+.horizons span { padding: 9px 16px; background: var(--card); color: var(--ink-soft); border: 1px solid var(--line-strong); border-radius: 20px; font-size: .8rem; font-weight: 650; }
+.horizons input:checked + span { color: white; background: var(--forest); border-color: var(--forest); }
+.horizons input:focus-visible + span { outline: 3px solid rgba(117, 89, 232, .5); outline-offset: 3px; }
+.sample { font-size: .72rem; color: var(--ink-soft); }
+.metricHeading { margin: 20px 0 10px; font-size: .88rem; }
+.metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 10px; margin: 0; }
+.metrics > div { padding: 15px 12px; border-radius: 10px; background: var(--card); border: 1px solid var(--line); }
+.metrics > div:first-child { background: var(--mint); border-color: #cde0d5; }
+.metrics dt { font-size: .74rem; color: var(--ink-soft); }
+.metrics dd { margin: 8px 0 0; font-size: 1.5rem; font-weight: 750; color: var(--forest); font-variant-numeric: tabular-nums; }
+.metrics dd small { font-weight: 500; font-size: .71rem; }
+.metrics .range { font-size: 1.14rem; }
+.metrics div > small { display: block; margin-top: 4px; font-size: .66rem; color: var(--ink-soft); }
+.secondary { padding-top: 12px; border-top: 1px solid var(--line); }
+.own { margin-top: 18px; padding: 14px 16px; border-left: 3px solid var(--forest-mid); background: var(--card); }
+.own h4 { margin: 0; font-size: .88rem; }
+.own p { margin: 7px 0 0; font-size: .83rem; line-height: 1.6; }
+.method { margin: 17px 0; }
+.method summary { width: fit-content; color: var(--forest); font-weight: 650; cursor: pointer; }
+.method li { margin-top: 4px; }
+.limit { color: var(--ink-soft); font-size: .76rem; line-height: 1.6; padding-top: 12px; border-top: 1px solid var(--line); }
+.source { color: var(--ink-soft); font-size: .67rem; line-height: 1.5; }
+@media (max-width: 600px) {
+  .header { flex-direction: column; }
+  .metrics { grid-template-columns: 1fr; }
+  .metrics > div { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 7px 16px; }
+  .metrics dd { margin: 0; }
+  .metrics div > small { width: 100%; margin: 0; }
+  .horizons span { padding: 9px 13px; }
+}
