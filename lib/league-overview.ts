@@ -30,7 +30,7 @@ const chipNames = ["wildcard", "freehit", "bboost", "3xc"];
 
 const MAX_STANDINGS_PAGES = 20;
 
-async function loadStandings(id: number, rank: number, get: ReturnType<typeof createLeagueFetcher>) {
+export async function loadLeagueStandings(id: number, rank: number, get: ReturnType<typeof createLeagueFetcher>) {
   const payloads: unknown[] = [];
   const pages: number[] = [];
   let complete = false;
@@ -105,7 +105,7 @@ export async function loadLeagueOverview(
   };
   const [ownPicksRaw, ownHistory, standings, live] = await Promise.all([
     picks(managerId), history(managerId),
-    Promise.all(selected.map(l => loadStandings(Number(l.id), Number(l.entry_rank), get))),
+    Promise.all(selected.map(l => loadLeagueStandings(Number(l.id), Number(l.entry_rank), get))),
     sourceFinalized
       ? get(`event/${sourceEvent}/live/`).catch(() => null) : Promise.resolve(null),
   ]);
