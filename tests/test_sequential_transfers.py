@@ -258,6 +258,25 @@ def test_rolls_first_then_makes_the_deferred_second_deadline_transfer() -> None:
     _assert_step_is_legal(players, second)
 
 
+def test_two_free_transfers_can_fund_three_transfers_at_either_deadline() -> None:
+    players = _pool()
+    players.loc[players["id"].isin([101, 102, 103]), "ep_gw2"] = 30.0
+    first = _first_plan(players, ((3, 101), (8, 102), (13, 103)), free_transfers=2)
+    immediate = optimize_two_deadline_sequence(players, (first,), horizon=2)
+    assert immediate.best_sequence.steps[0].transfer_count == 3
+    assert immediate.best_sequence.steps[0].hit_points == 4
+    assert immediate.best_sequence.steps[0].free_transfers_next_gameweek == 1
+
+    roll = _first_plan(players, free_transfers=1)
+    deferred = optimize_two_deadline_sequence(players, (roll,), horizon=2)
+    future = deferred.best_sequence.steps[1]
+    assert future.free_transfers_before == 2
+    assert future.transfer_count == 3
+    assert future.hit_points == 4
+    assert future.free_transfers_next_gameweek == 1
+    _assert_step_is_legal(players, future)
+
+
 def test_zero_free_transfers_is_legal_only_at_the_first_deadline() -> None:
     players = _pool()
     roll = _first_plan(players, free_transfers=0)

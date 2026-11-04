@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from itertools import combinations
 
 import pandas as pd
 import pulp
@@ -69,6 +70,85 @@ def _assert_legal(frame: pd.DataFrame, plan) -> None:
         assert 2 <= counts["MID"] <= 5
         assert 1 <= counts["FWD"] <= 3
         assert gameweek.captain_id in gameweek.starting_ids
+
+
+def _exhaustive_one_week_score(frame: pd.DataFrame, squad_ids: tuple[int, ...]) -> float:
+    rows = frame.set_index("id").loc[list(squad_ids)].to_dict("index")
+    scores = []
+    for starting_ids in combinations(squad_ids, 11):
+        positions = Counter(rows[player_id]["pos"] for player_id in starting_ids)
+        if not (
+            positions["GKP"] == 1
+            and 3 <= positions["DEF"] <= 5
+            and 2 <= positions["MID"] <= 5
+            and 1 <= positions["FWD"] <= 3
+        ):
+            continue
+        score = sum(rows[player_id]["ep_gw1"] for player_id in starting_ids)
+        score += max(rows[player_id]["ep_gw1"] for player_id in starting_ids)
+        score += sum(
+            rows[player_id]["ep_gw1"]
+            * (0.02 if rows[player_id]["pos"] == "GKP" else 0.08)
+            for player_id in set(squad_ids) - set(starting_ids)
+        )
+        scores.append(score)
+    return max(scores)
+
+
+def test_same_purchase_keeps_every_distinct_sale_and_matches_exhaustive_lineups() -> None:
+    players, squad_ids = _pool()
+    players = players[players["id"].isin([*squad_ids, 106])].copy()
+    midfielders = [8, 9, 10, 11, 12]
+    for player_id in midfielders:
+        players.loc[players["id"] == player_id, "ep_gw1"] = player_id - 5
+    players.loc[players["id"] == 106, "ep_gw1"] = 12.0
+    players.loc[
+        players["id"] == 8, ["purchase_price", "now_cost", "selling_price"]
+    ] = [60, 67, 63]
+    players.loc[
+        players["id"] == 9, ["purchase_price", "now_cost", "selling_price"]
+    ] = [50, 59, 54]
+
+    result = optimize_rolling_transfers(
+        players, squad_ids, bank_tenths=0, free_transfers=1, horizon=1,
+        plans_per_transfer_count=5, roll_ft_value_points=0,
+    )
+    plans = [plan for plan in (result.best_action, *result.alternatives) if plan.transfers]
+    assert len(plans) == 5
+    assert {(plan.transfers[0].out_id, plan.transfers[0].in_id) for plan in plans} == {
+        (out_id, 106) for out_id in midfielders
+    }
+    assert len({plan.squad_ids for plan in plans}) == 5
+    by_id = players.set_index("id")
+    for plan in plans:
+        assert plan.projected_points == pytest.approx(
+            _exhaustive_one_week_score(players, plan.squad_ids), abs=0.001
+        )
+        out_id = plan.transfers[0].out_id
+        assert plan.bank_after_tenths == by_id.at[out_id, "selling_price"] - 50
+        assert plan.hit_points == 0
+    assert result.best_action.transfers[0].out_id == 8
+
+
+@pytest.mark.parametrize("free_transfers", [2, 5])
+def test_one_extra_paid_transfer_is_compared_with_best_free_package(free_transfers) -> None:
+    players, squad_ids = _pool()
+    upgrades = [103, 106, 109, 104, 107, 110][: free_transfers + 1]
+    players.loc[players["id"].isin(upgrades), "ep_gw1"] = 20.0
+
+    result = optimize_rolling_transfers(
+        players, squad_ids, bank_tenths=0, free_transfers=free_transfers,
+        horizon=1, plans_per_transfer_count=1, roll_ft_value_points=0,
+    )
+    paid = result.best_action
+    assert paid.transfer_count == free_transfers + 1
+    assert paid.hit_points == 4
+    assert paid.free_transfers_next_gameweek == 1
+    assert paid.decision_value_points == pytest.approx(
+        _exhaustive_one_week_score(players, paid.squad_ids) - 4, abs=0.001
+    )
+    assert any(plan.transfer_count == free_transfers and plan.hit_points == 0 for plan in result.alternatives)
+    assert all(plan.transfer_count <= free_transfers + 1 for plan in result.alternatives)
 
 
 def test_roll_is_best_when_transfers_do_not_improve_the_squad() -> None:
@@ -300,6 +380,7 @@ def test_five_free_transfers_are_evaluated_with_one_bounded_plan_each() -> None:
     assert counts[3] == 1
     assert counts[4] == 1
     assert counts[5] == 1
+    assert counts[6] == 1
 
 
 def test_each_cbc_solve_uses_only_the_remaining_global_budget(monkeypatch) -> None:
@@ -355,8 +436,8 @@ def test_solver_covers_every_transfer_count_before_extra_alternatives(monkeypatc
         solver=solver,
     )
 
-    assert solve_order[:6] == [0, 1, 2, 3, 4, 5]
-    assert solve_order[6:] == [1, 1, 1, 1, 2, 2, 2, 2]
+    assert solve_order[:7] == [0, 1, 2, 3, 4, 5, 6]
+    assert solve_order[7:] == [1, 1, 1, 1, 2, 2, 2, 2]
 
 
 def test_coverage_fails_closed_when_budget_expires_before_next_count(monkeypatch) -> None:

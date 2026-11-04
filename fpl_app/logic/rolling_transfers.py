@@ -1,8 +1,8 @@
 """Deterministic, rolling transfer decisions for an existing FPL squad.
 
 The optimiser is deliberately independent of network, API and UI code.  It
-compares rolling the current free transfer with making up to the currently
-banked number of free transfers now (and always at least two), then evaluates
+compares rolling the current free transfer with using the currently banked
+free transfers plus one paid transfer now (and always at least two), then evaluates
 the resulting fixed squad over one to five supplied
 ``ep_gwN`` forecasts.  Chips and future-gameweek transfers are intentionally
 outside this first bounded version; callers run it again when the next
@@ -105,7 +105,7 @@ class TransferGameweekPlan:
 
 @dataclass(frozen=True)
 class TransferPlan:
-    """One immediately executable zero- to five-transfer plan."""
+    """One immediately executable zero- to six-transfer plan."""
 
     action: str
     transfers: tuple[TransferMove, ...]
@@ -342,6 +342,11 @@ def _action_sort_key(plan: TransferPlan) -> tuple[object, ...]:
     )
 
 
+def maximum_immediate_transfer_count(free_transfers: int) -> int:
+    """Cover the free-transfer bank plus one hit, within six total transfers."""
+    return min(6, max(2, free_transfers + 1))
+
+
 def _build_moves(
     frame: pd.DataFrame,
     outgoing_indices: Sequence[int],
@@ -394,7 +399,7 @@ def _solve_transfer_count(
     number_of_plans: int,
     solver: Optional[pulp.LpSolver],
     solver_deadline: float,
-    excluded_incoming_id_sets: Sequence[frozenset[int]] = (),
+    excluded_squad_id_sets: Sequence[frozenset[int]] = (),
     require_conclusive_first_solve: bool = False,
 ) -> list[TransferPlan]:
     indices = list(frame.index)
@@ -440,20 +445,19 @@ def _solve_transfer_count(
     )
     model += purchase_cost <= bank_tenths + sale_proceeds
 
-    available_by_id = {int(frame.at[index, "id"]): index for index in available}
-    for exclusion_number, incoming_ids in enumerate(excluded_incoming_id_sets):
-        excluded_indices = [
-            available_by_id[player_id]
-            for player_id in incoming_ids
-            if player_id in available_by_id
-        ]
-        if len(excluded_indices) != transfer_count:
+    index_by_id = {int(frame.at[index, "id"]): index for index in indices}
+    for exclusion_number, squad_ids in enumerate(excluded_squad_id_sets):
+        if (
+            len(squad_ids) != SQUAD.squad_size
+            or not squad_ids.issubset(index_by_id)
+            or len(squad_ids - owned_ids) != transfer_count
+        ):
             raise RollingTransferError(
-                "excluded incoming sets must identify one complete transfer plan"
+                "excluded squads must identify one complete transfer plan"
             )
         model += (
-            pulp.lpSum(squad[index] for index in excluded_indices)
-            <= transfer_count - 1,
+            pulp.lpSum(squad[index_by_id[player_id]] for player_id in squad_ids)
+            <= SQUAD.squad_size - 1,
             f"exclude_seed_{transfer_count}_{exclusion_number}",
         )
 
@@ -677,10 +681,10 @@ def _solve_transfer_count(
 
         if transfer_count == 0:
             break
-        # Exclude this exact incoming set.  Squad size and exact transfer count
-        # make the incoming set a unique transfer plan.
+        # The purchased players alone do not identify a plan: selling a different
+        # owned player changes both the retained squad and the available cash.
         model += (
-            pulp.lpSum(squad[index] for index in incoming) <= transfer_count - 1,
+            pulp.lpSum(squad[index] for index in chosen) <= SQUAD.squad_size - 1,
             f"exclude_{transfer_count}_{alternative_number}",
         )
 
@@ -785,7 +789,7 @@ def optimize_rolling_transfers(
     )
 
     actionable: list[TransferPlan] = [roll]
-    maximum_immediate_transfers = max(2, free_transfers)
+    maximum_immediate_transfers = maximum_immediate_transfer_count(free_transfers)
     coverage_plans: dict[int, TransferPlan] = {}
     for transfer_count in range(1, maximum_immediate_transfers + 1):
         candidates = _solve_transfer_count(
@@ -819,9 +823,7 @@ def optimize_rolling_transfers(
             coverage_plan = coverage_plans.get(transfer_count)
             if coverage_plan is None:
                 continue
-            excluded_incoming_ids = frozenset(
-                move.in_id for move in coverage_plan.transfers
-            )
+            excluded_squad_ids = frozenset(coverage_plan.squad_ids)
             actionable.extend(
                 _solve_transfer_count(
                     frame,
@@ -837,7 +839,7 @@ def optimize_rolling_transfers(
                     number_of_plans=extra_plans_per_count,
                     solver=solver,
                     solver_deadline=solver_deadline,
-                    excluded_incoming_id_sets=(excluded_incoming_ids,),
+                    excluded_squad_id_sets=(excluded_squad_ids,),
                 )
             )
 
@@ -868,6 +870,7 @@ def optimize_rolling_transfers(
 
 
 __all__ = [
+    "maximum_immediate_transfer_count",
     "DEFAULT_BENCH_WEIGHTS",
     "DEFAULT_GW_WEIGHTS",
     "RollingTransferError",

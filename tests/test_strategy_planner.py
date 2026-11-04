@@ -15,6 +15,7 @@ from fpl_app.logic.rolling_transfers import (
     TransferGameweekPlan,
     TransferMove,
     TransferPlan,
+    optimize_rolling_transfers,
 )
 from fpl_app.logic.strategy_planner import (
     ASSUMPTIONS,
@@ -282,6 +283,76 @@ def test_builds_a_legal_deterministic_four_deadline_roadmap() -> None:
         abs=0.002,
     )
     json.dumps(result.as_dict(), allow_nan=False)
+
+
+def test_same_purchase_sale_routes_match_exhaustive_future_cash_oracle() -> None:
+    players = _pool(horizon=6)
+    players = players[players["id"].isin([*INITIAL_IDS, 102, 103])].copy()
+    players.loc[players["id"] == 8, ["purchase_price", "now_cost", "selling_price"]] = [85, 95, 90]
+    players.loc[players["id"] == 8, "ep_gw1"] = 6.0
+    players.loc[players["id"].isin([10, 11, 12]), [f"ep_gw{g}" for g in range(1, 7)]] = 20.0
+    players.loc[players["id"] == 102, [f"ep_gw{g}" for g in range(1, 7)]] = 9.0
+    players.loc[players["id"] == 103, "now_cost"] = 90
+    players.loc[players["id"] == 103, "ep_gw1"] = 0.0
+    players.loc[players["id"] == 103, [f"ep_gw{g}" for g in range(2, 7)]] = 40.0
+    immediate = optimize_rolling_transfers(
+        players, INITIAL_IDS, bank_tenths=0, free_transfers=1, horizon=1,
+        plans_per_transfer_count=5, roll_ft_value_points=0,
+    )
+    roots = tuple(
+        p for p in (immediate.best_action, *immediate.alternatives)
+        if len(p.transfers) == 1 and p.transfers[0].in_id == 102
+    )
+    assert len(roots) == 5
+    assert max(roots, key=lambda p: p.projected_points).transfers[0].out_id == 9
+
+    # Only C (102, already owned in each root) and D (103) can be acquired.
+    # Thus every continuation is hold or buy D at one of the three future
+    # deadlines. Enumerate these, all legal FWD sales and their actual cash.
+    weights = DEFAULT_STRATEGY_GW_WEIGHTS[:6]
+    by_id = players.set_index("id")
+    oracle = []
+    for index, root in enumerate(roots):
+        before = _best_lineup(players, root.squad_ids, 2).projected_points
+        hold_value = root.projected_points + sum(weights[1:]) * before
+        oracle.append((hold_value, index))
+        for out_id in root.squad_ids:
+            if by_id.at[out_id, "pos"] != "FWD":
+                continue
+            if root.bank_after_tenths + by_id.at[out_id, "selling_price"] < 90:
+                continue
+            after_ids = tuple(sorted((set(root.squad_ids) - {out_id}) | {103}))
+            after = _best_lineup(players, after_ids, 2).projected_points
+            for deadline in (2, 3, 4):
+                value = root.projected_points
+                value += sum(weights[1:deadline - 1]) * before
+                value += sum(weights[deadline - 1:]) * after
+                oracle.append((value, index))
+    expected_value, expected_root = max(oracle)
+
+    result = optimize_strategy_roadmap(
+        players, roots, horizon=6, roll_ft_value_points=0,
+        eligible_transfer_in_ids={102, 103},
+    )
+    roadmap = result.best_roadmap
+    assert roadmap.first_step_candidate_index == expected_root
+    assert roadmap.decision_value_points == pytest.approx(expected_value, abs=0.002)
+    assert roadmap.steps[0].transfers[0].out_id == 8
+    assert roadmap.steps[0].bank_after_tenths == 40
+    assert roadmap.steps[1].bank_after_tenths == 0
+    assert roadmap.steps[1].transfers[0].in_id == 103
+    assert roadmap.total_hit_points == 0
+    _assert_chained(result, players)
+
+
+def test_three_transfer_first_step_uses_two_free_transfers_and_one_hit() -> None:
+    players = _pool(horizon=6)
+    first = _first_plan(players, ((3, 101), (8, 102), (13, 103)), free_transfers=2)
+    result = optimize_strategy_roadmap(players, (first,), horizon=6)
+    assert result.best_roadmap.steps[0].transfer_count == 3
+    assert result.best_roadmap.steps[0].hit_points == 4
+    assert result.best_roadmap.steps[0].free_transfers_next_gameweek == 1
+    _assert_chained(result, players)
 
 
 def test_zero_free_transfers_is_legal_only_for_the_current_deadline() -> None:

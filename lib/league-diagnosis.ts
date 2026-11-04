@@ -3,12 +3,13 @@ type Obj = Record<string, unknown>;
 const obj = (value: unknown): Obj => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Obj : {};
 const integer = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value);
 const chipNames = ["wildcard", "freehit", "bboost", "3xc"];
+export const LEAGUE_DETAIL_BATCH_SIZE = 6;
 
 export type LeaguePointComponents = {
   core: number; captain: number; bench_boost: number; triple_captain: number;
   hit_cost: number; gross: number; net: number; active_chip: string | null;
 };
-type GapComponents = { core: number; captain: number; bench_boost: number; triple_captain: number; hits: number };
+export type GapComponents = { core: number; captain: number; bench_boost: number; triple_captain: number; hits: number };
 type PlayerGap = { name: string; gap_change: number };
 export type LeagueDiagnosis = {
   scope: string;
@@ -25,6 +26,71 @@ export type LeagueDiagnosis = {
     core_player_gains: PlayerGap[]; core_player_losses: PlayerGap[];
   };
 };
+
+export type LeagueRoundDiagnosis = LeagueDiagnosis["latest"];
+export type LeagueSeasonSummary = {
+  start_event: number; end_event: number | null;
+  rounds: { gameweek: number; own_net: number | null; rival_net: number | null; gap_change: number | null }[];
+  missing_gameweeks: number[];
+  own_net: number | null; rival_net: number | null; gap_change: number | null;
+  matches_standings: boolean | null;
+};
+
+/** Histories describe the whole league scoring period; missing weeks remain null. */
+export function buildLeagueSeasonSummary(input: {
+  events: unknown; sourceEvent: number; startEvent: number;
+  ownHistory: unknown; rivalHistory: unknown;
+  ownLeaguePoints: number | null; rivalLeaguePoints: number | null;
+}): LeagueSeasonSummary {
+  const events = Array.isArray(input.events) ? input.events.map(obj) : [];
+  const finalized = new Set(events.filter(e => integer(e.id) && e.id <= input.sourceEvent
+    && e.finished === true && e.data_checked === true).map(e => Number(e.id)));
+  const last = Math.max(0, ...finalized);
+  const end = last >= input.startEvent ? last : null;
+  const rounds: LeagueSeasonSummary["rounds"] = [];
+  if (end !== null) for (let event = input.startEvent; event <= end; event += 1) {
+    const own = finalized.has(event) ? historyRound(input.ownHistory, event) : null;
+    const rival = finalized.has(event) ? historyRound(input.rivalHistory, event) : null;
+    const ownNet = own ? own.points - own.hits : null;
+    const rivalNet = rival ? rival.points - rival.hits : null;
+    rounds.push({ gameweek: event, own_net: ownNet, rival_net: rivalNet,
+      gap_change: ownNet !== null && rivalNet !== null ? rivalNet - ownNet : null });
+  }
+  const missing = rounds.filter(r => r.gap_change === null).map(r => r.gameweek);
+  const complete = rounds.length > 0 && missing.length === 0;
+  const own = complete ? rounds.reduce((sum, r) => sum + r.own_net!, 0) : null;
+  const rival = complete ? rounds.reduce((sum, r) => sum + r.rival_net!, 0) : null;
+  const matches = complete && end === input.sourceEvent && input.ownLeaguePoints !== null && input.rivalLeaguePoints !== null
+    ? own === input.ownLeaguePoints && rival === input.rivalLeaguePoints : null;
+  return { start_event: input.startEvent, end_event: end, rounds, missing_gameweeks: missing,
+    own_net: own, rival_net: rival, gap_change: own !== null && rival !== null ? rival - own : null, matches_standings: matches };
+}
+
+/** Only return an aggregate when every expected round has reconciled in full. */
+export function summarizeLeagueSeasonDetails(expected: number[], rounds: LeagueRoundDiagnosis[]) {
+  const byWeek = new Map<number, LeagueRoundDiagnosis>();
+  const duplicates = new Set<number>();
+  for (const round of rounds) {
+    if (byWeek.has(round.gameweek)) duplicates.add(round.gameweek);
+    byWeek.set(round.gameweek, round);
+  }
+  const missing = expected.filter(gw => duplicates.has(gw) || byWeek.get(gw)?.status !== "available"
+    || !byWeek.get(gw)?.own || !byWeek.get(gw)?.rival || !byWeek.get(gw)?.contributions);
+  if (!expected.length || missing.length) return { missing_gameweeks: missing, own: null, rival: null, contributions: null, gap_change: null };
+  const empty = (): LeaguePointComponents => ({ core: 0, captain: 0, bench_boost: 0, triple_captain: 0,
+    hit_cost: 0, gross: 0, net: 0, active_chip: null });
+  const own = empty(), rival = empty();
+  for (const event of expected) {
+    const round = byWeek.get(event)!;
+    for (const key of ["core", "captain", "bench_boost", "triple_captain", "hit_cost", "gross", "net"] as const) {
+      own[key] += round.own![key]; rival[key] += round.rival![key];
+    }
+  }
+  const contributions = { core: rival.core - own.core, captain: rival.captain - own.captain,
+    bench_boost: rival.bench_boost - own.bench_boost, triple_captain: rival.triple_captain - own.triple_captain,
+    hits: own.hit_cost - rival.hit_cost };
+  return { missing_gameweeks: [], own, rival, contributions, gap_change: rival.net - own.net };
+}
 
 function historyRound(history: unknown, event: number): { points: number; hits: number } | null {
   const current = obj(history).current;

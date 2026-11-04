@@ -14,6 +14,54 @@ import {
   stringifyPlannerRequest,
 } from "../lib/planner-contract.ts";
 
+test("complete action lineups preserve reserve order and reject inconsistent captains or bench", () => {
+  const payload = plannerPayload();
+  payload.sequential = sequentialPlan(payload);
+  payload.method.next_deadline_transfer_modelled = true;
+  for (const plan of [payload.best_action, ...payload.alternatives]) {
+    for (const week of plan.gameweeks) {
+      week.vice_captain_id = 14;
+      week.bench_ids = [6, 7, 12, 2];
+    }
+  }
+  assert.equal(parsePlannerPayload(payload).best_action.gameweeks[0].vice_captain_id, 14);
+  const bad = structuredClone(payload);
+  bad.best_action.gameweeks[0].bench_ids = [1, 7, 12, 2];
+  assert.throws(() => parsePlannerPayload(bad), /non-starters/);
+  bad.best_action.gameweeks[0].bench_ids = [2, 6, 7, 12];
+  assert.throws(() => parsePlannerPayload(bad), /reserve keeper/);
+  bad.best_action.gameweeks[0].bench_ids = [6, 7, 12, 2];
+  bad.best_action.gameweeks[0].vice_captain_id = 13;
+  assert.throws(() => parsePlannerPayload(bad), /different starter/);
+});
+
+test("five saved transfers may fund a six-player package with one hit", () => {
+  const payload = plannerPayload();
+  payload.confirmed_state.free_transfers = 5;
+  payload.method.maximum_immediate_transfers = 6;
+  payload.alternatives = [];
+  const buy = payload.best_action;
+  const ids = [1, 3, 4, 8, 9, 13];
+  buy.kind = "hit";
+  buy.transfer_count = 6;
+  buy.free_transfers_before = 5;
+  buy.free_transfers_next_gameweek = 1;
+  buy.hit_points = 4;
+  buy.transfers = ids.map(outId => ({
+    out_id: outId, in_id: outId + 100, position: playerPosition(outId),
+    out_purchase_price_tenths: 50, out_current_price_tenths: 50, out_selling_price_tenths: 50, in_price_tenths: 50,
+    out: playerReference(outId), in: playerReference(outId + 100, playerPosition(outId)),
+  }));
+  buy.squad_ids = buy.squad_ids.map((id: number) => ids.includes(id) ? id + 100 : id);
+  for (const week of buy.gameweeks) {
+    week.starting_ids = week.starting_ids.map((id: number) => ids.includes(id) ? id + 100 : id);
+    week.captain_id = 113;
+  }
+  assert.equal(parsePlannerPayload(payload).best_action.transfers.length, 6);
+  payload.confirmed_state.free_transfers = 3;
+  assert.throws(() => parsePlannerPayload(payload), /bounded immediate-transfer search/);
+});
+
 const limitations = [
   "state_is_locked_at_last_public_deadline",
   "current_free_transfers_not_public",

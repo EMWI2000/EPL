@@ -334,7 +334,7 @@ def _prepare_inputs(
             raise StrategyPlannerError("all first-step candidates must share one FT bank")
 
         transfer_count = len(plan.transfers)
-        if transfer_count > max(2, shared_ft):
+        if transfer_count > immediate.maximum_immediate_transfer_count(shared_ft):
             raise StrategyPlannerError(f"{path} exceeds the immediate transfer-count bound")
         expected_action = "roll" if transfer_count == 0 else f"{transfer_count}_transfer"
         if plan.action != expected_action:
